@@ -1,0 +1,71 @@
+:root {
+  --bg: #fff;
+  --fg: #111;
+  --line: #d6d6d6;
+  --soft: #f4f4f4;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: Consolas, monospace;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+main {
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+}
+
+.toolbar {
+  display: grid;
+  grid-template-columns: 1fr auto auto auto;
+  gap: 4px;
+}
+
+select,
+button {
+  font: inherit;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: #111;
+  padding: 4px;
+}
+
+button {
+  cursor: pointer;
+}
+
+#log-list {
+  border: 1px solid var(--line);
+  max-height: calc(100vh - 72px);
+  overflow: auto;
+  padding: 4px;
+  display: grid;
+  gap: 4px;
+}
+
+details {
+  border: 1px solid var(--line);
+  padding: 3px;
+  background: #fff;
+}
+
+summary {
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+pre {
+  margin: 4px 0 0;
+  white-space: pre-wrap;
+  background: var(--soft);
+  padding: 4px;
+}

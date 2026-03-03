@@ -1,0 +1,53 @@
+{
+  "manifest_version": 3,
+  "name": "Neuro Translate",
+  "description": "Structured translation pipeline with persistent orchestration.",
+  "version": "0.1.0",
+  "minimum_chrome_version": "120",
+  "permissions": [
+    "storage",
+    "tabs",
+    "scripting",
+    "offscreen",
+    "alarms",
+    "downloads",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "https://api.openai.com/*"
+  ],
+  "background": {
+    "service_worker": "sw/worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Neuro Translate",
+    "default_popup": "popup/popup.html"
+  },
+  "options_page": "debug/debug.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content/content.js"
+      ],
+      "css": [
+        "content/content.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "content/content.css"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
+}

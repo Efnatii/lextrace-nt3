@@ -1,0 +1,270 @@
+ДОКАЗАТЕЛЬСТВА РЕАЛЬНОГО ВЛИЯНИЯ ПАРАМЕТРОВ (popup JSON viewer)
+Дата проверки: 2026-03-01
+Репозиторий: neuro-translate-2
+
+Что именно проверено
+- Взяты все редактируемые ключи из `PROFILE_PARAM_META` в `extension/ui/popup.js` (56 параметров).
+- Для каждого ключа проверен путь `UI -> SET_SETTINGS patch -> settings-store/policy -> runtime-consumer`.
+- Если для ключа не найден runtime-consumer, это явно помечено.
+
+Сквозная цепочка применения настроек
+1. UI-редактор формирует patch:
+   - `extension/ui/popup.js:3777-3843` (`_applyProfileParamEditor`)
+   - `extension/ui/popup.js:2560-2578` (`_queueSettingsPatch` -> `_flushSettingsPatch`)
+2. Patch отправляется командой `SET_SETTINGS`:
+   - `extension/ui/popup.js:2573-2578`
+3. Background принимает `SET_SETTINGS` и вызывает Store:
+   - `extension/bg/background-app.js:2337-2358`
+4. Store валидирует/нормализует и пересчитывает effective:
+   - `extension/core/settings-store.js:197-307`
+   - `extension/core/agent-settings-policy.js:347-590`
+5. Runtime-модули читают эти значения:
+   - `extension/bg/translation-orchestrator.js`
+   - `extension/ai/translation-agent.js`
+   - `extension/ai/agent-tool-registry.js`
+   - `extension/bg/background-app.js`
+   - `extension/ai/agent-runner.js`
+   - `extension/ai/llm-client.js`
+
+Легенда статусов
+- `[RUNTIME]` реально меняет выполнение пайплайна/запросов/кеша.
+- `[PARTIAL]` доходит не до конца или влияет только частично.
+- `[NO_RUNTIME]` сейчас только хранится/показывается, но не найдено потребления в рантайме.
+- `[SYNTHETIC]` это UI-пресет, он маппится на реальные `[RUNTIME]` параметры.
+
+Матрица по каждому параметру (56/56)
+
+01) `userSettings.profile` — [RUNTIME]
+    Профильные defaults и вычисление effective profile.
+    Доказательства: `extension/core/agent-settings-policy.js:439-447,503-505`; `extension/ai/translation-agent.js:365-391`.
+
+02) `userSettings.agent.agentMode` — [RUNTIME]
+    Переключает execution mode `agent/legacy`.
+    Доказательства: `extension/core/agent-settings-policy.js:366,494-498,577`; `extension/bg/translation-orchestrator.js:2529-2533`.
+
+03) `userSettings.reasoning.reasoningMode` — [PARTIAL]
+    Управляет выбором `reasoningEffort/reasoningSummary` (profile vs custom), но ниже по стеку reasoning урезается.
+    Доказательства: `extension/core/agent-settings-policy.js:444-454`; `extension/bg/background-app.js:1808-1818`; `extension/ai/llm-client.js:596-603`.
+
+04) `userSettings.reasoning.reasoningEffort` — [PARTIAL]
+    Попадает в run-options и в запрос, но в transport-слое удаляется для Responses portable-режима.
+    Доказательства: `extension/core/agent-settings-policy.js:445-453`; `extension/ai/agent-runner.js:1509-1512,1536-1537`; `extension/ai/llm-client.js:601-602`.
+
+05) `userSettings.reasoning.reasoningSummary` — [PARTIAL]
+    Аналогично предыдущему.
+    Доказательства: `extension/core/agent-settings-policy.js:448-454`; `extension/ai/agent-runner.js:1509-1512`; `extension/ai/llm-client.js:602`.
+
+06) `userSettings.caching.promptCacheRetention` — [RUNTIME]
+    Влияет на `prompt_cache_retention`.
+    Доказательства: `extension/core/agent-settings-policy.js:456-460,546`; `extension/bg/background-app.js:1823-1832`; `extension/ai/llm-client.js:659-662`.
+
+07) `userSettings.caching.promptCacheKey` — [RUNTIME]
+    Влияет на `prompt_cache_key`.
+    Доказательства: `extension/core/agent-settings-policy.js:462-463,547`; `extension/bg/background-app.js:1832-1844`; `extension/ai/llm-client.js:655-658`.
+
+08) `userSettings.caching.compatCache` — [RUNTIME]
+    Включает/выключает совместимый API cache путь.
+    Доказательства: `extension/core/agent-settings-policy.js:465-467,548-549,579`; `extension/bg/background-app.js:1823`; `extension/bg/translation-orchestrator.js:2050-2052,2379-2381`.
+
+09) `userSettings.models.modelRoutingMode` — [RUNTIME]
+    Режим приоритизации allowlist (`auto/user_priority/profile_priority`).
+    Доказательства: `extension/core/agent-settings-policy.js:469-473,552`; `extension/ai/agent-tool-registry.js:4819-4834`.
+
+10) `userSettings.ui.uiLanguage` — [NO_RUNTIME]
+    Нормализуется и хранится, но runtime-потребителей кроме snapshot/policy не найдено.
+    Доказательства: `extension/core/agent-settings-policy.js:395,565`; поиск по рантайму не дает веток выполнения.
+
+11) `userSettings.ui.showAdvanced` — [NO_RUNTIME]
+    Нормализуется и хранится, но runtime-потребителей не найдено.
+    Доказательства: `extension/core/agent-settings-policy.js:396,566`; в `extension/ui/*` нет условий по этому полю.
+
+12) `userSettings.ui.compareRendering` — [RUNTIME]
+    Влияет на compare rendering, который уходит в content runtime.
+    Доказательства: `extension/core/agent-settings-policy.js:499-500,568-572`; `extension/bg/translation-orchestrator.js:3826-3833,3841-3843`; `extension/bg/translation-orchestrator.js:255-257`.
+
+13) `userSettings.memory.enabled` — [RUNTIME]
+    Отключает/включает восстановление из translation memory.
+    Доказательства: `extension/core/agent-settings-policy.js:387,557`; `extension/bg/background-app.js:568-571`; `extension/bg/translation-orchestrator.js:6797-6798`.
+
+14) `userSettings.memory.maxPages` — [RUNTIME]
+    Лимит страниц для GC памяти перевода.
+    Доказательства: `extension/core/agent-settings-policy.js:388,558`; `extension/bg/background-app.js:571-574`.
+
+15) `userSettings.memory.maxBlocks` — [RUNTIME]
+    Лимит блоков для GC памяти перевода.
+    Доказательства: `extension/core/agent-settings-policy.js:389,559`; `extension/bg/background-app.js:575-577`.
+
+16) `userSettings.memory.maxAgeDays` — [RUNTIME]
+    TTL записей памяти.
+    Доказательства: `extension/core/agent-settings-policy.js:390,560`; `extension/bg/background-app.js:578-580`.
+
+17) `userSettings.memory.gcOnStartup` — [RUNTIME]
+    Включает/выключает GC памяти на старте.
+    Доказательства: `extension/core/agent-settings-policy.js:391,561`; `extension/bg/background-app.js:563-569`.
+
+18) `userSettings.memory.ignoredQueryParams` — [RUNTIME]
+    Меняет нормализацию URL для memory key.
+    Доказательства: `extension/core/agent-settings-policy.js:392,562`; `extension/bg/translation-orchestrator.js:6646-6650`.
+
+19) `userSettings.models.agentAllowedModels` — [RUNTIME]
+    Allowlist моделей агента (после фильтрации доступных).
+    Доказательства: `extension/core/agent-settings-policy.js:357,477-480,551`; `extension/ai/agent-tool-registry.js:4813-4834`.
+
+20) `userSettings.models.modelUserPriority` — [RUNTIME]
+    Пользовательский порядок моделей при `modelRoutingMode=user_priority`.
+    Доказательства: `extension/core/agent-settings-policy.js:358-361,482-484,553`; `extension/ai/agent-tool-registry.js:4823-4825,4837-4849`.
+
+21) `translationAgentAllowedModels` — [RUNTIME]
+    Legacy allowlist участвует в runtime-фильтрации и пересечении с `translationModelList`.
+    Доказательства: `extension/core/settings-store.js:594-597`; `extension/bg/background-app.js:2135-2141`; `extension/ai/agent-tool-registry.js:4806-4809`.
+
+22) `translationModelList` — [RUNTIME]
+    Базовый список доступных model spec для селекции/валидации.
+    Доказательства: `extension/core/settings-store.js:235-237,251-256`; `extension/bg/background-app.js:2098-2104,2133-2141`; `extension/ai/agent-tool-registry.js:4805-4812`.
+
+23) `modelSelection.speed` — [RUNTIME]
+    Глобальная скорость выбора модели.
+    Доказательства: `extension/ai/model-selection-policy.js:28-35`; `extension/bg/background-app.js:2226-2244,2266`; `extension/bg/background-app.js:1509-1522`.
+
+24) `modelSelection.preference` — [RUNTIME]
+    Глобальное предпочтение `smartest/cheapest`.
+    Доказательства: `extension/ai/model-selection-policy.js:32-34,49`; `extension/bg/background-app.js:2243,2257,2267`.
+
+25) `translationAgentModelPolicy.mode` — [RUNTIME]
+    Режим auto/fixed для политики модели агента.
+    Доказательства: `extension/bg/background-app.js:2213`; `extension/bg/background-app.js:2255`.
+
+26) `translationAgentModelPolicy.speed` — [RUNTIME]
+    Флаг speed в политике маршрутизации агента.
+    Доказательства: `extension/bg/background-app.js:2220,2242`.
+
+27) `translationAgentModelPolicy.preference` — [RUNTIME]
+    Предпочтение `smartest/cheapest` в политике агента.
+    Доказательства: `extension/bg/background-app.js:2215-2217,2243,2257`.
+
+28) `translationAgentModelPolicy.allowRouteOverride` — [RUNTIME]
+    Разрешение route override (`fast/strong`).
+    Доказательства: `extension/bg/background-app.js:2222,2263-2266`.
+
+29) `translationAgentTuning.styleOverride` — [RUNTIME]
+    Влияет на итоговый стиль и system prompt.
+    Доказательства: `extension/ai/translation-agent.js:1397,1416-1418,1984`.
+
+30) `translationAgentTuning.maxBatchSizeOverride` — [RUNTIME]
+    Меняет batch size планировщика/фолбэка.
+    Доказательства: `extension/ai/translation-agent.js:1398,1419-1421,1852,2153-2156`.
+
+31) `translationAgentTuning.proofreadingPassesOverride` — [RUNTIME]
+    Меняет число проходов вычитки.
+    Доказательства: `extension/ai/translation-agent.js:1399,1422-1423,2170-2171`.
+
+32) `translationAgentTuning.parallelismOverride` — [RUNTIME]
+    Меняет профильный параллелизм.
+    Доказательства: `extension/ai/translation-agent.js:1400,1425-1427`.
+
+33) `translationAgentTuning.plannerTemperature` — [RUNTIME]
+    Передается в planner LLM request.
+    Доказательства: `extension/ai/translation-agent.js:1401,1929,1959`.
+
+34) `translationAgentTuning.plannerMaxOutputTokens` — [RUNTIME]
+    Лимит output token для planner request.
+    Доказательства: `extension/ai/translation-agent.js:1402,1928,1960`.
+
+35) `translationAgentTuning.auditIntervalMs` — [RUNTIME]
+    Интервал periodic audit.
+    Доказательства: `extension/ai/translation-agent.js:1403,1433,1040-1043`.
+
+36) `translationAgentTuning.mandatoryAuditIntervalMs` — [RUNTIME]
+    Интервал mandatory audit.
+    Доказательства: `extension/ai/translation-agent.js:1404,1434,1040-1042`.
+
+37) `translationAgentTuning.compressionThreshold` — [RUNTIME]
+    Порог запуска compaction.
+    Доказательства: `extension/ai/translation-agent.js:1405,1438,1124`; `extension/ai/agent-tool-registry.js:2650-2661`.
+
+38) `translationAgentTuning.contextFootprintLimit` — [RUNTIME]
+    Лимит footprint до compaction.
+    Доказательства: `extension/ai/translation-agent.js:1406,1439,1123`.
+
+39) `translationAgentTuning.compressionCooldownMs` — [RUNTIME]
+    Cooldown между compaction.
+    Доказательства: `extension/ai/translation-agent.js:1407,1440,1116`.
+
+40) `translationPipelineEnabled` — [RUNTIME]
+    Жесткий gate старта задач перевода.
+    Доказательства: `extension/bg/translation-orchestrator.js:130-131`; `extension/bg/translation-orchestrator.js:7740-7745`.
+
+41) `translationAgentExecutionMode` — [RUNTIME]
+    Ветка `agent` vs `legacy` исполнения.
+    Доказательства: `extension/bg/translation-orchestrator.js:2529-2533`; `extension/core/settings-store.js:266-267,590-593`.
+
+42) `translationCategoryMode` — [PARTIAL]
+    Доходит до `agentState.categoryMode`, но прямой автоматической селекции категорий по этому полю не найдено.
+    Доказательства: `extension/ai/translation-agent.js:379-400,465`; `extension/bg/translation-orchestrator.js:7439`.
+
+43) `translationPageCacheEnabled` — [RUNTIME]
+    Включает/выключает restore/save page cache.
+    Доказательства: `extension/bg/translation-orchestrator.js:6147-6149,6982-6984,7427-7428`.
+
+44) `translationApiCacheEnabled` — [RUNTIME]
+    Включает/выключает API-cache ветку при batch/proofread вызовах.
+    Доказательства: `extension/bg/translation-orchestrator.js:2050-2052,2379-2381,3077-3079`.
+
+45) `translationClassifierObserveDomChanges` — [RUNTIME]
+    Флаг наблюдения DOM и классификации.
+    Доказательства: `extension/bg/translation-orchestrator.js:5642-5649`; `extension/bg/translation-orchestrator.js:237-257`; `extension/bg/translation-orchestrator.js:5688-5689`.
+
+46) `translationPerfMaxTextNodesPerScan` — [RUNTIME]
+    Лимит scan budget.
+    Доказательства: `extension/bg/translation-orchestrator.js:5655-5657,5683-5689,6435-6437`.
+
+47) `translationPerfYieldEveryNNodes` — [RUNTIME]
+    Частота yield event-loop.
+    Доказательства: `extension/bg/translation-orchestrator.js:5658-5660,5683-5689,6438-6440`.
+
+48) `translationPerfAbortScanIfOverMs` — [RUNTIME]
+    Time budget на scan.
+    Доказательства: `extension/bg/translation-orchestrator.js:5661-5663,5683-5689,6441-6443`.
+
+49) `translationPerfDegradedScanOnHeavy` — [RUNTIME]
+    Разрешение degraded scan для тяжелых страниц.
+    Доказательства: `extension/bg/translation-orchestrator.js:5664,5683-5689,6444-6455`.
+
+50) `translationCompareRendering` — [RUNTIME]
+    Режим compare-rendering в job/content.
+    Доказательства: `extension/bg/translation-orchestrator.js:6458-6464`; `extension/bg/translation-orchestrator.js:3826-3843`; `extension/bg/translation-orchestrator.js:255-257`.
+
+51) `debugAllowTestCommands` — [RUNTIME]
+    Гейт для `BG_TEST_*` команд.
+    Доказательства: `extension/bg/background-app.js:2816-2817,2836-2838,2865-2867`.
+
+52) `modelPriorityRoles.agent` — [SYNTHETIC]
+    UI-пресет -> patch `modelSelection.* + translationAgentModelPolicy.*`.
+    Доказательства: `extension/ui/popup.js:2218-2230,2308-2315`.
+
+53) `modelPriorityRoles.translation` — [SYNTHETIC]
+    UI-пресет -> patch `userSettings.models.modelRoutingMode/modelUserPriority + translationAgentModelPolicy.*`.
+    Доказательства: `extension/ui/popup.js:2232-2246,2308-2315`.
+
+54) `modelPriorityRoles.context` — [SYNTHETIC]
+    UI-пресет -> patch `translationAgentTuning.parallelism/planner/audit`.
+    Доказательства: `extension/ui/popup.js:2248-2262,2308-2315`.
+
+55) `modelPriorityRoles.compaction` — [SYNTHETIC]
+    UI-пресет -> patch `translationAgentTuning.compression*`.
+    Доказательства: `extension/ui/popup.js:2264-2280,2308-2315`.
+
+56) `modelPriorityRoles.proofreading` — [SYNTHETIC]
+    UI-пресет -> patch `translationAgentTuning.proofreadingPassesOverride + translationAgentModelPolicy.*`.
+    Доказательства: `extension/ui/popup.js:2282-2303,2308-2315`.
+
+Итог по статусам
+- [RUNTIME]: 45 параметров.
+- [PARTIAL]: 4 параметра (`userSettings.reasoning.*`, `translationCategoryMode`).
+- [NO_RUNTIME]: 2 параметра (`userSettings.ui.uiLanguage`, `userSettings.ui.showAdvanced`).
+- [SYNTHETIC]: 5 параметров (`modelPriorityRoles.*`), маппятся в [RUNTIME]-поля.
+
+Краткий вывод
+- В popup-параметрах нет “сплошной декорации”: большинство (45/56) реально влияет на рантайм.
+- Есть 2 параметра без найденного runtime-consumer и 4 параметра с частичным влиянием; они выделены явно.
+- Если нужно, можно сделать следующий шаг: по [NO_RUNTIME]/[PARTIAL] параметрам добавить прямые runtime-консумеры и отдельный чек-лист тестов до/после для подтверждения поведения.

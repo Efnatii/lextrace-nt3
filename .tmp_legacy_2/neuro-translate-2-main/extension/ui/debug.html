@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Нейро Переводчик - Панель оператора</title>
+    <link rel="stylesheet" href="./debug.css">
+  </head>
+  <body>
+    <main class="debug" id="debugRoot">
+      <header class="debug__header">
+        <div class="debug__title-wrap">
+          <h1 class="debug__title">Панель оператора</h1>
+          <div class="debug__sub" data-field="header-job">Вкладка: - | Задача: -</div>
+          <div class="debug__sub" data-field="header-state">Статус: - | Этап: -</div>
+          <div class="debug__sub" data-field="header-runtime">Аренда: - | Повтор: - | Offscreen: - | Активные запросы: -</div>
+        </div>
+        <div class="debug__header-actions" data-field="header-actions"></div>
+      </header>
+
+      <nav class="debug__tabs" aria-label="Разделы отладки">
+        <button type="button" class="debug__tab" data-tab="overview">Обзор</button>
+        <button type="button" class="debug__tab" data-tab="plan">План</button>
+        <button type="button" class="debug__tab" data-tab="tools">Инструменты</button>
+        <button type="button" class="debug__tab" data-tab="diff">Патчи</button>
+        <button type="button" class="debug__tab" data-tab="categories">Категории</button>
+        <button type="button" class="debug__tab" data-tab="memory">Память</button>
+        <button type="button" class="debug__tab" data-tab="ratelimits">Лимиты</button>
+        <button type="button" class="debug__tab" data-tab="perf">Производительность</button>
+        <button type="button" class="debug__tab" data-tab="security">Безопасность</button>
+        <button type="button" class="debug__tab" data-tab="export">Экспорт</button>
+      </nav>
+
+      <section class="debug__content">
+        <section class="debug__panel" data-tab-panel="overview">
+          <h2>Обзор</h2>
+          <div class="debug__kv" data-field="overview-kv"></div>
+          <div class="debug__row-actions">
+            <button type="button" class="debug__btn" data-action="cancel-job" title="Остановить текущую задачу">Отменить</button>
+            <button type="button" class="debug__btn" data-action="erase-job" title="Стереть задачу и кэш">Стереть</button>
+            <button type="button" class="debug__btn" data-action="kick-scheduler" title="Принудительно запустить планировщик">Пнуть планировщик</button>
+            <button type="button" class="debug__btn" data-action="copy-diagnostics" title="Скопировать очищенную диагностику">Копировать диагностику</button>
+          </div>
+        </section>
+
+        <section class="debug__panel" data-tab-panel="plan" hidden>
+          <h2>План (таксономия + пайплайн)</h2>
+          <div class="debug__hint" data-field="plan-hint"></div>
+          <div class="debug__table-wrap">
+            <table class="debug__table">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Название</th>
+                  <th>Перевод по умолчанию</th>
+                  <th>Кол-во единиц</th>
+                  <th>Маршрутизация</th>
+                  <th>Батчинг</th>
+                  <th>Контекст</th>
+                  <th>Контроль качества</th>
+                </tr>
+              </thead>
+              <tbody data-field="plan-categories"></tbody>
+            </table>
+          </div>
+          <div class="debug__hint" data-field="plan-mapping"></div>
+        </section>
+
+        <section class="debug__panel" data-tab-panel="tools" hidden>
+          <h2>Инструменты (трасса вызовов)</h2>
+          <div class="debug__filters">
+            <select data-field="tools-filter-name"></select>
+            <select data-field="tools-filter-status">
+              <option value="all">статус: все</option>
+              <option value="ok">успех</option>
+              <option value="failed">ошибка</option>
+              <option value="coalesced">склеено</option>
+              <option value="skipped">пропущено</option>
+            </select>
+            <input type="text" data-field="tools-filter-search" placeholder="Поиск по трассе">
+            <button type="button" class="debug__btn" data-action="copy-tools-50" title="Скопировать последние 50 записей">Скопировать последние 50</button>
+          </div>
+          <div class="debug__table-wrap debug__table-wrap--tall">
+            <table class="debug__table">
+              <thead>
+                <tr>
+                  <th>Время</th>
+                  <th>Инструмент</th>
+                  <th>Статус</th>
+                  <th>Аргументы</th>
+                  <th>Результат</th>
+                </tr>
+              </thead>
+              <tbody data-field="tools-table"></tbody>
+            </table>
+          </div>
+          <pre class="debug__pre" data-field="tools-details">Выберите строку для деталей</pre>
+        </section>
+
+        <section class="debug__panel" data-tab-panel="diff" hidden>
+          <h2>Патчи</h2>
+          <div class="debug__split">
+            <div>
+              <div class="debug__filters">
+                <input type="text" data-field="diff-filter-category" placeholder="Фильтр по категории">
+                <input type="text" data-field="diff-filter-status" placeholder="Фильтр по статусу">
+              </div>
+              <div class="debug__list" data-field="diff-blocks"></div>
+            </div>
+            <div>
+              <div class="debug__diff-head">Оригинал / Перевод</div>
+              <div class="debug__diff-grid">
+                <pre class="debug__pre" data-field="diff-original">-</pre>
+                <pre class="debug__pre" data-field="diff-translated">-</pre>
+              </div>
+              <div class="debug__row-actions">
+                <button type="button" class="debug__btn" data-action="block-literal" title="Пересобрать блок более дословно">Сделать дословно</button>
+                <button type="button" class="debug__btn" data-action="block-style" title="Пересобрать блок с улучшенным стилем">Улучшить стиль</button>
+                <button type="button" class="debug__btn" data-action="block-proofread" title="Запустить proofread для блока">Вычитать</button>
+              </div>
+              <div class="debug__hint" data-field="diff-meta">Модель: - | Маршрут: - | Обновлено: -</div>
+            </div>
+          </div>
+          <h3>История патчей</h3>
+          <div class="debug__filters">
+            <input type="text" data-field="patch-filter-block" placeholder="ID блока">
+            <select data-field="patch-filter-kind">
+              <option value="all">тип: все</option>
+              <option value="delta">дельта</option>
+              <option value="final">финал</option>
+              <option value="restore">восстановление</option>
+            </select>
+            <input type="text" data-field="patch-filter-phase" placeholder="Фаза">
+          </div>
+          <div class="debug__table-wrap debug__table-wrap--tall">
+            <table class="debug__table">
+              <thead>
+                <tr>
+                  <th>№</th>
+                  <th>Время</th>
+                  <th>Тип</th>
+                  <th>ID блока</th>
+                  <th>Хэш</th>
+                  <th>Предпросмотр</th>
+                </tr>
+              </thead>
+              <tbody data-field="patch-table"></tbody>
+            </table>
+          </div>
+          <pre class="debug__pre" data-field="patch-details">Выберите патч для деталей</pre>
+        </section>
+
+        <section class="debug__panel" data-tab-panel="categories" hidden>
+          <h2>Категории</h2>
+          <div class="debug__hint" data-field="categories-hint"></div>
+          <div class="debug__list" data-field="categories-list"></div>
+          <div class="debug__row-actions">
+            <button type="button" class="debug__btn" data-action="apply-categories" title="Сохранить выбранные категории">Применить выбор категорий</button>
+            <button type="button" class="debug__btn" data-action="reclassify" title="Повторно вычислить классификацию">Пересчитать классификацию</button>
+          </div>
+        </section>
+
+        <section class="debug__panel" data-tab-panel="memory" hidden>
+          <h2>Память</h2>
+          <div class="debug__kv" data-field="memory-kv"></div>
+          <div class="debug__row-actions">
+            <button type="button" class="debug__btn" data-action="erase-memory-page" title="Удалить память текущей страницы">Стереть память этой страницы</button>
+            <button type="button" class="debug__btn" data-action="erase-memory-all" title="Удалить всю память">Стереть всю память</button>
+          </div>
+        </section>
+
+        <section class="debug__panel" data-tab-panel="ratelimits" hidden>
+          <h2>Лимиты запросов</h2>
+          <div class="debug__kv" data-field="ratelimits-kv"></div>
+          <div class="debug__list" data-field="ratelimits-list"></div>
+        </section>
+
+        <section class="debug__panel" data-tab-panel="perf" hidden>
+          <h2>Производительность</h2>
+          <div class="debug__kv" data-field="perf-kv"></div>
+          <div class="debug__list" data-field="perf-top"></div>
+        </section>
+
+        <section class="debug__panel" data-tab-panel="security" hidden>
+          <h2>Аудит безопасности</h2>
+          <div class="debug__hint" data-field="security-summary"></div>
+          <pre class="debug__pre" data-field="security-json">-</pre>
+          <div class="debug__row-actions">
+            <button type="button" class="debug__btn" data-action="run-security-audit" title="Запустить аудит безопасности">Запустить аудит</button>
+            <button type="button" class="debug__btn" data-action="repair-all" title="Исправить/сжать">Исправить/сжать</button>
+          </div>
+        </section>
+
+        <section class="debug__panel" data-tab-panel="export" hidden>
+          <h2>Экспорт</h2>
+          <label class="debug__label" for="export-text-mode">Режим включения текста</label>
+          <select id="export-text-mode" class="debug__input" data-field="export-text-mode" title="Режим включения текста в экспорт">
+            <option value="snippets">фрагменты</option>
+            <option value="none">без текста</option>
+            <option value="full">полный текст</option>
+          </select>
+          <div class="debug__hint">Полный режим может содержать фрагменты текста страницы; ключи всё равно маскируются.</div>
+          <div class="debug__row-actions">
+            <button type="button" class="debug__btn" data-action="export-json" title="Скачать очищенный JSON">Скачать JSON</button>
+            <button type="button" class="debug__btn" data-action="export-html" title="Скачать HTML отчёт">Скачать HTML</button>
+            <button type="button" class="debug__btn" data-action="copy-diagnostics" title="Скопировать очищенную диагностику">Копировать диагностику</button>
+          </div>
+          <div class="debug__hint" data-field="export-status">-</div>
+        </section>
+      </section>
+
+      <div class="nt-toast-host" data-field="toast-host" aria-live="polite"></div>
+    </main>
+
+    <script src="../core/nt-namespace.js"></script>
+    <script src="../core/message-envelope.js"></script>
+    <script src="../core/ui-protocol.js"></script>
+    <script src="../core/redaction.js"></script>
+    <script src="./ui-i18n-ru.js"></script>
+    <script src="./ui-icons.js"></script>
+    <script src="./ui-kit.js"></script>
+    <script src="./ui-state-store.js"></script>
+    <script src="./ui-protocol-client.js"></script>
+    <script src="./report-exporter.js"></script>
+    <script src="./debug.js"></script>
+  </body>
+</html>

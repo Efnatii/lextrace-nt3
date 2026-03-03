@@ -1,0 +1,2341 @@
+importScripts('settings.js');
+importScripts('ai-common.js');
+importScripts('guardrails.js');
+importScripts('resilience-policy.js');
+importScripts('messaging.js');
+importScripts('throughput-controller.js');
+importScripts('model-router.js');
+importScripts('llm/Operation.js');
+importScripts('llm/RequestRunner.js');
+importScripts('scheduler/task-scheduler.js');
+importScripts('batch/batch-client.js');
+importScripts('batch/batch-prewarm.js');
+importScripts('translation-service.js');
+importScripts('context-service.js');
+importScripts('proofread-service.js');
+
+const NT_SETTINGS = globalThis.NT_SETTINGS || {};
+const DEFAULT_TPM_LIMITS_BY_MODEL = NT_SETTINGS.DEFAULT_TPM_LIMITS_BY_MODEL || { default: 200000 };
+const DEFAULT_OUTPUT_RATIO_BY_ROLE = NT_SETTINGS.DEFAULT_OUTPUT_RATIO_BY_ROLE || {
+  translation: 0.6,
+  context: 0.4,
+  proofread: 0.5
+};
+const DEFAULT_TPM_SAFETY_BUFFER_TOKENS = Number.isFinite(NT_SETTINGS.DEFAULT_TPM_SAFETY_BUFFER_TOKENS)
+  ? NT_SETTINGS.DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+  : 100;
+const DEFAULT_STATE = NT_SETTINGS.DEFAULT_STATE || {
+  apiKey: '',
+  openAiOrganization: '',
+  openAiProject: '',
+  translationModel: 'gpt-4.1-mini',
+  contextModel: 'gpt-4.1-mini',
+  proofreadModel: 'gpt-4.1-mini',
+  translationModelList: ['gpt-4.1-mini:standard'],
+  contextModelList: ['gpt-4.1-mini:standard'],
+  proofreadModelList: ['gpt-4.1-mini:standard'],
+  contextGenerationEnabled: false,
+  proofreadEnabled: false,
+  batchTurboMode: 'off',
+  singleBlockConcurrency: false,
+  assumeOpenAICompatibleApi: false,
+  blockLengthLimit: 1200,
+  tpmLimitsByModel: DEFAULT_TPM_LIMITS_BY_MODEL,
+  outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
+  tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+};
+const STATE_CACHE_KEYS = NT_SETTINGS.STATE_CACHE_KEYS || new Set(Object.keys(DEFAULT_STATE));
+const sanitizeSettings =
+  NT_SETTINGS.sanitizeSettings ||
+  ((raw, defaults = {}) => ({ ...(defaults || {}), ...(raw && typeof raw === 'object' ? raw : {}) }));
+const pickStateForCache =
+  NT_SETTINGS.pickStateForCache ||
+  ((state) => {
+    const source = state && typeof state === 'object' ? state : {};
+    const output = {};
+    for (const key of STATE_CACHE_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(source, key)) {
+        output[key] = source[key];
+      }
+    }
+    return output;
+  });
+
+let STATE_CACHE = null;
+let STATE_CACHE_READY = false;
+const NT_RPC_PORT_NAME = 'NT_RPC_PORT';
+const UI_PORT_NAMES = {
+  debug: 'debug',
+  popup: 'popup'
+};
+const DEBUG_DB_NAME = 'nt_debug';
+const DEBUG_DB_VERSION = 1;
+const DEBUG_RAW_STORE = 'raw';
+const DEBUG_RAW_MAX_RECORDS = 1500;
+const DEBUG_RAW_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+const CONTENT_READY_BY_TAB = new Map();
+const NT_SETTINGS_RESPONSE_TYPE = 'NT_SETTINGS_RESPONSE';
+const DEBUG_STORAGE_KEY = 'translationDebugByUrl';
+const DEBUG_PORTS = new Set();
+const POPUP_PORTS = new Set();
+const ntProgressByTab = {};
+const ntPreflightByTab = {};
+const ntProgressStateByTab = {};
+const lastProgressPublishedAt = new Map();
+let debugDbPromise = null;
+let schedulerTickTimer = null;
+const SCHEDULER_TICK_INTERVAL_MS = 4000;
+let batchPollTimer = null;
+const BATCH_POLL_INTERVAL_MS = 5 * 60 * 1000;
+const BATCH_PREWARM_STORAGE_KEY = 'batchPrewarmJobs';
+
+async function migrateStoredStateIfNeeded() {
+  try {
+    const raw = await storageLocalGet({
+      apiKey: null,
+      openAiOrganization: null,
+      openAiProject: null,
+      translationModel: null,
+      contextModel: null,
+      proofreadModel: null,
+      translationModelList: null,
+      contextModelList: null,
+      proofreadModelList: null,
+      contextGenerationEnabled: null,
+      proofreadEnabled: null,
+      batchTurboMode: null,
+      singleBlockConcurrency: null,
+      assumeOpenAICompatibleApi: null,
+      blockLengthLimit: null,
+      chunkLengthLimit: null,
+      model: null,
+      tpmLimitsByModel: null,
+      outputRatioByRole: null,
+      tpmSafetyBufferTokens: null
+    });
+    const legacyModel = raw?.model;
+    const legacyChunkLimit = raw?.chunkLengthLimit;
+    const translationModel = raw?.translationModel || legacyModel || '';
+    const contextModel = raw?.contextModel || translationModel || legacyModel || '';
+    const proofreadModel = raw?.proofreadModel || translationModel || legacyModel || '';
+    const blockLengthLimit = raw?.blockLengthLimit ?? legacyChunkLimit ?? null;
+
+    const normalizeList = (value) => {
+      if (Array.isArray(value)) return value;
+      if (typeof value === 'string' && value.trim()) return [value.trim()];
+      return [];
+    };
+
+    const migrated = {
+      ...raw,
+      translationModel,
+      contextModel,
+      proofreadModel,
+      blockLengthLimit,
+      translationModelList: normalizeList(raw?.translationModelList),
+      contextModelList: normalizeList(raw?.contextModelList),
+      proofreadModelList: normalizeList(raw?.proofreadModelList)
+    };
+    const normalized = sanitizeSettings(migrated, DEFAULT_STATE);
+    const canonical = pickStateForCache(normalized);
+    const legacyPresent = legacyModel != null || legacyChunkLimit != null;
+    const changed =
+      legacyPresent ||
+      Object.keys(canonical).some((key) => {
+        if (!Object.prototype.hasOwnProperty.call(raw, key)) return true;
+        return raw[key] !== canonical[key];
+      });
+    if (changed) {
+      await storageLocalSet(canonical);
+    }
+  } catch (error) {
+    console.warn('Failed to migrate stored state.', error);
+  }
+}
+
+function getTaskScheduler() {
+  return globalThis.ntTaskScheduler || null;
+}
+
+void migrateStoredStateIfNeeded();
+
+function startSchedulerTick() {
+  if (schedulerTickTimer) return;
+  schedulerTickTimer = setInterval(() => {
+    const scheduler = getTaskScheduler();
+    if (!scheduler || typeof scheduler.getTickSnapshot !== 'function') return;
+    const snapshot = scheduler.getTickSnapshot();
+    globalThis.ntJsonLog?.({
+      kind: 'scheduler.tick',
+      ts: Date.now(),
+      inFlightByQueue: snapshot.inFlightByQueue,
+      queuedByQueue: snapshot.queuedByQueue,
+      governorStats: snapshot.governorStats,
+      backoffKeysCount: snapshot.governorStats?.filter((entry) => entry.backoffUntilMs > Date.now()).length || 0
+    });
+  }, SCHEDULER_TICK_INTERVAL_MS);
+}
+
+function startBatchPoller() {
+  if (batchPollTimer) return;
+  batchPollTimer = setInterval(() => {
+    void pollBatchPrewarmJobs();
+  }, BATCH_POLL_INTERVAL_MS);
+}
+
+function openDebugDb() {
+  if (debugDbPromise) return debugDbPromise;
+  debugDbPromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(DEBUG_DB_NAME, DEBUG_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(DEBUG_RAW_STORE)) {
+        const store = db.createObjectStore(DEBUG_RAW_STORE, { keyPath: 'id' });
+        store.createIndex('ts', 'ts', { unique: false });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('IndexedDB open failed'));
+  });
+  return debugDbPromise;
+}
+
+function wrapIdbRequest(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('IndexedDB request failed'));
+  });
+}
+
+async function withRawStore(mode, fn) {
+  const db = await openDebugDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DEBUG_RAW_STORE, mode);
+    const store = tx.objectStore(DEBUG_RAW_STORE);
+    Promise.resolve(fn(store))
+      .then((result) => {
+        tx.oncomplete = () => resolve(result);
+        tx.onerror = () => reject(tx.error || new Error('IndexedDB transaction failed'));
+        tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
+      })
+      .catch((error) => {
+        tx.abort();
+        reject(error);
+      });
+  });
+}
+
+async function pruneDebugRawStore() {
+  const now = Date.now();
+  return withRawStore('readwrite', async (store) => {
+    const index = store.index('ts');
+    const total = await wrapIdbRequest(index.count());
+    let excess = Math.max(0, total - DEBUG_RAW_MAX_RECORDS);
+    return new Promise((resolve, reject) => {
+      const cursorRequest = index.openCursor();
+      cursorRequest.onsuccess = () => {
+        const cursor = cursorRequest.result;
+        if (!cursor) {
+          resolve();
+          return;
+        }
+        const isExpired = cursor.value?.ts && cursor.value.ts < now - DEBUG_RAW_MAX_AGE_MS;
+        if (isExpired || excess > 0) {
+          if (excess > 0) {
+            excess -= 1;
+          }
+          cursor.delete();
+          cursor.continue();
+          return;
+        }
+        resolve();
+      };
+      cursorRequest.onerror = () => reject(cursorRequest.error || new Error('IndexedDB cursor failed'));
+    });
+  });
+}
+
+async function storeDebugRaw(record) {
+  if (!record?.id) {
+    return { ok: false, error: 'missing-id' };
+  }
+  const payload = {
+    ...record,
+    ts: Number.isFinite(record.ts) ? record.ts : Date.now()
+  };
+  await withRawStore('readwrite', (store) => wrapIdbRequest(store.put(payload)));
+  await pruneDebugRawStore();
+  return { ok: true };
+}
+
+async function getDebugRaw(id) {
+  if (!id) return null;
+  return withRawStore('readonly', (store) => wrapIdbRequest(store.get(id)));
+}
+
+function registerUiPort(port, kind) {
+  const set = kind === UI_PORT_NAMES.debug ? DEBUG_PORTS : POPUP_PORTS;
+  set.add(port);
+  port.onDisconnect.addListener(() => {
+    set.delete(port);
+  });
+  port.onMessage.addListener((message) => {
+    if (!message || typeof message !== 'object') return;
+    if (kind !== UI_PORT_NAMES.debug) return;
+    if (message.type === 'DEBUG_GET_SNAPSHOT') {
+      const sourceUrl = typeof message.sourceUrl === 'string' ? message.sourceUrl : '';
+      getDebugSnapshot(sourceUrl)
+        .then((snapshot) => {
+          port.postMessage({ type: 'DEBUG_SNAPSHOT', sourceUrl, snapshot });
+        })
+        .catch((error) => {
+          port.postMessage({
+            type: 'DEBUG_SNAPSHOT',
+            sourceUrl,
+            snapshot: null,
+            error: error?.message || String(error)
+          });
+        });
+    }
+    if (message.type === 'DEBUG_GET_RAW') {
+      const rawId = typeof message.rawId === 'string' ? message.rawId : '';
+      getDebugRaw(rawId)
+        .then((record) => {
+          port.postMessage({ type: 'DEBUG_RAW', rawId, record: record || null });
+        })
+        .catch((error) => {
+          port.postMessage({
+            type: 'DEBUG_RAW',
+            rawId,
+            record: null,
+            error: error?.message || String(error)
+          });
+        });
+    }
+  });
+}
+
+function broadcastToPorts(ports, message) {
+  if (!ports.size) return false;
+  let delivered = false;
+  for (const port of ports) {
+    try {
+      port.postMessage(message);
+      delivered = true;
+    } catch (error) {
+      ports.delete(port);
+    }
+  }
+  return delivered;
+}
+
+function sendRuntimeMessageSafe(message) {
+  try {
+    chrome.runtime.sendMessage(message, () => {
+      if (chrome.runtime.lastError) {
+        // Ignore missing listeners.
+      }
+    });
+  } catch (error) {
+    // Ignore missing listeners.
+  }
+}
+
+async function getDebugSnapshot(sourceUrl) {
+  if (!sourceUrl) return null;
+  const store = await storageLocalGet({ [DEBUG_STORAGE_KEY]: {} });
+  const map = store?.[DEBUG_STORAGE_KEY] || {};
+  return map[sourceUrl] || null;
+}
+
+function invokeHandlerAsPromise(handler, message, timeoutMs = 240000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const safeResolve = (payload) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      if (payload && typeof payload === 'object') {
+        resolve(payload);
+        return;
+      }
+      resolve({
+        success: false,
+        error: 'Background RPC response is empty',
+        isRuntimeError: true
+      });
+    };
+    const timeoutId = setTimeout(() => {
+      const timeoutEvent = {
+        kind: 'rpc.bg.timeout',
+        rpcId: message?.rpcId ?? null,
+        type: message?.type ?? null,
+        timeoutMs,
+        ts: Date.now()
+      };
+      if (typeof globalThis.ntJsonLog === 'function') {
+        globalThis.ntJsonLog(timeoutEvent);
+      } else {
+        console.info('Background RPC timeout', timeoutEvent);
+      }
+      safeResolve({ success: false, error: 'Background RPC timeout', isRuntimeError: true });
+    }, timeoutMs);
+    try {
+      const maybePromise = handler(message, (response) => {
+        safeResolve(response);
+      });
+      if (maybePromise && typeof maybePromise.then === 'function') {
+        maybePromise.catch((error) => {
+          safeResolve({
+            success: false,
+            error: error?.message || String(error),
+            isRuntimeError: true
+          });
+        });
+      }
+    } catch (error) {
+      safeResolve({
+        success: false,
+        error: error?.message || String(error),
+        isRuntimeError: true
+      });
+    }
+  });
+}
+
+function invokeSettingsAsPromise(handler, message, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const safeResolve = (payload) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      resolve(payload && typeof payload === 'object' ? payload : null);
+    };
+    const timeoutId = setTimeout(() => {
+      safeResolve(null);
+    }, timeoutMs);
+    try {
+      const maybePromise = handler(message, (response) => {
+        safeResolve(response);
+      });
+      if (maybePromise && typeof maybePromise.then === 'function') {
+        maybePromise.catch((error) => {
+          console.warn('Settings handler failed in RPC.', error);
+          safeResolve(null);
+        });
+      }
+    } catch (error) {
+      console.warn('Settings handler threw in RPC.', error);
+      safeResolve(null);
+    }
+  });
+}
+
+function storageLocalGet(keysOrDefaults, timeoutMs = 6000) {
+  return new Promise((resolve, reject) => {
+    let hasCompleted = false;
+    const timeoutId = setTimeout(() => {
+      if (hasCompleted) return;
+      hasCompleted = true;
+      reject(new Error('storageLocalGet timeout'));
+    }, timeoutMs);
+    try {
+      chrome.storage.local.get(keysOrDefaults, (items) => {
+        if (hasCompleted) return;
+        hasCompleted = true;
+        clearTimeout(timeoutId);
+        if (chrome.runtime.lastError) {
+          reject(chrome.runtime.lastError);
+          return;
+        }
+        if (!items || typeof items !== 'object') {
+          resolve({});
+          return;
+        }
+        resolve(items);
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+function storageLocalSet(items, timeoutMs = 3000) {
+  return new Promise((resolve, reject) => {
+    let hasCompleted = false;
+    const timeoutId = setTimeout(() => {
+      if (hasCompleted) return;
+      hasCompleted = true;
+      reject(new Error('storageLocalSet timeout'));
+    }, timeoutMs);
+    try {
+      chrome.storage.local.set(items, () => {
+        if (hasCompleted) return;
+        hasCompleted = true;
+        clearTimeout(timeoutId);
+        if (chrome.runtime.lastError) {
+          reject(chrome.runtime.lastError);
+          return;
+        }
+        resolve();
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+function applyStatePatch(patch = {}) {
+  const next = STATE_CACHE && typeof STATE_CACHE === 'object' ? { ...STATE_CACHE } : { ...DEFAULT_STATE };
+  const sanitizedPatch = sanitizeSettings(patch, {});
+
+  for (const [key, value] of Object.entries(sanitizedPatch || {})) {
+    if (!STATE_CACHE_KEYS.has(key)) continue;
+    if (
+      ['apiKey', 'openAiOrganization', 'openAiProject', 'translationModel', 'contextModel', 'proofreadModel'].includes(
+        key
+      )
+    ) {
+      next[key] = typeof value === 'string' ? value : value == null ? '' : String(value);
+      continue;
+    }
+    if (['translationModelList', 'contextModelList', 'proofreadModelList'].includes(key)) {
+      const fallbackModel =
+        key === 'contextModelList'
+          ? next.contextModel
+          : key === 'proofreadModelList'
+            ? next.proofreadModel
+            : next.translationModel;
+      const normalizedList = normalizeModelList(value, fallbackModel);
+      next[key] = normalizedList;
+      if (key === 'translationModelList') {
+        next.translationModel = parseModelSpec(normalizedList[0]).id || next.translationModel;
+      } else if (key === 'contextModelList') {
+        next.contextModel = parseModelSpec(normalizedList[0]).id || next.contextModel;
+      } else if (key === 'proofreadModelList') {
+        next.proofreadModel = parseModelSpec(normalizedList[0]).id || next.proofreadModel;
+      }
+      continue;
+    }
+    if (['contextGenerationEnabled', 'proofreadEnabled', 'singleBlockConcurrency', 'assumeOpenAICompatibleApi'].includes(key)) {
+      next[key] = Boolean(value);
+      continue;
+    }
+    if (key === 'batchTurboMode') {
+      const allowedModes = new Set(['off', 'prewarm_ui', 'prewarm_dedup_all']);
+      next[key] = allowedModes.has(value) ? value : DEFAULT_STATE.batchTurboMode;
+      continue;
+    }
+    if (['blockLengthLimit', 'tpmSafetyBufferTokens'].includes(key)) {
+      const numValue = Number(value);
+      next[key] = Number.isFinite(numValue) ? numValue : DEFAULT_STATE[key];
+      continue;
+    }
+    if (['tpmLimitsByModel', 'outputRatioByRole'].includes(key)) {
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        next[key] = value;
+      }
+      continue;
+    }
+  }
+
+  STATE_CACHE = next;
+  STATE_CACHE_READY = true;
+}
+
+function getApiConfigForModel(model, state) {
+  return {
+    apiKey: state.apiKey,
+    apiBaseUrl: OPENAI_API_URL,
+    provider: 'openai'
+  };
+}
+
+function getTpmLimitForModel(model, tpmLimitsByModel) {
+  if (!tpmLimitsByModel || typeof tpmLimitsByModel !== 'object') {
+    return DEFAULT_TPM_LIMITS_BY_MODEL.default;
+  }
+  const fallback = tpmLimitsByModel.default ?? DEFAULT_TPM_LIMITS_BY_MODEL.default;
+  return tpmLimitsByModel[model] ?? fallback;
+}
+
+function normalizeModelList(list, fallbackModelId) {
+  const registry = getModelRegistry();
+  const byKey = registry?.byKey || {};
+  const rawList = Array.isArray(list)
+    ? list
+    : typeof list === 'string'
+      ? [list]
+      : [];
+  const normalized = [];
+  rawList.forEach((entry) => {
+    if (typeof entry !== 'string' || !entry) return;
+    const parsed = parseModelSpec(entry);
+    if (!parsed.id) return;
+    const spec = formatModelSpec(parsed.id, parsed.tier);
+    if (!byKey[spec]) return;
+    if (!normalized.includes(spec)) {
+      normalized.push(spec);
+    }
+  });
+  if (!normalized.length) {
+    const fallbackSpec = fallbackModelId ? formatModelSpec(fallbackModelId, 'standard') : '';
+    if (fallbackSpec && byKey[fallbackSpec]) {
+      normalized.push(fallbackSpec);
+    }
+  }
+  return normalized;
+}
+
+function areModelListsEqual(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right)) return false;
+  if (left.length !== right.length) return false;
+  return left.every((value, index) => value === right[index]);
+}
+
+function getPrimaryModelId(modelList, fallbackModelId) {
+  const normalized = normalizeModelList(modelList, fallbackModelId);
+  return parseModelSpec(normalized[0]).id || fallbackModelId;
+}
+
+function getModelListForStage(state, stage) {
+  if (stage === 'context') return state.contextModelList || [];
+  if (stage === 'proofread') return state.proofreadModelList || [];
+  return state.translationModelList || [];
+}
+
+function getModelCooldownMap() {
+  if (!globalThis.__NT_MODEL_COOLDOWNS__) {
+    globalThis.__NT_MODEL_COOLDOWNS__ = new Map();
+  }
+  return globalThis.__NT_MODEL_COOLDOWNS__;
+}
+
+function getModelCooldown(spec) {
+  const cooldowns = getModelCooldownMap();
+  const entry = cooldowns.get(spec);
+  if (!entry?.availableAfter) return null;
+  if (entry.availableAfter <= Date.now()) {
+    cooldowns.delete(spec);
+    return null;
+  }
+  return entry;
+}
+
+function setModelCooldown(spec, error) {
+  if (!spec) return;
+  const cooldowns = getModelCooldownMap();
+  const retryAfterMs = Number.isFinite(Number(error?.retryAfterMs))
+    ? Number(error.retryAfterMs)
+    : 5000;
+  const capped = Math.min(Math.max(retryAfterMs, 0), 60000);
+  cooldowns.set(spec, { availableAfter: Date.now() + capped });
+}
+
+function normalizeTriggerSource(triggerSource) {
+  if (!triggerSource || typeof triggerSource !== 'string') return '';
+  return triggerSource.trim().toLowerCase();
+}
+
+function getCandidateModels(stage, requestMeta, state) {
+  const fallbackModel = stage === 'context'
+    ? state.contextModel
+    : stage === 'proofread'
+      ? state.proofreadModel
+      : state.translationModel;
+  let originalRequestedModelList = normalizeModelList(getModelListForStage(state, stage), fallbackModel);
+  const triggerSource = requestMeta?.triggerSource || '';
+  const purpose = requestMeta?.purpose || '';
+  const normalizedTriggerSource = normalizeTriggerSource(triggerSource);
+  let effectivePurpose = typeof purpose === 'string' ? purpose : '';
+  if (normalizedTriggerSource.includes('validate')) {
+    effectivePurpose = 'validate';
+  } else if (normalizedTriggerSource.includes('retry')) {
+    effectivePurpose = 'retry';
+  } else if (!effectivePurpose) {
+    effectivePurpose = 'main';
+  }
+  const isManualTrigger =
+    (Boolean(requestMeta?.isManual) ||
+      normalizedTriggerSource.includes('manual') ||
+      effectivePurpose === 'manual') &&
+    !normalizedTriggerSource.includes('retry') &&
+    !normalizedTriggerSource.includes('validate');
+  let candidateStrategy = 'default_preserve_order';
+  if (stage === 'translate') {
+    if (effectivePurpose === 'validate') {
+      candidateStrategy = 'validate_cheapest';
+    } else if (effectivePurpose === 'retry') {
+      candidateStrategy = 'retry_cheapest';
+    } else if (isManualTrigger) {
+      candidateStrategy = 'manual_smartest';
+    }
+  } else if (stage === 'proofread') {
+    if (effectivePurpose === 'validate') {
+      candidateStrategy = 'validate_cheapest';
+    } else if (effectivePurpose === 'retry') {
+      candidateStrategy = 'retry_cheapest';
+    } else if (isManualTrigger) {
+      candidateStrategy = 'manual_smartest';
+    }
+  } else if (stage === 'context') {
+    if (effectivePurpose === 'validate') {
+      candidateStrategy = 'validate_cheapest';
+    } else if (effectivePurpose === 'retry') {
+      candidateStrategy = 'retry_cheapest';
+    } else if (isManualTrigger) {
+      candidateStrategy = 'manual_smartest';
+    }
+  }
+  if (!Array.isArray(originalRequestedModelList) || !originalRequestedModelList.length) {
+    const fallbackSpec = fallbackModel ? formatModelSpec(fallbackModel, 'standard') : '';
+    if (fallbackSpec) {
+      originalRequestedModelList = [fallbackSpec];
+    } else {
+      originalRequestedModelList = [];
+    }
+  }
+  const parsedEntries = originalRequestedModelList.map((spec, index) => {
+    const parsed = parseModelSpec(spec);
+    const tierPref = parsed.tier === 'flex' ? 1 : 0;
+    const capabilityRank = getModelCapabilityRank(parsed.id);
+    const costSum = getModelEntry(parsed.id, parsed.tier)?.sum_1M ?? Infinity;
+    return {
+      spec,
+      index,
+      parsed,
+      tierPref,
+      capabilityRank,
+      costSum
+    };
+  });
+  const compareManual = (left, right) => {
+    if (left.capabilityRank !== right.capabilityRank) {
+      return right.capabilityRank - left.capabilityRank;
+    }
+    if (left.tierPref !== right.tierPref) {
+      return right.tierPref - left.tierPref;
+    }
+    if (left.index !== right.index) {
+      return left.index - right.index;
+    }
+    return 0;
+  };
+  const compareCheapest = (left, right) => {
+    if (left.costSum !== right.costSum) {
+      return left.costSum - right.costSum;
+    }
+    if (left.capabilityRank !== right.capabilityRank) {
+      return right.capabilityRank - left.capabilityRank;
+    }
+    if (left.tierPref !== right.tierPref) {
+      return right.tierPref - left.tierPref;
+    }
+    if (left.index !== right.index) {
+      return left.index - right.index;
+    }
+    return 0;
+  };
+  const orderedEntries = [...parsedEntries];
+  if (candidateStrategy === 'manual_smartest') {
+    orderedEntries.sort(compareManual);
+  } else if (candidateStrategy === 'retry_cheapest' || candidateStrategy === 'validate_cheapest') {
+    orderedEntries.sort(compareCheapest);
+  }
+  const orderedList = orderedEntries.map((entry) => entry.spec);
+  const cooldownFiltered = orderedList.filter((spec) => !getModelCooldown(spec));
+  const finalOrderedList = cooldownFiltered.length ? cooldownFiltered : orderedList;
+  return {
+    orderedList: finalOrderedList,
+    originalRequestedModelList,
+    isManual: Boolean(isManualTrigger),
+    candidateStrategy
+  };
+}
+
+function classifyFallbackReason(error) {
+  if (!error) return 'unknown_error';
+  if (error?.fallbackReason) return error.fallbackReason;
+  const status = error?.status;
+  const message = String(error?.message || '').toLowerCase();
+  if (error?.isRateLimit || status === 429) return 'rate_limit';
+  if (message.includes('tpm') || message.includes('tokens per minute')) return 'tpm_limit';
+  if (status === 404 || message.includes('not found')) return 'model_not_found';
+  if (message.includes('service_tier')) return 'service_tier_unavailable';
+  if (status === 503 || status === 502 || status === 504 || message.includes('unavailable')) return 'unavailable';
+  if (message.includes('unsupported') || message.includes('unknown parameter')) return 'unsupported_param';
+  return 'request_failed';
+}
+
+function shouldFallbackToStandard(error) {
+  const message = String(error?.message || '').toLowerCase();
+  if (message.includes('service_tier')) return true;
+  if (error?.fallbackReason && String(error.fallbackReason).includes('service_tier')) return true;
+  if (error?.fallbackReason && String(error.fallbackReason).includes('unsupported_param')) return true;
+  return false;
+}
+
+function recordCooldownIfNeeded(modelSpec, reason, error) {
+  if (!modelSpec) return;
+  if (reason === 'tpm_limit' || reason === 'rate_limit') {
+    setModelCooldown(modelSpec, error);
+  }
+}
+
+function deriveTaskType(stage, requestMeta = {}) {
+  const flags = requestMeta?.flags || {};
+  if (flags.uiMode) return 'ui';
+  const triggerSource = typeof requestMeta?.triggerSource === 'string' ? requestMeta.triggerSource : '';
+  const purpose = typeof requestMeta?.purpose === 'string' ? requestMeta.purpose : '';
+  const normalizedTrigger = triggerSource.toLowerCase();
+  const normalizedPurpose = purpose.toLowerCase();
+  if (normalizedPurpose.includes('repair') || normalizedTrigger.includes('repair')) return 'repair';
+  if (normalizedPurpose.includes('validate') || normalizedTrigger.includes('validate')) return 'validate';
+  if (stage === 'proofread') return 'proofread';
+  return 'translation';
+}
+
+function buildMissingKeyReason(roleLabel, config, model) {
+  return `Перевод недоступен: укажите OpenAI API ключ для модели ${model} (${roleLabel}).`;
+}
+
+async function getState() {
+  if (STATE_CACHE_READY && STATE_CACHE && typeof STATE_CACHE === 'object') {
+    return { ...DEFAULT_STATE, ...STATE_CACHE };
+  }
+
+  try {
+    let stored;
+    try {
+      stored = await storageLocalGet({ ...DEFAULT_STATE });
+    } catch (error) {
+      if (error?.message === 'storageLocalGet timeout') {
+        console.warn('storageLocalGet timed out, retrying with extended timeout.', error);
+        stored = await storageLocalGet({ ...DEFAULT_STATE }, 8000);
+      } else {
+        throw error;
+      }
+    }
+    const safeStored = sanitizeSettings(stored, DEFAULT_STATE);
+    const merged = { ...DEFAULT_STATE, ...safeStored };
+    const previousModels = {
+      translationModel: merged.translationModel,
+      contextModel: merged.contextModel,
+      proofreadModel: merged.proofreadModel,
+      translationModelList: merged.translationModelList,
+      contextModelList: merged.contextModelList,
+      proofreadModelList: merged.proofreadModelList
+    };
+    const fallbackTranslationModel = merged.translationModel || DEFAULT_STATE.translationModel;
+    const fallbackContextModel = merged.contextModel || DEFAULT_STATE.contextModel;
+    const fallbackProofreadModel = merged.proofreadModel || DEFAULT_STATE.proofreadModel;
+    merged.translationModelList = normalizeModelList(
+      merged.translationModelList || merged.translationModel,
+      fallbackTranslationModel
+    );
+    merged.contextModelList = normalizeModelList(
+      merged.contextModelList || merged.contextModel,
+      fallbackContextModel
+    );
+    merged.proofreadModelList = normalizeModelList(
+      merged.proofreadModelList || merged.proofreadModel,
+      fallbackProofreadModel
+    );
+    merged.translationModel = parseModelSpec(merged.translationModelList[0]).id || fallbackTranslationModel;
+    merged.contextModel = parseModelSpec(merged.contextModelList[0]).id || fallbackContextModel;
+    merged.proofreadModel = parseModelSpec(merged.proofreadModelList[0]).id || fallbackProofreadModel;
+    if (
+      merged.translationModel !== previousModels.translationModel ||
+      merged.contextModel !== previousModels.contextModel ||
+      merged.proofreadModel !== previousModels.proofreadModel ||
+      !areModelListsEqual(merged.translationModelList, previousModels.translationModelList) ||
+      !areModelListsEqual(merged.contextModelList, previousModels.contextModelList) ||
+      !areModelListsEqual(merged.proofreadModelList, previousModels.proofreadModelList)
+    ) {
+      await storageLocalSet({
+        translationModel: merged.translationModel,
+        contextModel: merged.contextModel,
+        proofreadModel: merged.proofreadModel,
+        translationModelList: merged.translationModelList,
+        contextModelList: merged.contextModelList,
+        proofreadModelList: merged.proofreadModelList
+      });
+    }
+    applyStatePatch(merged);
+    return { ...DEFAULT_STATE, ...STATE_CACHE };
+  } catch (error) {
+    console.warn('Failed to load state from storage, using defaults.', error);
+    if (STATE_CACHE_READY && STATE_CACHE && typeof STATE_CACHE === 'object') {
+      return { ...DEFAULT_STATE, ...STATE_CACHE };
+    }
+    return { ...DEFAULT_STATE };
+  }
+}
+
+async function saveState(partial) {
+  const current = await getState();
+  const next = sanitizeSettings({ ...current, ...partial }, DEFAULT_STATE);
+  await storageLocalSet(pickStateForCache(next));
+  applyStatePatch(next);
+  return next;
+}
+
+async function ensureDefaultKeysOnFreshInstall() {
+  const stored = await storageLocalGet({});
+  const safeStored = stored && typeof stored === 'object' ? stored : {};
+  const patch = {};
+  for (const [key, value] of Object.entries(DEFAULT_STATE)) {
+    if (safeStored[key] === undefined) {
+      patch[key] = value;
+    }
+  }
+  if (Object.keys(patch).length > 0) {
+    await storageLocalSet(patch);
+  }
+  applyStatePatch({ ...DEFAULT_STATE, ...safeStored, ...patch });
+}
+
+startSchedulerTick();
+startBatchPoller();
+
+chrome.runtime.onInstalled.addListener(async (details) => {
+  const reason = details?.reason;
+  if (reason === 'install') {
+    await ensureDefaultKeysOnFreshInstall();
+  } else {
+    await getState();
+  }
+  await warmUpContentScripts(reason || 'installed');
+});
+
+chrome.runtime.onStartup.addListener(async () => {
+  await warmUpContentScripts('startup');
+});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'local') return;
+  const patch = {};
+  for (const [key, change] of Object.entries(changes || {})) {
+    if (!STATE_CACHE_KEYS.has(key)) continue;
+    patch[key] = change?.newValue;
+  }
+  applyStatePatch(sanitizeSettings(patch, {}));
+});
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (!port) return;
+  if (port.name === UI_PORT_NAMES.debug || port.name === UI_PORT_NAMES.popup) {
+    registerUiPort(port, port.name);
+    return;
+  }
+  if (port.name !== NT_RPC_PORT_NAME) return;
+  const tabId = port.sender?.tab?.id ?? null;
+  port.onMessage.addListener((msg) => {
+    if (!msg || typeof msg !== 'object') return;
+    const rpcId = msg.rpcId;
+    if (typeof rpcId !== 'string') return;
+    const type = msg.type;
+    const startedAt = Date.now();
+    globalThis.ntJsonLog?.({
+      kind: 'rpc.bg.request',
+      rpcId,
+      type,
+      tabId,
+      senderUrl: port.sender?.url ?? null,
+      msg,
+      ts: startedAt
+    });
+    const postResponse = (response) => {
+      try {
+        globalThis.ntJsonLog?.({
+          kind: 'rpc.bg.response',
+          rpcId,
+          type,
+          tabId,
+          response,
+          durationMs: Date.now() - startedAt,
+          ts: Date.now()
+        });
+        port.postMessage({ rpcId, response });
+      } catch (error) {
+        console.warn('Failed to post RPC response.', { error, rpcId, type, tabId });
+      }
+    };
+
+    let responsePromise;
+    switch (type) {
+      case 'RPC_HEARTBEAT':
+        responsePromise = Promise.resolve({ ok: true, ts: Date.now() });
+        break;
+      case 'TRANSLATE_TEXT':
+        responsePromise = invokeHandlerAsPromise(handleTranslateText, msg, 480000);
+        break;
+      case 'GENERATE_CONTEXT':
+        responsePromise = invokeHandlerAsPromise(handleGenerateContext, msg, 180000);
+        break;
+      case 'GENERATE_SHORT_CONTEXT':
+        responsePromise = invokeHandlerAsPromise(handleGenerateShortContext, msg, 180000);
+        break;
+      case 'PROOFREAD_TEXT':
+        responsePromise = invokeHandlerAsPromise(handleProofreadText, msg, 360000);
+        break;
+      case 'START_PAGE_PLAN':
+        responsePromise = invokeHandlerAsPromise(handleStartPagePlan, msg, 5000);
+        break;
+      case 'SCHEDULER_REQUEST_SLOT':
+        responsePromise = invokeHandlerAsPromise(handleSchedulerRequestSlot, msg, 2000);
+        break;
+      case 'SCHEDULER_RECORD_OUTCOME':
+        responsePromise = invokeHandlerAsPromise(handleSchedulerRecordOutcome, msg, 2000);
+        break;
+      case 'START_BATCH_PREWARM':
+        responsePromise = invokeHandlerAsPromise(handleStartBatchPrewarm, msg, 5000);
+        break;
+      case 'GET_SETTINGS':
+        responsePromise = invokeSettingsAsPromise(handleGetSettings, msg, 1500).then((settings) => ({
+          ok: true,
+          settings
+        }));
+        break;
+      case 'GET_TAB_ID':
+        responsePromise = Promise.resolve({ ok: true, tabId });
+        break;
+      default:
+        responsePromise = Promise.resolve({
+          success: false,
+          error: `Unknown RPC type: ${type}`,
+          isRuntimeError: true
+        });
+        break;
+    }
+
+    Promise.resolve(responsePromise)
+      .then((response) => {
+        postResponse(response);
+      })
+      .catch((error) => {
+        globalThis.ntJsonLog?.({
+          kind: 'rpc.bg.error',
+          rpcId,
+          type,
+          tabId,
+          error: error?.message || String(error)
+        });
+        postResponse({
+          success: false,
+          error: error?.message || String(error),
+          isRuntimeError: true
+        });
+      });
+  });
+});
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === 'DEBUG_STORE_RAW') {
+    const shouldLog = globalThis.__NT_DEBUG__ || globalThis.__NT_DEV__;
+    const startedAt = Date.now();
+    const recordId = message?.record?.id || '';
+    let responded = false;
+    const timeoutMs = 1200;
+    const timeoutId = setTimeout(() => {
+      if (responded) return;
+      responded = true;
+      if (shouldLog) {
+        console.debug('DEBUG_STORE_RAW timeout', { id: recordId, durationMs: Date.now() - startedAt });
+      }
+      sendResponse({ ok: false, error: 'raw-store-timeout' });
+    }, timeoutMs);
+    if (shouldLog) {
+      console.debug('DEBUG_STORE_RAW start', { id: recordId });
+    }
+    Promise.resolve()
+      .then(() => storeDebugRaw(message?.record || {}))
+      .then((result) => {
+        if (responded) return;
+        responded = true;
+        clearTimeout(timeoutId);
+        if (shouldLog) {
+          console.debug('DEBUG_STORE_RAW end', { id: recordId, ok: result?.ok, durationMs: Date.now() - startedAt });
+        }
+        sendResponse(result || { ok: false, error: 'store-failed' });
+      })
+      .catch((error) => {
+        if (responded) return;
+        responded = true;
+        clearTimeout(timeoutId);
+        if (shouldLog) {
+          console.debug('DEBUG_STORE_RAW error', {
+            id: recordId,
+            durationMs: Date.now() - startedAt,
+            error: error?.message || String(error)
+          });
+        }
+        sendResponse({ ok: false, error: error?.message || String(error) });
+      });
+    return true;
+  }
+
+  if (message?.type === 'DEBUG_GET_RAW') {
+    Promise.resolve()
+      .then(() => getDebugRaw(message?.rawId))
+      .then((record) => {
+        sendResponse({ ok: true, record: record || null });
+      })
+      .catch((error) => {
+        sendResponse({ ok: false, error: error?.message || String(error) });
+      });
+    return true;
+  }
+
+  if (message?.type === 'DEBUG_GET_SNAPSHOT') {
+    Promise.resolve()
+      .then(() => getDebugSnapshot(message?.sourceUrl || ''))
+      .then((snapshot) => {
+        sendResponse({ ok: true, snapshot: snapshot || null });
+      })
+      .catch((error) => {
+        sendResponse({ ok: false, error: error?.message || String(error) });
+      });
+    return true;
+  }
+
+  if (message?.type === 'DEBUG_NOTIFY') {
+    const sourceUrl = typeof message?.sourceUrl === 'string' ? message.sourceUrl : '';
+    const delivered = broadcastToPorts(DEBUG_PORTS, { type: 'DEBUG_UPDATED', sourceUrl });
+    sendResponse({ ok: true, delivered });
+    return true;
+  }
+
+  if (message?.type === 'GET_SETTINGS') {
+    const requestId =
+      typeof message?.requestId === 'string' && message.requestId
+        ? message.requestId
+        : `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    sendResponse({ ok: true, requestId });
+    const tabId = sender?.tab?.id;
+    if (!tabId) {
+      return true;
+    }
+    Promise.resolve()
+      .then(async () => {
+        const settings = await computeSettingsViaHandle({ ...message, requestId });
+        const safeSettings =
+          settings && typeof settings === 'object'
+            ? settings
+            : {
+                allowed: false,
+                disallowedReason:
+                  'Перевод недоступен: не удалось получить настройки. Перезагрузите страницу и попробуйте снова.',
+                apiKey: DEFAULT_STATE.apiKey,
+                translationModel: DEFAULT_STATE.translationModel,
+                contextModel: DEFAULT_STATE.contextModel,
+                proofreadModel: DEFAULT_STATE.proofreadModel,
+                translationModelList: DEFAULT_STATE.translationModelList,
+                contextModelList: DEFAULT_STATE.contextModelList,
+                proofreadModelList: DEFAULT_STATE.proofreadModelList,
+                contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
+                proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+                assumeOpenAICompatibleApi: DEFAULT_STATE.assumeOpenAICompatibleApi,
+                blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
+                tpmLimitsByRole: {
+                  translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
+                  context: getTpmLimitForModel(DEFAULT_STATE.contextModel, DEFAULT_STATE.tpmLimitsByModel),
+                  proofread: getTpmLimitForModel(DEFAULT_STATE.proofreadModel, DEFAULT_STATE.tpmLimitsByModel)
+                },
+                outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
+                tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+              };
+        chrome.tabs.sendMessage(
+          tabId,
+          { type: NT_SETTINGS_RESPONSE_TYPE, requestId, settings: safeSettings },
+          () => {
+            if (chrome.runtime.lastError) {
+              console.debug('Failed to deliver settings response to tab.', chrome.runtime.lastError.message);
+            }
+          }
+        );
+      })
+      .catch((error) => {
+        console.warn('Failed to compute settings for tab message.', error);
+      });
+    return true;
+  }
+
+  if (message?.type === 'TRANSLATE_TEXT') {
+    handleTranslateText(message, sendResponse);
+    return true;
+  }
+
+  if (message?.type === 'GENERATE_CONTEXT') {
+    handleGenerateContext(message, sendResponse);
+    return true;
+  }
+
+  if (message?.type === 'GENERATE_SHORT_CONTEXT') {
+    handleGenerateShortContext(message, sendResponse);
+    return true;
+  }
+
+  if (message?.type === 'PROOFREAD_TEXT') {
+    handleProofreadText(message, sendResponse);
+    return true;
+  }
+
+  if (message?.type === 'GET_TAB_ID') {
+    sendResponse({ tabId: sender?.tab?.id ?? null });
+    return true;
+  }
+
+  if (message?.type === 'NT_GET_PROGRESS') {
+    const tabId = message?.tabId ?? sender?.tab?.id;
+    sendResponse({ ok: true, snapshot: tabId ? ntProgressByTab?.[tabId] || null : null });
+    return true;
+  }
+
+  if (message?.type === 'NT_SET_TOTAL') {
+    const tabId = message?.tabId ?? sender?.tab?.id;
+    if (!tabId) {
+      sendResponse({ ok: false, error: 'missing-tab' });
+      return true;
+    }
+    const channel = message?.channel === 'prewarm' ? 'prewarm' : 'page';
+    setTotals(tabId, message?.totals || {}, channel);
+    const reason =
+      typeof message?.reason === 'string' && message.reason.trim()
+        ? message.reason.trim()
+        : 'setTotal';
+    publishProgress(tabId, reason, { force: true });
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (message?.type === 'NT_PROGRESS_PULSE') {
+    const tabId = message?.tabId ?? sender?.tab?.id;
+    if (!tabId) {
+      sendResponse({ ok: false, error: 'missing-tab' });
+      return true;
+    }
+    const channel = message?.channel === 'prewarm' ? 'prewarm' : 'page';
+    const totalsSource = message?.totals || {};
+    const totalsPatch = {};
+    const total = Number.isFinite(message?.total) ? message.total : totalsSource.total;
+    const done = Number.isFinite(message?.done) ? message.done : totalsSource.done;
+    const failed = Number.isFinite(message?.failed) ? message.failed : totalsSource.failed;
+    const inFlight = Number.isFinite(message?.inFlight) ? message.inFlight : totalsSource.inFlight;
+    const queued = Number.isFinite(message?.queued) ? message.queued : totalsSource.queued;
+    if (Number.isFinite(total)) totalsPatch.total = total;
+    if (Number.isFinite(done)) totalsPatch.done = done;
+    if (Number.isFinite(failed)) totalsPatch.failed = failed;
+    if (Number.isFinite(inFlight)) totalsPatch.inFlight = inFlight;
+    if (Number.isFinite(queued)) totalsPatch.queued = queued;
+    const reason =
+      typeof message?.reason === 'string' && message.reason.trim()
+        ? message.reason.trim()
+        : 'pulse';
+    if (!Object.keys(totalsPatch).length && reason === 'start_cmd') {
+      const existingInFlight =
+        ntProgressStateByTab[tabId]?.channels?.[channel]?.totals?.inFlight ?? 0;
+      totalsPatch.inFlight = Math.max(existingInFlight, 1);
+    }
+    if (Object.keys(totalsPatch).length) {
+      setTotals(tabId, totalsPatch, channel);
+    }
+    publishProgress(tabId, reason, { force: true });
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (message?.type === 'NT_REPORT_PREFLIGHT') {
+    const tabId = message?.tabId ?? sender?.tab?.id;
+    if (!tabId) {
+      sendResponse({ ok: false, error: 'missing-tab' });
+      return true;
+    }
+    ntPreflightByTab[tabId] = message?.debug || null;
+    publishProgress(tabId, 'preflight', { force: true });
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (message?.type === 'NT_REPORT_ERROR') {
+    const tabId = message?.tabId ?? sender?.tab?.id;
+    if (!tabId) {
+      sendResponse({ ok: false, error: 'missing-tab' });
+      return true;
+    }
+    setLastError(tabId, message || {});
+    publishProgress(tabId, 'error', { force: true });
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (message?.type === 'SYNC_STATE_CACHE') {
+    try {
+      applyStatePatch(message?.state || {});
+    } catch (error) {
+      console.warn('Failed to sync state cache.', error);
+    }
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (message?.type === 'CANCEL_PAGE_TRANSLATION' && sender?.tab?.id) {
+    sendMessageToTabSafe(sender.tab, { type: 'CANCEL_TRANSLATION' }).then((result) => {
+      if (!result.ok) {
+        console.warn('Failed to cancel translation via tab message.', result.reason);
+      }
+    });
+  }
+
+  if (message?.type === 'NT_CONTENT_READY' && sender?.tab?.id) {
+    CONTENT_READY_BY_TAB.set(sender.tab.id, Date.now());
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (message?.type === 'ENSURE_CONTENT_SCRIPT') {
+    const tabId = Number(message.tabId);
+    if (!Number.isFinite(tabId)) {
+      sendResponse({ ok: false, reason: 'tab-not-found' });
+      return true;
+    }
+    chrome.tabs.get(tabId, async (tab) => {
+      if (chrome.runtime.lastError) {
+        sendResponse({ ok: false, reason: chrome.runtime.lastError.message });
+        return;
+      }
+      if (!tab?.url || !isInjectableTabUrl(tab.url)) {
+        sendResponse({ ok: false, reason: 'unsupported-url' });
+        return;
+      }
+      const injected = await ensureContentScriptInjected(tabId);
+      if (injected.ok) {
+        CONTENT_READY_BY_TAB.set(tabId, Date.now());
+        sendResponse({ ok: true });
+      } else {
+        sendResponse({ ok: false, reason: injected.reason || 'inject-failed' });
+      }
+    });
+    return true;
+  }
+
+  if (message?.type === 'TRANSLATION_PROGRESS') {
+    handleTranslationProgress(message, sender);
+  }
+
+  if (message?.type === 'NT_SELF_CHECK') {
+    handleSelfCheck(sendResponse, message);
+    return true;
+  }
+
+  if (message?.type === 'TRANSLATION_CANCELLED') {
+    handleTranslationCancelled(message, sender);
+  }
+
+  if (message?.type === 'UPDATE_TRANSLATION_VISIBILITY') {
+    handleTranslationVisibility(message, sender);
+  }
+
+  if (message?.type === 'GET_TRANSLATION_STATUS') {
+    handleGetTranslationStatus(sendResponse, sender?.tab?.id);
+    return true;
+  }
+
+  return false;
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  CONTENT_READY_BY_TAB.delete(tabId);
+  delete ntProgressByTab[tabId];
+  delete ntProgressStateByTab[tabId];
+  delete ntPreflightByTab[tabId];
+  lastProgressPublishedAt.delete(tabId);
+  void storageLocalSet({ ntProgressByTab });
+});
+
+async function warmUpContentScripts(reason) {
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      if (!tab?.id || !isInjectableTabUrl(tab.url)) {
+        continue;
+      }
+      if (tab.status && tab.status !== 'complete') {
+        continue;
+      }
+      if (CONTENT_READY_BY_TAB.has(tab.id)) {
+        continue;
+      }
+      const injected = await ensureContentScriptInjected(tab.id);
+      if (injected.ok) {
+        CONTENT_READY_BY_TAB.set(tab.id, Date.now());
+      } else {
+        console.debug('Content script warm-up skipped.', { reason, tabId: tab.id, error: injected.reason });
+      }
+    }
+  } catch (error) {
+    console.warn('Failed to warm up content scripts.', error);
+  }
+}
+
+function computeSettingsViaHandle(messageForHandle) {
+  return new Promise((resolve) => {
+    let done = false;
+    const safeResolve = (payload) => {
+      if (done) return;
+      done = true;
+      resolve(payload && typeof payload === 'object' ? payload : null);
+    };
+    const timer = setTimeout(() => safeResolve(null), 1500);
+    Promise.resolve()
+      .then(() =>
+        handleGetSettings(messageForHandle, (resp) => {
+          clearTimeout(timer);
+          safeResolve(resp);
+        })
+      )
+      .catch(() => {
+        clearTimeout(timer);
+        safeResolve(null);
+      });
+  });
+}
+
+async function handleGetSettings(message, sendResponse) {
+  let response = null;
+  try {
+    const state = await getState();
+    if (!state || typeof state !== 'object') {
+      response = {
+        allowed: false,
+        disallowedReason:
+          'Перевод недоступен: не удалось получить настройки. Перезагрузите страницу и попробуйте снова.',
+        apiKey: DEFAULT_STATE.apiKey,
+        translationModel: DEFAULT_STATE.translationModel,
+        contextModel: DEFAULT_STATE.contextModel,
+        proofreadModel: DEFAULT_STATE.proofreadModel,
+        translationModelList: DEFAULT_STATE.translationModelList,
+        contextModelList: DEFAULT_STATE.contextModelList,
+        proofreadModelList: DEFAULT_STATE.proofreadModelList,
+        contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
+        proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+        batchTurboMode: DEFAULT_STATE.batchTurboMode,
+        singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
+        assumeOpenAICompatibleApi: DEFAULT_STATE.assumeOpenAICompatibleApi,
+        blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
+        tpmLimitsByRole: {
+          translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
+          context: getTpmLimitForModel(DEFAULT_STATE.contextModel, DEFAULT_STATE.tpmLimitsByModel),
+          proofread: getTpmLimitForModel(DEFAULT_STATE.proofreadModel, DEFAULT_STATE.tpmLimitsByModel)
+        },
+        outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
+        tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+      };
+    } else {
+      const translationModel = getPrimaryModelId(state.translationModelList, state.translationModel);
+      const contextModel = getPrimaryModelId(state.contextModelList, state.contextModel);
+      const proofreadModel = getPrimaryModelId(state.proofreadModelList, state.proofreadModel);
+      const translationConfig = getApiConfigForModel(translationModel, state);
+      const contextConfig = getApiConfigForModel(contextModel, state);
+      const proofreadConfig = getApiConfigForModel(proofreadModel, state);
+      const tpmLimitsByRole = {
+        translation: getTpmLimitForModel(translationModel, state.tpmLimitsByModel),
+        context: getTpmLimitForModel(contextModel, state.tpmLimitsByModel),
+        proofread: getTpmLimitForModel(proofreadModel, state.tpmLimitsByModel)
+      };
+      const hasTranslationKey = Boolean(translationConfig.apiKey);
+      const hasContextKey = Boolean(contextConfig.apiKey);
+      const hasProofreadKey = Boolean(proofreadConfig.apiKey);
+      let disallowedReason = null;
+      if (!hasTranslationKey) {
+        disallowedReason = buildMissingKeyReason('перевод', translationConfig, translationModel);
+      } else if (state.contextGenerationEnabled && !hasContextKey) {
+        disallowedReason = buildMissingKeyReason('контекст', contextConfig, contextModel);
+      } else if (state.proofreadEnabled && !hasProofreadKey) {
+        disallowedReason = buildMissingKeyReason('вычитка', proofreadConfig, proofreadModel);
+      }
+      response = {
+        allowed:
+          hasTranslationKey &&
+          (!state.contextGenerationEnabled || hasContextKey) &&
+          (!state.proofreadEnabled || hasProofreadKey),
+        disallowedReason,
+        apiKey: state.apiKey,
+        translationModel,
+        contextModel,
+        proofreadModel,
+        translationModelList: state.translationModelList,
+        contextModelList: state.contextModelList,
+        proofreadModelList: state.proofreadModelList,
+        contextGenerationEnabled: state.contextGenerationEnabled,
+        proofreadEnabled: state.proofreadEnabled,
+        batchTurboMode: state.batchTurboMode || DEFAULT_STATE.batchTurboMode,
+        singleBlockConcurrency: state.singleBlockConcurrency,
+        assumeOpenAICompatibleApi: state.assumeOpenAICompatibleApi,
+        blockLengthLimit: state.blockLengthLimit,
+        tpmLimitsByRole,
+        outputRatioByRole: state.outputRatioByRole || DEFAULT_OUTPUT_RATIO_BY_ROLE,
+        tpmSafetyBufferTokens:
+          Number.isFinite(state.tpmSafetyBufferTokens) && state.tpmSafetyBufferTokens >= 0
+            ? state.tpmSafetyBufferTokens
+            : DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+      };
+    }
+  } catch (error) {
+    console.error('Failed to fetch settings.', error);
+    response = {
+      allowed: false,
+      disallowedReason:
+        'Перевод недоступен: не удалось получить настройки. Перезагрузите страницу и попробуйте снова.',
+      apiKey: DEFAULT_STATE.apiKey,
+      translationModel: DEFAULT_STATE.translationModel,
+      contextModel: DEFAULT_STATE.contextModel,
+      proofreadModel: DEFAULT_STATE.proofreadModel,
+      translationModelList: DEFAULT_STATE.translationModelList,
+      contextModelList: DEFAULT_STATE.contextModelList,
+      proofreadModelList: DEFAULT_STATE.proofreadModelList,
+      contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
+      proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+      batchTurboMode: DEFAULT_STATE.batchTurboMode,
+      singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
+      assumeOpenAICompatibleApi: DEFAULT_STATE.assumeOpenAICompatibleApi,
+      blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
+      tpmLimitsByRole: {
+        translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
+        context: getTpmLimitForModel(DEFAULT_STATE.contextModel, DEFAULT_STATE.tpmLimitsByModel),
+        proofread: getTpmLimitForModel(DEFAULT_STATE.proofreadModel, DEFAULT_STATE.tpmLimitsByModel)
+      },
+      outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
+      tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+    };
+  } finally {
+    if (!response) {
+      response = {
+        allowed: false,
+        disallowedReason:
+          'Перевод недоступен: не удалось получить настройки. Перезагрузите страницу и попробуйте снова.',
+        apiKey: DEFAULT_STATE.apiKey,
+        translationModel: DEFAULT_STATE.translationModel,
+        contextModel: DEFAULT_STATE.contextModel,
+        proofreadModel: DEFAULT_STATE.proofreadModel,
+        translationModelList: DEFAULT_STATE.translationModelList,
+        contextModelList: DEFAULT_STATE.contextModelList,
+        proofreadModelList: DEFAULT_STATE.proofreadModelList,
+        contextGenerationEnabled: DEFAULT_STATE.contextGenerationEnabled,
+        proofreadEnabled: DEFAULT_STATE.proofreadEnabled,
+        batchTurboMode: DEFAULT_STATE.batchTurboMode,
+        singleBlockConcurrency: DEFAULT_STATE.singleBlockConcurrency,
+        assumeOpenAICompatibleApi: DEFAULT_STATE.assumeOpenAICompatibleApi,
+        blockLengthLimit: DEFAULT_STATE.blockLengthLimit,
+        tpmLimitsByRole: {
+          translation: getTpmLimitForModel(DEFAULT_STATE.translationModel, DEFAULT_STATE.tpmLimitsByModel),
+          context: getTpmLimitForModel(DEFAULT_STATE.contextModel, DEFAULT_STATE.tpmLimitsByModel),
+          proofread: getTpmLimitForModel(DEFAULT_STATE.proofreadModel, DEFAULT_STATE.tpmLimitsByModel)
+        },
+        outputRatioByRole: DEFAULT_OUTPUT_RATIO_BY_ROLE,
+        tpmSafetyBufferTokens: DEFAULT_TPM_SAFETY_BUFFER_TOKENS
+      };
+    }
+    sendResponse(response);
+  }
+}
+
+async function executeModelFallback(stage, state, message, handler) {
+  const baseRequestMeta = message?.requestMeta && typeof message.requestMeta === 'object' ? message.requestMeta : {};
+  const { orderedList, originalRequestedModelList, candidateStrategy } = getCandidateModels(stage, baseRequestMeta, state);
+  const preferredSpec = originalRequestedModelList?.[0] || orderedList?.[0] || '';
+  const taskType = deriveTaskType(stage, baseRequestMeta);
+  const operationType = typeof getPromptCacheKey === 'function' ? getPromptCacheKey(stage) : stage;
+  const host = (() => {
+    try {
+      const url = baseRequestMeta?.url || '';
+      return url ? new URL(url).host : '';
+    } catch (error) {
+      return '';
+    }
+  })();
+  const router = globalThis.ntModelRouter;
+  const routerChoice = router && typeof router.selectModel === 'function'
+    ? router.selectModel({
+        type: taskType,
+        preferredModel: preferredSpec,
+        allowedModels: originalRequestedModelList,
+        allowMoreExpensiveFallback: false,
+        allowCheaperFallback: true,
+        operationType,
+        requestId: baseRequestMeta?.requestId || '',
+        estimatedTokens: message?.estimatedTokens ?? null,
+        host
+      })
+    : null;
+  let routedList = orderedList;
+  if (routerChoice?.chosenSpec) {
+    routedList = [routerChoice.chosenSpec, ...orderedList.filter((spec) => spec !== routerChoice.chosenSpec)];
+  }
+  if (message?.requestOptions?.resilience?.forceAlternateModel && routedList.length > 1) {
+    const preferredCandidate = preferredSpec || routedList[0];
+    const alternate = routedList.find((spec) => spec !== preferredCandidate);
+    if (alternate) {
+      routedList = [alternate, ...routedList.filter((spec) => spec !== alternate)];
+    }
+  }
+  let attemptIndex = 0;
+  let lastError = null;
+  let fallbackReasonForNext = null;
+
+  for (const modelSpec of routedList) {
+    const parsed = parseModelSpec(modelSpec);
+    const modelId = parsed.id;
+    const requestedTier = parsed.tier;
+    if (!modelId) continue;
+    const flexEntry = getModelEntry(modelId, 'flex');
+    const standardEntry = getModelEntry(modelId, 'standard');
+    const attemptWithTier = async (tier, fallbackReason) => {
+      attemptIndex += 1;
+      const selectedModelSpec = formatModelSpec(modelId, tier);
+      const requestMeta = {
+        ...baseRequestMeta,
+        selectedModel: modelId,
+        selectedTier: tier,
+        selectedModelSpec,
+        attemptIndex,
+        fallbackReason: fallbackReason || baseRequestMeta.fallbackReason || '',
+        originalRequestedModelList,
+        candidateStrategy,
+        candidateOrderedList: orderedList
+      };
+      const requestOptions = {
+        tier,
+        serviceTier: tier === 'flex' ? 'flex' : null,
+        assumeOpenAICompatibleApi: Boolean(state.assumeOpenAICompatibleApi),
+        ...(message?.requestOptions || {})
+      };
+      return handler({ modelId, requestOptions, requestMeta });
+    };
+
+    const attemptFallbackReason = fallbackReasonForNext;
+    fallbackReasonForNext = null;
+
+    if (requestedTier === 'flex') {
+      if (!flexEntry) {
+        if (standardEntry) {
+          try {
+            return await attemptWithTier('standard', attemptFallbackReason || 'service_tier_unavailable');
+          } catch (standardError) {
+            lastError = standardError;
+            const standardReason = classifyFallbackReason(standardError);
+            recordCooldownIfNeeded(formatModelSpec(modelId, 'standard'), standardReason, standardError);
+            fallbackReasonForNext = standardReason;
+            continue;
+          }
+        }
+        lastError = new Error('Requested flex tier unavailable.');
+        fallbackReasonForNext = classifyFallbackReason(lastError);
+        continue;
+      }
+      try {
+        return await attemptWithTier('flex', attemptFallbackReason);
+      } catch (error) {
+        lastError = error;
+        const reason = classifyFallbackReason(error);
+        recordCooldownIfNeeded(formatModelSpec(modelId, 'flex'), reason, error);
+        if (shouldFallbackToStandard(error) && standardEntry) {
+          try {
+            return await attemptWithTier('standard', reason);
+          } catch (standardError) {
+            lastError = standardError;
+            const standardReason = classifyFallbackReason(standardError);
+            recordCooldownIfNeeded(formatModelSpec(modelId, 'standard'), standardReason, standardError);
+            fallbackReasonForNext = standardReason;
+            continue;
+          }
+        }
+        fallbackReasonForNext = reason;
+        continue;
+      }
+    }
+
+    if (requestedTier === 'standard') {
+      if (!standardEntry) {
+        lastError = new Error('Requested standard tier unavailable.');
+        fallbackReasonForNext = classifyFallbackReason(lastError);
+        continue;
+      }
+      try {
+        return await attemptWithTier('standard', attemptFallbackReason);
+      } catch (error) {
+        lastError = error;
+        const reason = classifyFallbackReason(error);
+        recordCooldownIfNeeded(formatModelSpec(modelId, 'standard'), reason, error);
+        fallbackReasonForNext = reason;
+      }
+    }
+  }
+
+  throw lastError || new Error('All candidate models failed.');
+}
+
+async function handleTranslateText(message, sendResponse) {
+  try {
+    const state = await getState();
+    const primaryModel = getPrimaryModelId(state.translationModelList, state.translationModel);
+    const { apiKey, apiBaseUrl } = getApiConfigForModel(primaryModel, state);
+    if (!apiKey) {
+      sendResponse({ success: false, error: 'API key is missing.' });
+      return;
+    }
+
+    const result = await executeModelFallback('translate', state, message, async ({ modelId, requestOptions, requestMeta }) => {
+      const { translations, rawTranslation, debug } = await translateTexts(
+        message.texts,
+        apiKey,
+        message.targetLanguage,
+        modelId,
+        message.context,
+        apiBaseUrl,
+        message.keepPunctuationTokens,
+        requestMeta,
+        requestOptions
+      );
+      return { translations, rawTranslation, debug };
+    });
+    sendResponse({ success: true, translations: result.translations, rawTranslation: result.rawTranslation, debug: result.debug });
+  } catch (error) {
+    console.error('Translation failed', error);
+    sendResponse({
+      success: false,
+      error: error?.message || 'Unknown error',
+      contextOverflow: Boolean(error?.isContextOverflow)
+    });
+  }
+}
+
+async function handleGenerateContext(message, sendResponse) {
+  try {
+    const state = await getState();
+    const primaryModel = getPrimaryModelId(state.contextModelList, state.contextModel);
+    const { apiKey, apiBaseUrl } = getApiConfigForModel(primaryModel, state);
+    if (!apiKey) {
+      sendResponse({ success: false, error: 'API key is missing.' });
+      return;
+    }
+
+    const contextRequestMeta = {
+      ...(message?.requestMeta || {}),
+      stage: 'context',
+      purpose: message?.requestMeta?.purpose || 'main'
+    };
+    if (
+      (contextRequestMeta.purpose === 'retry' || contextRequestMeta.purpose === 'validate') &&
+      !contextRequestMeta.triggerSource
+    ) {
+      contextRequestMeta.triggerSource = contextRequestMeta.purpose;
+    }
+    const contextMessage = {
+      ...message,
+      requestMeta: contextRequestMeta
+    };
+    const result = await executeModelFallback('context', state, contextMessage, async ({ modelId, requestOptions, requestMeta }) => {
+      const { context, debug } = await generateTranslationContext(
+        message.text,
+        apiKey,
+        message.targetLanguage,
+        modelId,
+        apiBaseUrl,
+        requestMeta,
+        requestOptions
+      );
+      return { context, debug };
+    });
+    sendResponse({ success: true, context: result.context, debug: result.debug });
+  } catch (error) {
+    console.error('Context generation failed', error);
+    sendResponse({ success: false, error: error?.message || 'Unknown error' });
+  }
+}
+
+async function handleGenerateShortContext(message, sendResponse) {
+  try {
+    const state = await getState();
+    const primaryModel = getPrimaryModelId(state.contextModelList, state.contextModel);
+    const { apiKey, apiBaseUrl } = getApiConfigForModel(primaryModel, state);
+    if (!apiKey) {
+      sendResponse({ success: false, error: 'API key is missing.' });
+      return;
+    }
+
+    const contextRequestMeta = {
+      ...(message?.requestMeta || {}),
+      stage: 'context',
+      purpose: message?.requestMeta?.purpose || 'short'
+    };
+    if (
+      (contextRequestMeta.purpose === 'retry' || contextRequestMeta.purpose === 'validate') &&
+      !contextRequestMeta.triggerSource
+    ) {
+      contextRequestMeta.triggerSource = contextRequestMeta.purpose;
+    }
+    const contextMessage = {
+      ...message,
+      requestMeta: contextRequestMeta
+    };
+    const result = await executeModelFallback('context', state, contextMessage, async ({ modelId, requestOptions, requestMeta }) => {
+      const { context, debug } = await generateShortTranslationContext(
+        message.text,
+        apiKey,
+        message.targetLanguage,
+        modelId,
+        apiBaseUrl,
+        requestMeta,
+        requestOptions
+      );
+      return { context, debug };
+    });
+    sendResponse({ success: true, context: result.context, debug: result.debug });
+  } catch (error) {
+    console.error('Short context generation failed', error);
+    sendResponse({ success: false, error: error?.message || 'Unknown error' });
+  }
+}
+
+async function handleProofreadText(message, sendResponse) {
+  try {
+    const state = await getState();
+    const primaryModel = getPrimaryModelId(state.proofreadModelList, state.proofreadModel);
+    const { apiKey, apiBaseUrl } = getApiConfigForModel(primaryModel, state);
+    if (!apiKey) {
+      sendResponse({ success: false, error: 'API key is missing.' });
+      return;
+    }
+
+    const result = await executeModelFallback('proofread', state, message, async ({ modelId, requestOptions, requestMeta }) => {
+      const { translations, rawProofread, debug } = await proofreadTranslation(
+        message.segments,
+        message.sourceBlock,
+        message.translatedBlock,
+        message.context,
+        message.proofreadMode,
+        message.language,
+        apiKey,
+        modelId,
+        apiBaseUrl,
+        requestMeta,
+        requestOptions
+      );
+      return { translations, rawProofread, debug };
+    });
+    sendResponse({
+      success: true,
+      translations: result.translations,
+      rawProofread: result.rawProofread,
+      debug: result.debug
+    });
+  } catch (error) {
+    console.error('Proofreading failed', error);
+    sendResponse({
+      success: false,
+      error: error?.message || 'Unknown error',
+      contextOverflow: Boolean(error?.isContextOverflow)
+    });
+  }
+}
+
+async function handleStartPagePlan(message, sendResponse) {
+  try {
+    const scheduler = getTaskScheduler();
+    if (!scheduler) {
+      sendResponse({ ok: false, error: 'scheduler-unavailable' });
+      return;
+    }
+    const tabId = message?.tabId ?? null;
+    if (!tabId) {
+      sendResponse({ ok: false, error: 'tab-id-missing' });
+      return;
+    }
+    const plan = message?.plan || {};
+    const entry = scheduler.startPlan(tabId, plan);
+    globalThis.ntJsonLog?.({
+      kind: 'preflight.summary',
+      ts: Date.now(),
+      host: plan?.host || '',
+      totals: plan?.totals || {},
+      hints: plan?.hints || {}
+    });
+    sendResponse({ ok: true, planId: entry?.planId || plan?.planId || '' });
+  } catch (error) {
+    sendResponse({ ok: false, error: error?.message || String(error) });
+  }
+}
+
+async function handleSchedulerRequestSlot(message, sendResponse) {
+  try {
+    const scheduler = getTaskScheduler();
+    if (!scheduler) {
+      sendResponse({ ok: false, error: 'scheduler-unavailable' });
+      return;
+    }
+    const key = message?.key || '';
+    const estimatedTokens = Number.isFinite(message?.estimatedTokens) ? message.estimatedTokens : 0;
+    const queueType = message?.queueType || '';
+    const result = scheduler.requestSlot({ key, estimatedTokens, queueType });
+    if (result?.allowed) {
+      globalThis.ntJsonLog?.({
+        kind: 'scheduler.dispatch',
+        ts: Date.now(),
+        taskType: message?.opType || queueType || 'unknown',
+        batchSize: Number.isFinite(message?.batchSize) ? message.batchSize : null,
+        model: key.split(':')[1] || '',
+        estimatedTokens,
+        contextMode: message?.contextMode || ''
+      });
+    }
+    sendResponse({ ok: true, ...result });
+  } catch (error) {
+    sendResponse({ ok: false, error: error?.message || String(error) });
+  }
+}
+
+async function handleSchedulerRecordOutcome(message, sendResponse) {
+  try {
+    const scheduler = getTaskScheduler();
+    if (!scheduler) {
+      sendResponse({ ok: false, error: 'scheduler-unavailable' });
+      return;
+    }
+    const key = message?.key || '';
+    const status = Number.isFinite(message?.status) ? message.status : null;
+    const latencyMs = Number.isFinite(message?.latencyMs) ? message.latencyMs : null;
+    const queueType = message?.queueType || '';
+    const result = scheduler.recordOutcome({ key, status, latencyMs, queueType });
+    if (status === 429) {
+      globalThis.ntJsonLog?.({
+        kind: 'scheduler.backoff',
+        ts: Date.now(),
+        key,
+        backoffMs: result?.backoffMs || 0,
+        reason: '429'
+      });
+    }
+    sendResponse({ ok: true });
+  } catch (error) {
+    sendResponse({ ok: false, error: error?.message || String(error) });
+  }
+}
+
+function getBatchClient() {
+  return globalThis.ntBatchClient || null;
+}
+
+function getBatchPrewarm() {
+  return globalThis.ntBatchPrewarm || null;
+}
+
+async function loadBatchJobs() {
+  const store = await storageLocalGet({ [BATCH_PREWARM_STORAGE_KEY]: [] });
+  const jobs = store?.[BATCH_PREWARM_STORAGE_KEY];
+  return Array.isArray(jobs) ? jobs : [];
+}
+
+async function saveBatchJobs(jobs) {
+  await storageLocalSet({ [BATCH_PREWARM_STORAGE_KEY]: jobs });
+}
+
+async function handleStartBatchPrewarm(message, sendResponse) {
+  try {
+    const batchClient = getBatchClient();
+    const batchPrewarm = getBatchPrewarm();
+    if (!batchClient || !batchPrewarm) {
+      sendResponse({ ok: false, error: 'batch-unavailable' });
+      return;
+    }
+    const state = await getState();
+    if (!state?.apiKey) {
+      globalThis.ntJsonLog?.({
+        kind: 'batch.prewarm.skipped',
+        ts: Date.now(),
+        fields: { reason: 'missing_api_key' }
+      });
+      sendResponse({ ok: true, skipped: true });
+      return;
+    }
+    const items = Array.isArray(message?.items) ? message.items : [];
+    if (!items.length) {
+      globalThis.ntJsonLog?.({
+        kind: 'batch.prewarm.skipped',
+        ts: Date.now(),
+        fields: { reason: 'no_candidates' }
+      });
+      sendResponse({ ok: true, skipped: true });
+      return;
+    }
+    const host = message?.host || '';
+    const targetLang = message?.targetLang || '';
+    const apiBaseUrl = OPENAI_API_URL;
+    const endpoint = batchPrewarm.pickBatchEndpoint(apiBaseUrl);
+    const model = batchPrewarm.pickBatchModel(state, 'translation');
+    const { jsonlText, requestMap, requestCount, inputBytes } = batchPrewarm.buildBatchJsonl({
+      items,
+      host,
+      targetLang,
+      model,
+      endpoint,
+      segmentsPerRequest: 1
+    });
+    if (!requestCount) {
+      globalThis.ntJsonLog?.({
+        kind: 'batch.prewarm.skipped',
+        ts: Date.now(),
+        fields: { reason: 'no_candidates' }
+      });
+      sendResponse({ ok: true, skipped: true });
+      return;
+    }
+    if (requestCount > batchPrewarm.MAX_BATCH_REQUESTS_PER_PAGE || inputBytes > batchPrewarm.MAX_BATCH_BYTES) {
+      globalThis.ntJsonLog?.({
+        kind: 'batch.prewarm.skipped',
+        ts: Date.now(),
+        fields: { reason: 'too_large' }
+      });
+      sendResponse({ ok: true, skipped: true });
+      return;
+    }
+    const config = {
+      apiKey: state.apiKey,
+      openAiOrganization: state.openAiOrganization || '',
+      openAiProject: state.openAiProject || '',
+      apiBaseUrl
+    };
+    let batchInfo;
+    try {
+      const filePayload = await batchClient.uploadBatchFile(jsonlText, config);
+      batchInfo = await batchClient.createBatch(filePayload?.id, endpoint, config);
+      const job = {
+        batchId: batchInfo?.id,
+        host,
+        targetLang,
+        endpoint,
+        model,
+        requestCount,
+        inputBytes,
+        inputFileId: filePayload?.id,
+        outputFileId: batchInfo?.output_file_id || null,
+        status: batchInfo?.status || 'created',
+        createdAt: Date.now(),
+        requestMap
+      };
+      const jobs = await loadBatchJobs();
+      jobs.push(job);
+      await saveBatchJobs(jobs);
+      globalThis.ntJsonLog?.({
+        kind: 'batch.prewarm.created',
+        ts: Date.now(),
+        fields: {
+          host,
+          targetLang,
+          requests: requestCount,
+          endpoint,
+          model,
+          inputBytes,
+          batch_id: batchInfo?.id || ''
+        }
+      });
+      sendResponse({ ok: true, batchId: batchInfo?.id || '' });
+    } catch (error) {
+      globalThis.ntJsonLog?.({
+        kind: 'batch.prewarm.skipped',
+        ts: Date.now(),
+        fields: { reason: 'unsupported_endpoint', error: error?.message || String(error) }
+      });
+      sendResponse({ ok: true, skipped: true });
+    }
+  } catch (error) {
+    sendResponse({ ok: false, error: error?.message || String(error) });
+  }
+}
+
+async function pollBatchPrewarmJobs() {
+  const batchClient = getBatchClient();
+  const batchPrewarm = getBatchPrewarm();
+  if (!batchClient || !batchPrewarm) return;
+  let jobs = [];
+  try {
+    jobs = await loadBatchJobs();
+  } catch (error) {
+    return;
+  }
+  if (!jobs.length) return;
+  const state = await getState();
+  const config = {
+    apiKey: state.apiKey,
+    openAiOrganization: state.openAiOrganization || '',
+    openAiProject: state.openAiProject || '',
+    apiBaseUrl: OPENAI_API_URL
+  };
+  const remaining = [];
+  for (const job of jobs) {
+    if (!job?.batchId) continue;
+    let batchInfo = null;
+    try {
+      batchInfo = await batchClient.pollBatch(job.batchId, config);
+    } catch (error) {
+      remaining.push(job);
+      continue;
+    }
+    const status = batchInfo?.status || job.status;
+    if (status === 'completed' && batchInfo?.output_file_id) {
+      try {
+        const outputText = await batchClient.downloadOutput(batchInfo.output_file_id, config);
+        const parsed = batchPrewarm.parseBatchOutput({ jsonlText: outputText, requestMap: job.requestMap });
+        const { tmWrites } = await batchPrewarm.applyBatchToMemory({
+          storageGet: storageLocalGet,
+          storageSet: storageLocalSet,
+          host: job.host,
+          targetLang: job.targetLang,
+          requestMap: job.requestMap,
+          parsed
+        });
+        globalThis.ntJsonLog?.({
+          kind: 'batch.prewarm.completed',
+          ts: Date.now(),
+          fields: {
+            batch_id: job.batchId,
+            ok: true,
+            errors: parsed.errors || 0,
+            tmWrites,
+            elapsedMs: Date.now() - (job.createdAt || Date.now())
+          }
+        });
+      } catch (error) {
+        globalThis.ntJsonLog?.({
+          kind: 'batch.prewarm.completed',
+          ts: Date.now(),
+          fields: {
+            batch_id: job.batchId,
+            ok: false,
+            errors: 1,
+            tmWrites: 0,
+            elapsedMs: Date.now() - (job.createdAt || Date.now())
+          }
+        });
+      }
+      continue;
+    }
+    if (['failed', 'expired', 'cancelled'].includes(status)) {
+      globalThis.ntJsonLog?.({
+        kind: 'batch.prewarm.completed',
+        ts: Date.now(),
+        fields: {
+          batch_id: job.batchId,
+          ok: false,
+          errors: 1,
+          tmWrites: 0,
+          elapsedMs: Date.now() - (job.createdAt || Date.now())
+        }
+      });
+      continue;
+    }
+    remaining.push({ ...job, status, outputFileId: batchInfo?.output_file_id || job.outputFileId });
+  }
+  await saveBatchJobs(remaining);
+}
+
+async function handleTranslationProgress(message, sender) {
+  const tabId = sender?.tab?.id;
+  if (!tabId) return;
+
+  const status = {
+    completedBlocks: message.completedBlocks || 0,
+    totalBlocks: message.totalBlocks || 0,
+    inProgressBlocks: message.inProgressBlocks || 0,
+    message: message.message || '',
+    timestamp: Date.now()
+  };
+  const { translationStatusByTab = {} } = await storageLocalGet({ translationStatusByTab: {} });
+  translationStatusByTab[tabId] = status;
+  await storageLocalSet({ translationStatusByTab });
+  setTotals(tabId, {
+    total: status.totalBlocks,
+    done: status.completedBlocks,
+    inFlight: status.inProgressBlocks,
+    queued: Math.max(0, (status.totalBlocks || 0) - (status.completedBlocks || 0) - (status.inProgressBlocks || 0))
+  });
+  publishProgress(tabId, 'translationProgress');
+}
+
+function buildProgressSnapshot(tabId, reason) {
+  const stored = ntProgressStateByTab[tabId] || {};
+  const channels = stored.channels || {};
+  const page = channels.page || {};
+  const prewarm = channels.prewarm || {};
+  const pageTotals = page.totals || {};
+  const prewarmTotals = prewarm.totals || {};
+  const totals = stored.totals || pageTotals;
+  const lastError = stored.lastError || page.lastError || null;
+  const busy =
+    (pageTotals.inFlight || 0) +
+      (pageTotals.queued || 0) +
+      (prewarmTotals.inFlight || 0) +
+      (prewarmTotals.queued || 0) >
+    0;
+  return {
+    ts: Date.now(),
+    tabId,
+    reason,
+    totals: {
+      total: totals.total ?? 0,
+      done: totals.done ?? 0,
+      failed: totals.failed ?? 0,
+      inFlight: totals.inFlight ?? 0,
+      queued: totals.queued ?? 0
+    },
+    channels: {
+      page: {
+        totals: {
+          total: pageTotals.total ?? 0,
+          done: pageTotals.done ?? 0,
+          failed: pageTotals.failed ?? 0,
+          inFlight: pageTotals.inFlight ?? 0,
+          queued: pageTotals.queued ?? 0
+        },
+        lastError: page.lastError || null
+      },
+      prewarm: {
+        totals: {
+          total: prewarmTotals.total ?? 0,
+          done: prewarmTotals.done ?? 0,
+          failed: prewarmTotals.failed ?? 0,
+          inFlight: prewarmTotals.inFlight ?? 0,
+          queued: prewarmTotals.queued ?? 0
+        },
+        lastError: prewarm.lastError || null
+      }
+    },
+    busy,
+    stageCounts: stored.stageCounts || {},
+    lastError
+  };
+}
+
+async function publishProgress(tabId, reason, { force = false } = {}) {
+  if (!tabId) return;
+  const now = Date.now();
+  const lastPublish = lastProgressPublishedAt.get(tabId) || 0;
+  if (!force && now - lastPublish < 750) {
+    return;
+  }
+  lastProgressPublishedAt.set(tabId, now);
+  const snapshot = buildProgressSnapshot(tabId, reason);
+  ntProgressByTab[tabId] = snapshot;
+  await storageLocalSet({ ntProgressByTab });
+  sendRuntimeMessageSafe({ type: 'NT_PROGRESS_PUSH', tabId, snapshot });
+}
+
+function setLastError(tabId, { stage, reason, message, channel } = {}) {
+  if (!tabId) return;
+  const entry = ntProgressStateByTab[tabId] || {};
+  const channelKey = channel === 'prewarm' ? 'prewarm' : 'page';
+  entry.channels = entry.channels || {};
+  entry.channels[channelKey] = entry.channels[channelKey] || {};
+  const payload = {
+    ts: Date.now(),
+    stage: stage || 'unknown',
+    reason: reason || 'error',
+    message: message || ''
+  };
+  entry.channels[channelKey].lastError = payload;
+  entry.lastError = channelKey === 'page' ? payload : entry.lastError || payload;
+  ntProgressStateByTab[tabId] = entry;
+}
+
+function setTotals(tabId, totals, channel = 'page') {
+  if (!tabId) return;
+  const entry = ntProgressStateByTab[tabId] || {};
+  const channelKey = channel === 'prewarm' ? 'prewarm' : 'page';
+  entry.channels = entry.channels || {};
+  entry.channels[channelKey] = entry.channels[channelKey] || {};
+  const existingTotals = entry.channels[channelKey].totals || {};
+  entry.channels[channelKey].totals = {
+    total: Number.isFinite(totals?.total) ? totals.total : existingTotals.total || 0,
+    done: Number.isFinite(totals?.done) ? totals.done : existingTotals.done || 0,
+    failed: Number.isFinite(totals?.failed) ? totals.failed : existingTotals.failed || 0,
+    inFlight: Number.isFinite(totals?.inFlight) ? totals.inFlight : existingTotals.inFlight || 0,
+    queued: Number.isFinite(totals?.queued) ? totals.queued : existingTotals.queued || 0
+  };
+  if (channelKey === 'page') {
+    entry.totals = {
+      total: Number.isFinite(totals?.total) ? totals.total : existingTotals.total || 0,
+      done: Number.isFinite(totals?.done) ? totals.done : existingTotals.done || 0,
+      failed: Number.isFinite(totals?.failed) ? totals.failed : existingTotals.failed || 0,
+      inFlight: Number.isFinite(totals?.inFlight) ? totals.inFlight : existingTotals.inFlight || 0,
+      queued: Number.isFinite(totals?.queued) ? totals.queued : existingTotals.queued || 0
+    };
+  }
+  entry.stageCounts = totals?.stageCounts || entry.stageCounts || {};
+  ntProgressStateByTab[tabId] = entry;
+}
+
+async function handleSelfCheck(sendResponse, message = {}) {
+  try {
+    const { translationStatusByTab = {} } = await storageLocalGet({ translationStatusByTab: {} });
+    const progressEntries = Object.values(translationStatusByTab);
+    const lastProgressAt = progressEntries.reduce((latest, entry) => {
+      const ts = Number(entry?.timestamp) || 0;
+      return ts > latest ? ts : latest;
+    }, 0);
+    const tabId = message?.tabId;
+    sendResponse({
+      ok: true,
+      version: chrome.runtime.getManifest().version,
+      stateCacheReady: Boolean(STATE_CACHE_READY),
+      hasStateCache: Boolean(STATE_CACHE),
+      schedulerTickRunning: Boolean(schedulerTickTimer),
+      progressTabs: progressEntries.length,
+      lastProgressAt: lastProgressAt || null,
+      preflight: tabId ? ntPreflightByTab[tabId] || null : null,
+      now: Date.now()
+    });
+  } catch (error) {
+    sendResponse({
+      ok: false,
+      error: error?.message || String(error),
+      now: Date.now()
+    });
+  }
+}
+
+async function handleGetTranslationStatus(sendResponse, tabId) {
+  const { translationStatusByTab = {} } = await storageLocalGet({ translationStatusByTab: {} });
+  sendResponse(translationStatusByTab[tabId] || null);
+}
+
+async function handleTranslationVisibility(message, sender) {
+  const tabId = sender?.tab?.id;
+  if (!tabId) return;
+  const { translationVisibilityByTab = {} } = await storageLocalGet({ translationVisibilityByTab: {} });
+  translationVisibilityByTab[tabId] = Boolean(message.visible);
+  await storageLocalSet({ translationVisibilityByTab });
+  const payload = {
+    type: 'TRANSLATION_VISIBILITY_CHANGED',
+    tabId,
+    visible: Boolean(message.visible)
+  };
+  broadcastToPorts(POPUP_PORTS, payload);
+  sendRuntimeMessageSafe(payload);
+}
+
+async function handleTranslationCancelled(message, sender) {
+  const tabId = message?.tabId ?? sender?.tab?.id;
+  if (!tabId) return;
+  const { translationStatusByTab = {}, translationVisibilityByTab = {} } = await storageLocalGet({
+    translationStatusByTab: {},
+    translationVisibilityByTab: {}
+  });
+  delete translationStatusByTab[tabId];
+  translationVisibilityByTab[tabId] = false;
+  await storageLocalSet({ translationStatusByTab, translationVisibilityByTab });
+  const payload = { type: 'TRANSLATION_CANCELLED', tabId };
+  broadcastToPorts(POPUP_PORTS, payload);
+  sendRuntimeMessageSafe(payload);
+}

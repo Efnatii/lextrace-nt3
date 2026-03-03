@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Neuro Translate",
+  "version": "0.1.0",
+  "description": "Translate pages on demand using GPT-5-Nano.",
+  "permissions": ["storage", "scripting", "tabs"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Neuro Translate"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": [
+        "resilience-policy.js",
+        "ui-translation-memory.js",
+        "proofread-heuristics.js",
+        "segment-dedup.js",
+        "scheduler/page-preflight.js",
+        "settings.js",
+        "content-script.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

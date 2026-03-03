@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>NT E2E Big</title>
+    <style>
+      body { font-family: "Segoe UI", Arial, sans-serif; margin: 20px; }
+      h1 { margin-bottom: 10px; }
+      .item { margin: 0 0 8px; padding: 8px 10px; border-bottom: 1px solid #eceff4; }
+    </style>
+  </head>
+  <body>
+    <h1 id="big-title">Large document for cancellation and scheduler tests</h1>
+    <p id="ui-tick">tick=0</p>
+    <div id="big-root"></div>
+    <script>
+      (function build() {
+        const params = new URLSearchParams(window.location.search || '');
+        const requested = Number(params.get('size'));
+        const size = Number.isFinite(requested) ? Math.max(200, Math.min(20000, Math.round(requested))) : 220;
+        const root = document.getElementById('big-root');
+        for (let i = 0; i < size; i += 1) {
+          const p = document.createElement('p');
+          p.className = 'item';
+          p.id = 'big-p-' + i;
+          p.textContent = 'Paragraph #' + i + ' keeps deterministic content for stress translation and queue fairness checks.';
+          root.appendChild(p);
+        }
+        const tickNode = document.getElementById('ui-tick');
+        window.__ntUiTick = 0;
+        setInterval(() => {
+          window.__ntUiTick += 1;
+          if (tickNode) {
+            tickNode.textContent = 'tick=' + window.__ntUiTick;
+          }
+        }, 120);
+      })();
+    </script>
+  </body>
+</html>

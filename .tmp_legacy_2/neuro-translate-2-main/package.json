@@ -1,0 +1,27 @@
+{
+  "name": "neuro-translate-2",
+  "private": true,
+  "version": "0.1.1",
+  "scripts": {
+    "build:clean": "node tools/build-clean.js",
+    "build:zip": "npm run build:clean && npm run lint:manifest && node tools/build-zip.js",
+    "lint:manifest": "node tools/manifest-audit.js",
+    "smoke:edge": "node tools/run-e2e.js --mode=mock --grep \"C1:|C3: cancel|C5:\"",
+    "test:manifest-audit": "node tools/test-manifest-audit.js",
+    "test:unit:pipeline": "node tools/test-translation-agent.js && node tools/test-agent-runner-tool-calling.js && node tools/test-category-selection.js && node tools/test-popup-category-gating.js",
+    "test:e2e": "playwright test --project=ext-headless --grep-invert \"REAL fimfiction|real-fimfiction\"",
+    "test:e2e:mock": "node tools/run-e2e.js --mode=mock",
+    "test:e2e:real": "playwright test tests/e2e/real-fimfiction-uno.spec.js",
+    "test:e2e:real:headed": "playwright test tests/e2e/real-fimfiction-uno.spec.js --headed",
+    "autofix:real": "node tools/autofix-real-e2e.js",
+    "test:e2e:real:all": "node tools/run-e2e.js --mode=real",
+    "test:e2e:real:fimfiction": "node tools/run-e2e.js --mode=real --real-fimfiction --grep \"REAL fimfiction\" tests/e2e/real-fimfiction-uno.spec.js",
+    "test:e2e:ui": "node tools/run-e2e.js --mode=mock --ui",
+    "test:e2e:headed": "playwright test --project=ext-headed --grep-invert \"REAL fimfiction|real-fimfiction\"",
+    "test:e2e:edge": "node tools/e2e-edge.js",
+    "test:e2e:loop": "node tools/e2e-loop.js"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.52.0"
+  }
+}

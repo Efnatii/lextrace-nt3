@@ -1,0 +1,13 @@
+:root {
+  --nt-highlight: #111;
+  --nt-translation-bg: #fff;
+  --nt-original-opacity: 1;
+}
+
+.neuro-translate-diff {
+  outline: 1px dashed var(--nt-highlight);
+}
+
+.neuro-translate-hidden {
+  display: none !important;
+}

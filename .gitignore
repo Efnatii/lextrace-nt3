@@ -1,0 +1,9 @@
+node_modules/
+dist/
+playwright-report/
+test-results/
+coverage/
+.nyc_output/
+.vscode/
+.idea/
+*.log

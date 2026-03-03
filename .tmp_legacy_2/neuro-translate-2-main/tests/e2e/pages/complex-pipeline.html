@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Complex Pipeline Fixture</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: "Georgia", "Times New Roman", serif;
+        background: #f5f5f5;
+        color: #1d1d1d;
+      }
+      .layout {
+        max-width: 1040px;
+        margin: 0 auto;
+        padding: 24px;
+        display: grid;
+        gap: 24px;
+      }
+      .hero, .panel, .note {
+        background: #fff;
+        border: 1px solid #d6d6d6;
+        border-radius: 10px;
+        padding: 18px;
+      }
+      .columns {
+        display: grid;
+        grid-template-columns: 2fr 1fr;
+        gap: 16px;
+      }
+      .panel h2 {
+        margin: 0 0 10px;
+        font-size: 22px;
+      }
+      .panel p {
+        margin: 0 0 10px;
+        line-height: 1.5;
+      }
+      .dialogue {
+        margin: 0;
+        padding: 12px;
+        border-left: 4px solid #9d9d9d;
+        background: #fafafa;
+        font-style: italic;
+      }
+      .ui-block {
+        display: grid;
+        gap: 10px;
+      }
+      .ui-block label {
+        display: grid;
+        gap: 4px;
+        font-family: "Segoe UI", sans-serif;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-family: "Segoe UI", sans-serif;
+      }
+      th, td {
+        border: 1px solid #d6d6d6;
+        padding: 8px;
+        text-align: left;
+      }
+      .tags {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .tags span {
+        border: 1px solid #c9c9c9;
+        border-radius: 999px;
+        padding: 3px 8px;
+        font-family: "Segoe UI", sans-serif;
+        font-size: 12px;
+      }
+      #dynamic-feed {
+        font-family: "Segoe UI", sans-serif;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="layout">
+      <section class="hero">
+        <h1 id="cp-title">The Glass Harbor Chronicle</h1>
+        <p id="cp-intro">
+          The harbor was awake long before dawn. Cargo cranes moved like mechanical herons, and every dock worker
+          spoke in clipped phrases that sounded like fragments of a secret code.
+        </p>
+        <div class="tags">
+          <span>fantasy</span>
+          <span>mystery</span>
+          <span>industrial city</span>
+          <span>slow burn</span>
+          <span>first person</span>
+        </div>
+      </section>
+
+      <section class="columns">
+        <article class="panel">
+          <h2 id="cp-story-title">Chapter Nine: The Ledger Room</h2>
+          <p id="cp-story-1">
+            Mira laid the brass key on the table and waited. Nobody in the room touched it. The captain studied the
+            wax seal and whispered, “If this record is real, then the rebellion never ended. It only changed uniforms.”
+          </p>
+          <p id="cp-story-2">
+            A rainstorm shook the windows. The clerk opened the ledger and read each entry twice, first for accuracy,
+            then for fear. Every line was dated, signed, and impossible to explain.
+          </p>
+          <blockquote class="dialogue" id="cp-dialogue">
+            “Do not translate the map labels literally,” said Vera. “They are idioms from the old river guild, and
+            literal wording will make the route look absurd.”
+          </blockquote>
+        </article>
+
+        <aside class="panel ui-block">
+          <h2 id="cp-ui-title">Reader Controls</h2>
+          <label for="cp-font">Font style
+            <select id="cp-font">
+              <option>Classic Serif</option>
+              <option>Editorial Sans</option>
+              <option>High Contrast Mono</option>
+            </select>
+          </label>
+          <label for="cp-theme">Theme profile
+            <select id="cp-theme">
+              <option>Daylight</option>
+              <option>Dusk</option>
+              <option>Fog Harbor</option>
+            </select>
+          </label>
+          <label for="cp-note">Reader note
+            <textarea id="cp-note" rows="4">Character names should remain stable across chapters.</textarea>
+          </label>
+          <button id="cp-save" type="button">Save reading settings</button>
+        </aside>
+      </section>
+
+      <section class="panel">
+        <h2 id="cp-table-title">Route Reference Table</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Route ID</th>
+              <th>Origin</th>
+              <th>Destination</th>
+              <th>Cargo Notes</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>A-17</td>
+              <td>North Quay</td>
+              <td>Iris Market</td>
+              <td>Glass ornaments, fragile, keep dry.</td>
+            </tr>
+            <tr>
+              <td>R-04</td>
+              <td>Old Canal</td>
+              <td>Salt Depot</td>
+              <td>Medical salt sacks, urgent restock.</td>
+            </tr>
+            <tr>
+              <td>Z-88</td>
+              <td>Clocktower Dock</td>
+              <td>Inner Delta</td>
+              <td>Restricted manifests, verify signatures manually.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="note">
+        <h2 id="cp-feed-title">Live dispatch feed</h2>
+        <p id="dynamic-feed">No recent dispatches.</p>
+      </section>
+    </main>
+
+    <script>
+      (() => {
+        const feed = document.getElementById('dynamic-feed');
+        const lines = [
+          'Dispatch 14: Storm barrier raised at East Channel.',
+          'Dispatch 15: Three barges delayed for customs audit.',
+          'Dispatch 16: Route Z-88 moved to manual escort.',
+          'Dispatch 17: Harbor office requests translator review.'
+        ];
+        let index = 0;
+        setInterval(() => {
+          if (!feed) return;
+          feed.textContent = lines[index % lines.length];
+          index += 1;
+        }, 2400);
+      })();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neuro Translate</title>
+  <link rel="stylesheet" href="popup.css" />
+  <style>
+    :root {
+      color-scheme: light;
+      --text-primary: #1f2937;
+      --text-secondary: #4b5563;
+      --text-muted: #6b7280;
+      --border: #9ca3af;
+      --surface: #ffffff;
+    }
+    body {
+      font-family: "Inter", "Segoe UI", Arial, sans-serif;
+      margin: 12px;
+      min-width: 320px;
+      color: var(--text-primary);
+      background: var(--surface);
+    }
+    .card {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .header {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .title {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+    .subtitle {
+      margin: 0;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .section {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    details.section {
+      gap: 8px;
+    }
+    details.section > summary {
+      font-size: 12px;
+      color: var(--text-secondary);
+      font-weight: 600;
+      cursor: pointer;
+      list-style: none;
+    }
+    details.section > summary::-webkit-details-marker {
+      display: none;
+    }
+    .details-body {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .summary-count {
+      font-size: 11px;
+      font-weight: 500;
+      color: var(--text-muted);
+    }
+    label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .range-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .range-value {
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+    select,
+    input[type="text"],
+    input[type="password"] {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      color: var(--text-primary);
+      background: var(--surface);
+      font-size: 13px;
+    }
+    select[multiple] {
+      min-height: 140px;
+    }
+    .model-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .model-tier {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 8px;
+      background: #f9fafb;
+    }
+    .model-tier > summary {
+      font-size: 12px;
+      color: var(--text-secondary);
+      font-weight: 600;
+      cursor: pointer;
+      list-style: none;
+    }
+    .model-tier > summary::-webkit-details-marker {
+      display: none;
+    }
+    .model-options {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      margin-top: 6px;
+      max-height: 180px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+    .model-option {
+      display: grid;
+      grid-template-columns: auto 1fr auto auto;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .model-option input {
+      margin-top: 0;
+    }
+    .model-note {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+    .toggle {
+      flex-direction: row;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+    }
+    .toggle input {
+      margin: 0;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(64px, 1fr));
+      gap: 8px;
+    }
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .status-text {
+      font-size: 12px;
+      color: var(--text-secondary);
+      text-align: right;
+      max-width: 45%;
+    }
+    .status-details {
+      font-size: 11px;
+      color: var(--text-muted);
+      text-align: right;
+    }
+    .status-error {
+      font-size: 11px;
+      color: #b91c1c;
+      text-align: right;
+      white-space: pre-wrap;
+    }
+    .progress {
+      position: relative;
+      flex: 1;
+      height: 8px;
+      border-radius: 999px;
+      background: #e5e7eb;
+      overflow: hidden;
+    }
+    .progress__fill {
+      height: 100%;
+      width: 0;
+      background: #2563eb;
+      transition: width 0.2s ease;
+    }
+    button {
+      padding: 8px;
+      border-radius: 8px;
+      border: 1px solid var(--text-primary);
+      background: var(--surface);
+      color: var(--text-primary);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.1s ease, background 0.2s ease, color 0.2s ease;
+    }
+    button:hover {
+      background: var(--text-primary);
+      color: var(--surface);
+    }
+    button:active {
+      transform: translateY(1px);
+    }
+    .secondary-row button {
+      border-color: var(--border);
+      color: var(--text-secondary);
+    }
+    .secondary-row button:hover {
+      background: var(--text-secondary);
+      color: var(--surface);
+    }
+    .icon-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      height: 44px;
+      gap: 6px;
+    }
+    .icon {
+      width: 18px;
+      height: 18px;
+      display: inline-flex;
+    }
+    .icon svg {
+      width: 100%;
+      height: 100%;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .icon-pressed {
+      display: none;
+    }
+    button[aria-pressed="true"] .icon-default {
+      display: none;
+    }
+    button[aria-pressed="true"] .icon-pressed {
+      display: inline-flex;
+    }
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      border: 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <h3 class="title">Neuro Translate</h3>
+    </div>
+    <details class="section" id="apiKeys">
+      <summary>API ключи</summary>
+      <div class="details-body">
+        <label>
+          OpenAI API ключ
+          <input type="password" id="apiKey" placeholder="Введите API-ключ OpenAI" autocomplete="off" />
+        </label>
+        <label>
+          OpenAI Organization
+          <input type="text" id="openAiOrganization" placeholder="Организация (опционально)" autocomplete="off" />
+        </label>
+        <label>
+          OpenAI Project
+          <input type="text" id="openAiProject" placeholder="Проект (опционально)" autocomplete="off" />
+        </label>
+      </div>
+    </details>
+    <details class="section" id="translationModels">
+      <summary><span class="summary-title">Модели перевода</span> <span class="summary-count" id="translationModelCount"></span></summary>
+      <div class="details-body">
+        <label>
+          Список моделей для перевода
+          <span class="model-note">Это список РАЗРЕШЁННЫХ моделей. Код сам выбирает:<br>
+            • manual → самая умная из выбранных (по capability rank)<br>
+            • retry/validate → самая дешёвая из выбранных (по Σ1M)<br>
+            • при ошибках/лимитах пробуются следующие модели из списка</span>
+          <div class="model-list" id="translationModelList"></div>
+        </label>
+      </div>
+    </details>
+    <details class="section" id="contextModels">
+      <summary><span class="summary-title">Модели контекста</span> <span class="summary-count" id="contextModelCount"></span></summary>
+      <div class="details-body">
+        <label>
+          Список моделей для контекста
+          <span class="model-note">Это список РАЗРЕШЁННЫХ моделей. Код сам выбирает:<br>
+            • manual → самая умная из выбранных (по capability rank)<br>
+            • retry/validate → самая дешёвая из выбранных (по Σ1M)<br>
+            • при ошибках/лимитах пробуются следующие модели из списка</span>
+          <div class="model-list" id="contextModelList"></div>
+        </label>
+      </div>
+    </details>
+    <details class="section" id="proofreadModels">
+      <summary><span class="summary-title">Модели для вычитки</span> <span class="summary-count" id="proofreadModelCount"></span></summary>
+      <div class="details-body">
+        <label>
+          Список моделей для вычитки
+          <span class="model-note">Это список РАЗРЕШЁННЫХ моделей. Код сам выбирает:<br>
+            • manual → самая умная из выбранных (по capability rank)<br>
+            • retry/validate → самая дешёвая из выбранных (по Σ1M)<br>
+            • при ошибках/лимитах пробуются следующие модели из списка</span>
+          <div class="model-list" id="proofreadModelList"></div>
+        </label>
+      </div>
+    </details>
+    <div class="section">
+      <label class="toggle">
+        <input type="checkbox" id="contextGeneration" />
+        Генерировать контекст перед переводом
+      </label>
+      <label class="toggle">
+        <input type="checkbox" id="proofreadEnabled" />
+        Выполнять вычитку перевода
+      </label>
+      <label class="toggle">
+        <input type="checkbox" id="singleBlockConcurrency" />
+        Ограничить параллельность: 1 блок за раз (перевод/вычитка)
+      </label>
+      <label class="toggle">
+        <input type="checkbox" id="assumeOpenAICompatibleApi" />
+        Считать прокси OpenAI-совместимым (для prompt caching)
+      </label>
+      <label>
+        Batch Turbo Mode (prewarm)
+        <select id="batchTurboMode">
+          <option value="off">Выключено</option>
+          <option value="prewarm_ui">Prewarm UI (UI-строки)</option>
+          <option value="prewarm_dedup_all">Prewarm All Dedup (повторы по странице)</option>
+        </select>
+        <span class="model-note">Отправляет фоновые batch-запросы для translation memory. Интерактивный перевод не ждёт batch.</span>
+      </label>
+      <label>
+        <div class="range-label">
+          <span>Максимальная длина блока:</span>
+          <span class="range-value" id="blockLengthValue">1200</span>
+        </div>
+        <input type="range" id="blockLengthLimit" min="300" max="4000" step="100" />
+      </label>
+    </div>
+    <div class="section">
+      <div class="status-row">
+        <div class="progress" id="statusProgress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div class="progress__fill" id="statusProgressFill"></div>
+        </div>
+        <div class="status-text" id="status">Статус: перевод не выполняется.</div>
+      </div>
+      <div class="status-details" id="statusDetails"></div>
+      <div class="status-error" id="statusError"></div>
+    </div>
+    <div class="section">
+      <div class="row">
+        <button class="icon-button" id="btn-start" data-action="start" aria-label="Старт" title="Старт">
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="9"></circle>
+              <path d="M3 12h18"></path>
+              <path d="M12 3a15 15 0 0 1 0 18"></path>
+              <path d="M12 3a15 15 0 0 0 0 18"></path>
+            </svg>
+          </span>
+          <span class="sr-only">Старт</span>
+        </button>
+        <button class="icon-button" id="btn-reset" data-action="reset" aria-pressed="false" aria-label="Сброс" title="Сброс">
+          <span class="icon icon-default" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="M4 7h10"></path>
+              <path d="M4 7l3-3"></path>
+              <path d="M4 7l3 3"></path>
+              <path d="M20 17H10"></path>
+              <path d="M20 17l-3-3"></path>
+              <path d="M20 17l-3 3"></path>
+              <circle cx="17" cy="7" r="2"></circle>
+            </svg>
+          </span>
+          <span class="icon icon-pressed" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="M20 7H10"></path>
+              <path d="M20 7l-3-3"></path>
+              <path d="M20 7l-3 3"></path>
+              <path d="M4 17h10"></path>
+              <path d="M4 17l3-3"></path>
+              <path d="M4 17l3 3"></path>
+              <circle cx="7" cy="17" r="2"></circle>
+            </svg>
+          </span>
+          <span class="sr-only">Сброс</span>
+        </button>
+        <button class="icon-button" id="btn-stop" data-action="stop" aria-label="Стоп" title="Стоп">
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <rect x="7" y="7" width="10" height="10" rx="1"></rect>
+            </svg>
+          </span>
+          <span class="sr-only">Стоп</span>
+        </button>
+      </div>
+      <div class="row secondary-row">
+        <button class="icon-button" id="openDebug" aria-label="Открыть отладку перевода" title="Открыть отладку перевода">
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="M14 7a4 4 0 1 0-4 4"></path>
+              <path d="M2 20l6-6"></path>
+              <path d="M13 11l5 5"></path>
+              <path d="M18 16l4-4"></path>
+            </svg>
+          </span>
+          <span class="sr-only">Открыть отладку перевода</span>
+        </button>
+      </div>
+    </div>
+  </div>
+  <script src="ai-common.js"></script>
+  <script src="messaging.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
