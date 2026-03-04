@@ -7,6 +7,11 @@ describe("BatchWindowManager chain", () => {
       batchWindow: {
         prevBatchesCount: 2,
         compactAfter: 2
+      },
+      compaction: {
+        thresholds: {
+          tokenTarget: 90
+        }
       }
     });
 
@@ -23,5 +28,7 @@ describe("BatchWindowManager chain", () => {
     const compacted = manager.getCompactionContext();
     expect(compacted.length).toBeLessThanOrEqual(3);
     expect(compacted.every((item) => item.tokenEstimate > 0)).toBe(true);
+    expect(compacted.every((item) => item.tokenEstimate <= 90)).toBe(true);
+    expect(compacted[compacted.length - 1].sourceIndexes[0]).toBe(0);
   });
 });

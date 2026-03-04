@@ -45,14 +45,12 @@ export class PipelineOrchestrator {
     this.eventLogStore.maxAgeMs = settings.storagePolicy.maxAgeMs;
     this.eventLogStore.maxBytes = settings.storagePolicy.maxBytes;
     const result = await this.eventLogStore.gc();
-    if (result.removed > 0) {
-      await this.log({
-        level: LOG_LEVEL.INFO,
-        category: EVENT_CATEGORY.STORAGE_GC,
-        name: "event_log_gc",
-        data: result
-      });
-    }
+    await this.log({
+      level: result.removed > 0 ? LOG_LEVEL.INFO : LOG_LEVEL.DEBUG,
+      category: EVENT_CATEGORY.STORAGE_GC,
+      name: "event_log_gc",
+      data: result
+    });
   }
 
   async startForTab({ tabId, url }) {
@@ -381,6 +379,7 @@ export class PipelineOrchestrator {
         globalContext,
         previousWindow,
         compactedHistory: windowManager.getCompactionContext(),
+        compactionPolicy: settings.compaction,
         blocks: batch.blocks.map((item) => ({
           blockId: item.blockId,
           text: item.text,
@@ -418,6 +417,7 @@ export class PipelineOrchestrator {
           await this.throwIfCancelled(signal);
           const response = await controller.runWithBudget({
             model,
+            role: "translation",
             tokensEstimate,
             signal,
             onRateLimit: (error) => {
@@ -566,135 +566,194 @@ export class PipelineOrchestrator {
 
   async generateGlobalContext({ pageSessionId, tabId, settings, blocks, signal }) {
     const model = settings.modelPriority.context[0] || settings.globalContext.model;
-    const blockText = blocks.map((block) => `[${block.blockId}] (${block.category}) ${block.text}`).join("\n");
     const targetTokens = Math.max(15000, Number(settings.globalContext.targetTokens) || 15000);
-
-    const payload = {
-      role: "context",
-      model,
-      promptCaching: settings.promptCaching,
-      mockMode: settings.mockMode,
-      pageSessionId,
-      input: {
-        targetTokens,
-        instruction:
-          "Build a detailed global translation context for this page. Preserve entities, style, product names, legal terminology, and consistency constraints.",
-        orderedBlocks: blockText
-      },
-      schema: "context"
-    };
-
-    const requestId = `req_${stableHash(`${pageSessionId}_context_${Date.now()}`)}`;
-    this.cancellation.registerRequest(pageSessionId, requestId);
-    this.inflightRequests.add({ requestId, pageSessionId, tabId, model, kind: "context" });
-
-    await this.log({
-      category: EVENT_CATEGORY.OPENAI_REQUEST,
-      name: "context_request_sent",
-      pageSessionId,
-      tabId,
-      data: {
-        requestId,
-        model,
-        targetTokens,
-        blocks: blocks.length
-      }
-    });
+    const maxOutputTokens = Math.max(512, Number(settings.globalContext.maxOutputTokens) || 4096);
+    const minPasses = Math.max(1, Math.ceil(targetTokens / maxOutputTokens));
+    const blockChunks = buildContextChunks(blocks, 6000);
+    const passCount = Math.max(minPasses, blockChunks.length);
 
     const controller = this.controllerBySession.get(pageSessionId);
-    let response;
-    try {
-      response = await controller.retryWithBackoff(
-        async (attempt) =>
-          controller
-            .runWithBudget({
-              model,
-              tokensEstimate: estimateTokens(blockText) + targetTokens,
-              signal,
-              onRateLimit: (error) => {
-                this.log({
-                  level: LOG_LEVEL.WARN,
-                  category: EVENT_CATEGORY.OPENAI_RATE_LIMIT,
-                  name: "context_rate_limit_hit",
-                  pageSessionId,
-                  tabId,
-                  data: {
-                    requestId,
-                    retryAfterMs: error.retryAfterMs,
-                    status: error.status,
-                    attempt
-                  }
-                });
-              },
-              fn: () =>
-                this.offscreenClient
-                  .execute({
-                    requestId,
+    const contextParts = [];
+    let mergedTokens = 0;
+
+    for (let passIndex = 0; passIndex < passCount; passIndex += 1) {
+      await this.throwIfCancelled(signal);
+      if (mergedTokens >= targetTokens && passIndex >= minPasses) {
+        break;
+      }
+
+      const chunk = blockChunks[passIndex % blockChunks.length];
+      const orderedBlocks = chunk.map((block) => `[${block.blockId}] (${block.category}) ${block.text}`).join("\n");
+      const previousContextTail = contextParts.join("\n").slice(-16_000);
+      const payload = {
+        role: "context",
+        model,
+        promptCaching: settings.promptCaching,
+        mockMode: settings.mockMode,
+        pageSessionId,
+        input: {
+          targetTokens,
+          maxOutputTokens,
+          passIndex,
+          passCount,
+          previousContextTail,
+          instruction:
+            "Build a detailed global translation context for this page. Preserve entities, style, product names, legal terminology, and consistency constraints.",
+          orderedBlocks
+        },
+        schema: "context"
+      };
+
+      const requestId = `req_${stableHash(`${pageSessionId}_context_${passIndex}_${Date.now()}`)}`;
+      this.cancellation.registerRequest(pageSessionId, requestId);
+      this.inflightRequests.add({ requestId, pageSessionId, tabId, model, kind: "context" });
+
+      await this.log({
+        category: EVENT_CATEGORY.OPENAI_REQUEST,
+        name: "context_request_sent",
+        pageSessionId,
+        tabId,
+        data: {
+          requestId,
+          model,
+          targetTokens,
+          maxOutputTokens,
+          passIndex,
+          passCount,
+          chunkBlocks: chunk.length
+        }
+      });
+
+      let response;
+      try {
+        response = await controller.retryWithBackoff(
+          async (attempt) =>
+            controller
+              .runWithBudget({
+                model,
+                role: "context",
+                tokensEstimate: estimateTokens(orderedBlocks) + maxOutputTokens + estimateTokens(previousContextTail),
+                signal,
+                onRateLimit: (error) => {
+                  this.log({
+                    level: LOG_LEVEL.WARN,
+                    category: EVENT_CATEGORY.OPENAI_RATE_LIMIT,
+                    name: "context_rate_limit_hit",
                     pageSessionId,
                     tabId,
-                    operation: "openai.responses",
-                    payload,
-                    access: this.buildAccess(settings)
-                  })
-                  .catch((error) => {
-                    if (Number(error?.status) === 429) {
-                      throw new RateLimitError(error.message, {
-                        retryAfterMs: error?.retryAfterMs || 1000,
-                        status: 429
-                      });
+                    data: {
+                      requestId,
+                      retryAfterMs: error.retryAfterMs,
+                      status: error.status,
+                      attempt
                     }
-                    throw error;
-                  })
-            })
-            .catch((error) => {
-              if (error instanceof RateLimitError) {
+                  });
+                },
+                fn: () =>
+                  this.offscreenClient
+                    .execute({
+                      requestId,
+                      pageSessionId,
+                      tabId,
+                      operation: "openai.responses",
+                      payload,
+                      access: this.buildAccess(settings)
+                    })
+                    .catch((error) => {
+                      if (Number(error?.status) === 429) {
+                        throw new RateLimitError(error.message, {
+                          retryAfterMs: error?.retryAfterMs || 1000,
+                          status: 429
+                        });
+                      }
+                      throw error;
+                    })
+              })
+              .catch((error) => {
+                if (error instanceof RateLimitError) {
+                  throw error;
+                }
+                const retryAfterMs = parseRetryAfterSeconds(error?.headers);
+                if (Number(error?.status) === 429) {
+                  throw new RateLimitError(error.message, {
+                    retryAfterMs: retryAfterMs ? retryAfterMs * 1000 : 1000,
+                    status: 429
+                  });
+                }
                 throw error;
+              }),
+          {
+            signal,
+            maxAttempts: 5,
+            onAttempt: ({ attempt, sleepMs, error }) => {
+              this.log({
+                level: LOG_LEVEL.WARN,
+                category: EVENT_CATEGORY.OPENAI_RATE_LIMIT,
+                name: "context_retry_backoff",
+                pageSessionId,
+                tabId,
+                data: {
+                  requestId,
+                  attempt,
+                  sleepMs,
+                  reason: error?.message || "unknown"
+                }
+              });
+            },
+            shouldRetry: (error) => {
+              if (error?.name === "AbortError") {
+                return false;
               }
-              const retryAfterMs = parseRetryAfterSeconds(error?.headers);
-              if (Number(error?.status) === 429) {
-                throw new RateLimitError(error.message, {
-                  retryAfterMs: retryAfterMs ? retryAfterMs * 1000 : 1000,
-                  status: 429
-                });
+              if (error instanceof RateLimitError) {
+                return true;
               }
-              throw error;
-            }),
-        {
-          signal,
-          maxAttempts: 5,
-          onAttempt: ({ attempt, sleepMs, error }) => {
-            this.log({
-              level: LOG_LEVEL.WARN,
-              category: EVENT_CATEGORY.OPENAI_RATE_LIMIT,
-              name: "context_retry_backoff",
-              pageSessionId,
-              tabId,
-              data: {
-                requestId,
-                attempt,
-                sleepMs,
-                reason: error?.message || "unknown"
-              }
-            });
-          },
-          shouldRetry: (error) => {
-            if (error?.name === "AbortError") {
-              return false;
+              const status = Number(error?.status || 0);
+              return status === 429 || (status >= 500 && status < 600);
             }
-            if (error instanceof RateLimitError) {
-              return true;
-            }
-            const status = Number(error?.status || 0);
-            return status === 429 || (status >= 500 && status < 600);
           }
+        );
+      } finally {
+        this.cancellation.unregisterRequest(pageSessionId, requestId);
+        this.inflightRequests.remove(requestId);
+      }
+
+      const contextText = String(response?.structured?.context || response?.text || "").trim();
+      if (contextText) {
+        contextParts.push(`[pass ${passIndex + 1}/${passCount}]\n${contextText}`);
+      }
+      mergedTokens = estimateTokens(contextParts.join("\n\n"));
+
+      await this.log({
+        category: EVENT_CATEGORY.CONTEXT_GENERATE,
+        name: "context_pass_ready",
+        pageSessionId,
+        tabId,
+        data: {
+          requestId,
+          passIndex,
+          passCount,
+          mergedTokens,
+          usage: response?.usage || null
         }
-      );
-    } finally {
-      this.cancellation.unregisterRequest(pageSessionId, requestId);
-      this.inflightRequests.remove(requestId);
+      });
     }
 
-    const contextText = response?.structured?.context || response?.text || "";
+    const mergedText = contextParts.join("\n\n");
+    const tokensApprox = estimateTokens(mergedText);
+    if (tokensApprox < targetTokens) {
+      await this.log({
+        level: LOG_LEVEL.WARN,
+        category: EVENT_CATEGORY.CONTEXT_GENERATE,
+        name: "global_context_target_not_reached",
+        pageSessionId,
+        tabId,
+        data: {
+          tokensApprox,
+          targetTokens,
+          passCount: contextParts.length
+        }
+      });
+    }
 
     await this.log({
       category: EVENT_CATEGORY.CONTEXT_GENERATE,
@@ -702,14 +761,14 @@ export class PipelineOrchestrator {
       pageSessionId,
       tabId,
       data: {
-        requestId,
-        tokensApprox: estimateTokens(contextText),
-        usage: response?.usage || null
+        tokensApprox,
+        targetTokens,
+        passCount: contextParts.length
       }
     });
 
     return {
-      text: contextText,
+      text: mergedText,
       model,
       targetTokens
     };
@@ -1023,7 +1082,7 @@ export class PipelineOrchestrator {
     if (!queue || !controller) {
       return;
     }
-    const snapshot = controller.getSnapshot(model);
+    const snapshot = controller.getSnapshot(model, { role: "translation" });
     const nextConcurrency = Math.max(
       1,
       Number(snapshot?.dynamicConcurrency || snapshot?.limits?.concurrency || queue.concurrency || 1)
@@ -1155,4 +1214,31 @@ export class PipelineOrchestrator {
       await this.resumePending();
     }
   }
+}
+
+function buildContextChunks(blocks, maxTokensPerChunk) {
+  const chunks = [];
+  let current = [];
+  let currentTokens = 0;
+
+  for (const block of blocks) {
+    const line = `[${block.blockId}] (${block.category}) ${block.text}`;
+    const lineTokens = estimateTokens(line);
+    if (current.length > 0 && currentTokens + lineTokens > maxTokensPerChunk) {
+      chunks.push(current);
+      current = [];
+      currentTokens = 0;
+    }
+    current.push(block);
+    currentTokens += lineTokens;
+  }
+
+  if (current.length > 0) {
+    chunks.push(current);
+  }
+
+  if (chunks.length === 0) {
+    return [[]];
+  }
+  return chunks;
 }

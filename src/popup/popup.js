@@ -115,7 +115,6 @@ function renderShell() {
     <header class="popup-header">
       <div>
         <h1 class="popup-title">Neuro Translate</h1>
-        <p class="popup-subtitle">Управление переводом страницы</p>
       </div>
       <button class="icon-btn" id="btn-open-debug" title="Открыть debug">⚙</button>
     </header>

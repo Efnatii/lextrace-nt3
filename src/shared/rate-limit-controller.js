@@ -10,17 +10,34 @@ export class RateLimitError extends Error {
 }
 
 export class BudgetThroughputController {
-  constructor({ modelLimits = {}, safetyBufferTokens = 500, logger = null } = {}) {
+  constructor({ modelLimits = {}, roleModelLimits = {}, safetyBufferTokens = 500, logger = null } = {}) {
     this.modelLimits = modelLimits;
+    this.roleModelLimits = roleModelLimits;
     this.safetyBufferTokens = safetyBufferTokens;
     this.logger = logger;
     this.state = new Map();
   }
 
-  ensureModelState(model) {
-    if (!this.state.has(model)) {
-      const limits = this.modelLimits[model] || { tpm: 60_000, rpm: 300, concurrency: 2 };
-      this.state.set(model, {
+  resolveLimits(model, role) {
+    const byRole = this.roleModelLimits?.[role];
+    if (byRole && byRole[model]) {
+      return byRole[model];
+    }
+    return this.modelLimits[model] || { tpm: 60_000, rpm: 300, concurrency: 2 };
+  }
+
+  buildStateKey(model, role) {
+    return `${role}:${model}`;
+  }
+
+  ensureModelState(model, role = "translation") {
+    const stateKey = this.buildStateKey(model, role);
+    if (!this.state.has(stateKey)) {
+      const limits = this.resolveLimits(model, role);
+      this.state.set(stateKey, {
+        stateKey,
+        role,
+        model,
         limits,
         dynamicConcurrency: limits.concurrency,
         active: 0,
@@ -30,7 +47,7 @@ export class BudgetThroughputController {
         consecutiveSuccesses: 0
       });
     }
-    return this.state.get(model);
+    return this.state.get(stateKey);
   }
 
   prune(modelState, nowMs) {
@@ -63,8 +80,8 @@ export class BudgetThroughputController {
     return 0;
   }
 
-  async acquire(model, tokensEstimate, { signal } = {}) {
-    const modelState = this.ensureModelState(model);
+  async acquire(model, tokensEstimate, { signal, role = "translation" } = {}) {
+    const modelState = this.ensureModelState(model, role);
 
     while (true) {
       if (signal?.aborted) {
@@ -82,6 +99,7 @@ export class BudgetThroughputController {
       this.logger?.({
         name: "rate_limit_wait",
         model,
+        role,
         waitMs,
         tokensEstimate
       });
@@ -89,25 +107,26 @@ export class BudgetThroughputController {
     }
   }
 
-  release(model) {
-    const modelState = this.ensureModelState(model);
+  release(model, { role = "translation" } = {}) {
+    const modelState = this.ensureModelState(model, role);
     modelState.active = Math.max(0, modelState.active - 1);
   }
 
-  noteRateLimit(model) {
-    const modelState = this.ensureModelState(model);
+  noteRateLimit(model, { role = "translation" } = {}) {
+    const modelState = this.ensureModelState(model, role);
     modelState.lastRateLimitAt = Date.now();
     modelState.consecutiveSuccesses = 0;
     modelState.dynamicConcurrency = Math.max(1, (modelState.dynamicConcurrency || modelState.limits.concurrency) - 1);
     this.logger?.({
       name: "rate_limit_concurrency_down",
       model,
+      role,
       dynamicConcurrency: modelState.dynamicConcurrency
     });
   }
 
-  noteSuccess(model) {
-    const modelState = this.ensureModelState(model);
+  noteSuccess(model, { role = "translation" } = {}) {
+    const modelState = this.ensureModelState(model, role);
     modelState.consecutiveSuccesses += 1;
     const target = Math.max(1, modelState.limits.concurrency);
     const now = Date.now();
@@ -118,15 +137,18 @@ export class BudgetThroughputController {
       this.logger?.({
         name: "rate_limit_concurrency_up",
         model,
+        role,
         dynamicConcurrency: modelState.dynamicConcurrency
       });
     }
   }
 
-  getSnapshot(model) {
-    const modelState = this.ensureModelState(model);
+  getSnapshot(model, { role = "translation" } = {}) {
+    const modelState = this.ensureModelState(model, role);
     return {
       limits: { ...modelState.limits },
+      role: modelState.role,
+      model: modelState.model,
       dynamicConcurrency: modelState.dynamicConcurrency,
       active: modelState.active,
       lastRateLimitAt: modelState.lastRateLimitAt,
@@ -134,22 +156,22 @@ export class BudgetThroughputController {
     };
   }
 
-  async runWithBudget({ model, tokensEstimate, fn, signal, onRateLimit }) {
-    await this.acquire(model, tokensEstimate, { signal });
+  async runWithBudget({ model, role = "translation", tokensEstimate, fn, signal, onRateLimit }) {
+    await this.acquire(model, tokensEstimate, { signal, role });
     try {
       const result = await fn();
-      this.noteSuccess(model);
+      this.noteSuccess(model, { role });
       return result;
     } catch (error) {
       if (error instanceof RateLimitError) {
-        this.noteRateLimit(model);
+        this.noteRateLimit(model, { role });
         if (typeof onRateLimit === "function") {
           onRateLimit(error);
         }
       }
       throw error;
     } finally {
-      this.release(model);
+      this.release(model, { role });
     }
   }
 

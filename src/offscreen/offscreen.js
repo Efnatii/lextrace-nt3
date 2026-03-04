@@ -58,7 +58,7 @@ function createHeaders(access) {
   return headers;
 }
 
-async function runResponses({ requestId, payload, access }) {
+async function runResponses({ requestId, pageSessionId, payload, access }) {
   const mockMode = payload?.mockMode?.enabled;
   const delayMs = payload?.mockMode?.artificialDelayMs || 0;
 
@@ -75,7 +75,10 @@ async function runResponses({ requestId, payload, access }) {
   }
 
   const controller = new AbortController();
-  inflight.set(requestId, controller);
+  inflight.set(requestId, {
+    controller,
+    pageSessionId: pageSessionId || null
+  });
 
   try {
     const baseUrl = String(access?.baseUrl || "https://api.openai.com/v1").replace(/\/$/, "");
@@ -116,9 +119,15 @@ function buildResponsesBody(payload) {
   const model = payload.model;
 
   if (role === "context") {
+    const targetTokens = Math.max(15000, Number(payload?.input?.targetTokens) || 15000);
+    const maxOutputTokens = Math.max(512, Number(payload?.input?.maxOutputTokens) || 4096);
+    const passIndex = Number(payload?.input?.passIndex || 0);
+    const passCount = Number(payload?.input?.passCount || 1);
+    const previousTail = String(payload?.input?.previousContextTail || "");
     return {
       model,
       temperature: 0.2,
+      max_output_tokens: maxOutputTokens,
       input: [
         {
           role: "system",
@@ -126,7 +135,7 @@ function buildResponsesBody(payload) {
             {
               type: "input_text",
               text:
-                "You produce exhaustive global translation context. Include domain assumptions, named entities, glossary hints, consistency constraints, tone policy and critical disambiguations."
+                "You produce exhaustive global translation context. Build detailed, high-density notes for consistent translation quality. Include domain assumptions, named entities, glossary hints, consistency constraints, style and ambiguity handling. Return plain text only."
             }
           ]
         },
@@ -135,7 +144,14 @@ function buildResponsesBody(payload) {
           content: [
             {
               type: "input_text",
-              text: JSON.stringify(payload.input)
+              text: JSON.stringify({
+                targetTokens,
+                maxOutputTokens,
+                passIndex,
+                passCount,
+                previousContextTail,
+                orderedBlocks: payload.input?.orderedBlocks || ""
+              })
             }
           ]
         }
@@ -320,18 +336,22 @@ async function runModels({ access, payload }) {
 
 function cancelRequest(requestId, pageSessionId) {
   if (requestId) {
-    const controller = inflight.get(requestId);
-    if (controller) {
-      controller.abort();
+    const entry = inflight.get(requestId);
+    if (entry?.controller) {
+      entry.controller.abort();
+      inflight.delete(requestId);
+    } else if (typeof entry?.abort === "function") {
+      entry.abort();
       inflight.delete(requestId);
     }
     return { cancelledRequestId: requestId };
   }
 
   if (pageSessionId) {
-    for (const [id, controller] of inflight.entries()) {
-      if (id.includes(pageSessionId)) {
-        controller.abort();
+    for (const [id, entry] of inflight.entries()) {
+      const entrySessionId = entry?.pageSessionId || null;
+      if (entrySessionId === pageSessionId) {
+        entry.controller?.abort?.();
         inflight.delete(id);
       }
     }

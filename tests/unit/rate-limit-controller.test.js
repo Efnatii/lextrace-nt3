@@ -84,4 +84,29 @@ describe("BudgetThroughputController", () => {
     expect(after.dynamicConcurrency).toBe(2);
     expect(after.lastRateLimitAt).toBeGreaterThan(0);
   });
+
+  it("tracks separate concurrency windows for different roles", async () => {
+    const controller = new BudgetThroughputController({
+      modelLimits: {
+        mx: { tpm: 100000, rpm: 1000, concurrency: 3 }
+      }
+    });
+
+    await expect(
+      controller.runWithBudget({
+        model: "mx",
+        role: "context",
+        tokensEstimate: 10,
+        fn: async () => {
+          throw new RateLimitError("429", { retryAfterMs: 1 });
+        }
+      })
+    ).rejects.toThrow("429");
+
+    const contextSnapshot = controller.getSnapshot("mx", { role: "context" });
+    const translationSnapshot = controller.getSnapshot("mx", { role: "translation" });
+
+    expect(contextSnapshot.dynamicConcurrency).toBe(2);
+    expect(translationSnapshot.dynamicConcurrency).toBe(3);
+  });
 });

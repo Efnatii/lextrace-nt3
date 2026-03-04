@@ -45,12 +45,6 @@ main {
   line-height: 1.2;
 }
 
-.popup-subtitle {
-  margin: 3px 0 0;
-  font-size: 12px;
-  color: var(--muted);
-}
-
 .top-tabs {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Нейро Переводчик</title>
+    <link rel="stylesheet" href="./popup.css">
+  </head>
+  <body>
+    <main class="popup" id="popupRoot">
+      <header class="popup__header">
+        <div>
+          <h1 class="popup__title">Нейро Переводчик</h1>
+          <p class="popup__subtitle" data-field="subtitle">Управление переводом страницы</p>
+        </div>
+        <div class="popup__header-actions">
+          <button type="button" data-field="open-debug-slot"></button>
+        </div>
+      </header>
+
+      <nav class="popup__tabs" aria-label="Разделы popup">
+        <button type="button" class="popup__tab" data-tab="status">Статус</button>
+        <button type="button" class="popup__tab" data-tab="settings">Настройки</button>
+        <button type="button" class="popup__tab" data-tab="history">История</button>
+        <button type="button" class="popup__tab" data-tab="errors">Ошибки</button>
+      </nav>
+
+      <section class="popup__panel" data-tab-panel="status">
+        <div class="popup__connection">
+          <span class="popup__label">Связь:</span>
+          <span class="nt-badge nt-badge--neutral" data-field="connection-badge">...</span>
+          <span class="popup__connection-text" data-field="connection-text">Подключаюсь...</span>
+        </div>
+
+        <div class="popup__kv-grid">
+          <div class="popup__kv-key">Текущий этап</div>
+          <div class="popup__kv-value" data-field="stage">Нет данных</div>
+        </div>
+
+        <div class="popup__progress-wrap">
+          <label class="popup__label" for="status-progress">Прогресс</label>
+          <progress id="status-progress" class="popup__progress" max="100" value="0" data-field="progress"></progress>
+          <div class="popup__progress-stats">
+            <span data-field="progress-done">Готово: 0</span>
+            <span data-field="progress-pending">Ожидает: 0</span>
+            <span data-field="progress-failed">С ошибкой: 0</span>
+          </div>
+        </div>
+
+        <div class="popup__status-lines">
+          <div class="popup__line-title">Последний статус агента</div>
+          <div class="popup__status-log" data-field="agent-status-log"></div>
+          <div class="popup__line popup__line--legacy" data-field="agent-digest" hidden></div>
+          <div class="popup__line popup__line--legacy" data-field="agent-line-1" hidden></div>
+          <div class="popup__line popup__line--legacy" data-field="agent-line-2" hidden></div>
+        </div>
+
+        <div class="popup__status-controls">
+          <div class="popup__icon-row" data-field="status-actions"></div>
+          <div class="popup__segment" data-field="mode-group"></div>
+        </div>
+        <section class="popup__category-alert" data-section="category-chooser" hidden>
+          <div class="popup__line-title">Требуется выбор категорий</div>
+          <div class="popup__hint" data-field="category-question">Категории появятся после этапа планирования.</div>
+          <div class="popup__category-list" data-section="category-chooser-list"></div>
+          <div class="popup__icon-row" data-field="category-actions"></div>
+        </section>
+        <div class="popup__warn" data-field="lease-warning" hidden></div>
+      </section>
+
+      <section class="popup__panel" data-tab-panel="settings" hidden>
+        <section class="popup__section popup__section--profile">
+          <h2 class="popup__section-title">Профиль</h2>
+          <div class="popup__section-head">
+            <div class="popup__icon-row" data-field="profile-json-actions"></div>
+          </div>
+          <div class="popup__profile-presets">
+            <div class="popup__profile-field">
+              <label class="popup__label" for="profile-save-name">Имя</label>
+              <input
+                id="profile-save-name"
+                class="popup__input"
+                data-field="profile-save-name"
+                type="text"
+                maxlength="64"
+                placeholder="Имя профиля"
+                title="Имя для сохранения текущих настроек профиля"
+              >
+            </div>
+            <div class="popup__profile-field">
+              <label class="popup__label" for="profile-saved-select">Сохраненные</label>
+              <select
+                id="profile-saved-select"
+                class="popup__input"
+                data-field="profile-saved-select"
+                title="Выберите сохраненный профиль"
+              >
+                <option value="">Сохраненные профили</option>
+              </select>
+            </div>
+            <div class="popup__icon-row popup__icon-row--compact" data-field="profile-actions"></div>
+          </div>
+          <div class="popup__profile-pipeline-tabs" role="tablist" aria-label="Этапы применения параметров">
+            <button
+              type="button"
+              class="popup__profile-pipeline-tab"
+              data-profile-pipeline-tab="input"
+              aria-selected="true"
+              title="Шаг 1: исходные значения из userSettings."
+            >Ввод</button>
+            <button
+              type="button"
+              class="popup__profile-pipeline-tab"
+              data-profile-pipeline-tab="policy"
+              aria-selected="false"
+              title="Шаг 2: результат нормализации и effective-политики."
+            >Политика</button>
+            <button
+              type="button"
+              class="popup__profile-pipeline-tab"
+              data-profile-pipeline-tab="runtime"
+              aria-selected="false"
+              title="Шаг 3: параметры, которые потребляет рантайм."
+            >Рантайм</button>
+            <button
+              type="button"
+              class="popup__profile-pipeline-tab"
+              data-profile-pipeline-tab="service"
+              aria-selected="false"
+              title="Служебные поля версии, времени и debug."
+            >Сервис</button>
+          </div>
+          <div class="popup__profile-legend" aria-label="Легенда параметров">
+            <button
+              type="button"
+              class="popup__legend-item"
+              data-action="toggle-profile-marker"
+              data-marker="user"
+              aria-pressed="true"
+              title="Параметры, которые напрямую задает пользователь. Клик: скрыть/показать цветовую маркировку."
+            >
+              <span class="popup__legend-dot popup__legend-dot--user" aria-hidden="true"></span>
+              <span class="popup__legend-label">Пользователь</span>
+            </button>
+            <button
+              type="button"
+              class="popup__legend-item"
+              data-action="toggle-profile-marker"
+              data-marker="agent"
+              aria-pressed="true"
+              title="Параметры, которые вычисляются агентом/политикой. Клик: скрыть/показать цветовую маркировку."
+            >
+              <span class="popup__legend-dot popup__legend-dot--agent" aria-hidden="true"></span>
+              <span class="popup__legend-label">Агент/политика</span>
+            </button>
+            <button
+              type="button"
+              class="popup__legend-item"
+              data-action="toggle-profile-marker"
+              data-marker="profile"
+              aria-pressed="true"
+              title="Параметры, которые задаются/перезаписываются выбранным профилем. Клик: скрыть/показать цветовую маркировку."
+            >
+              <span class="popup__legend-dot popup__legend-dot--profile" aria-hidden="true"></span>
+              <span class="popup__legend-label">Профиль</span>
+            </button>
+          </div>
+          <div class="popup__json-wrap">
+            <div class="popup__pre popup__pre--profile popup__json-viewer" data-field="profile-json-viewer">Нет данных</div>
+            <div class="popup__json-editor" data-field="profile-json-editor" hidden>
+              <div class="popup__json-editor-title" data-field="profile-json-editor-title">Параметр</div>
+              <div class="popup__json-editor-simple" data-field="profile-json-simple-editor">
+                <select
+                  id="profile-json-editor-select"
+                  class="popup__input"
+                  data-field="profile-json-editor-select"
+                  title="Выберите значение параметра. Применение произойдет автоматически."
+                  hidden
+                ></select>
+                <input
+                  id="profile-json-editor-input"
+                  class="popup__input"
+                  data-field="profile-json-editor-input"
+                  type="text"
+                  placeholder="Введите значение"
+                  title="Введите значение и нажмите Enter. Применение произойдет автоматически."
+                  hidden
+                >
+              </div>
+              <div class="popup__json-editor-models" data-field="profile-json-models-editor" hidden>
+                <div class="popup__models-toolbar">
+                  <label class="popup__label" for="model-sort-select">Сортировка</label>
+                  <select id="model-sort-select" class="popup__input popup__input--auto" data-field="model-sort-select" title="Сортировка списка моделей">
+                    <option value="name">По имени</option>
+                    <option value="input">По цене входа</option>
+                    <option value="total">По сумме вход+выход</option>
+                    <option value="output">По цене выхода</option>
+                  </select>
+                  <div class="popup__preset-row" data-field="model-presets"></div>
+                </div>
+                <div class="popup__table-wrap" data-field="model-table-wrap">
+                  <table class="popup__table" aria-label="Разрешённые модели">
+                    <thead>
+                      <tr>
+                        <th></th>
+                        <th>Модель</th>
+                        <th>Уровень</th>
+                        <th>$ вход</th>
+                        <th>$ кэш-вход</th>
+                        <th>$ выход</th>
+                      </tr>
+                    </thead>
+                    <tbody data-field="model-rows"></tbody>
+                  </table>
+                </div>
+                <div class="popup__hint" data-field="model-empty" hidden>Нет данных по моделям.</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="popup__section">
+          <h2 class="popup__section-title">Доступ и ключи</h2>
+
+          <div class="popup__mode-select" role="radiogroup" aria-label="Режим соединения">
+            <label title="Использовать OpenAI API ключ напрямую">
+              <input type="radio" name="connection-mode" value="BYOK" data-field="connection-mode-byok">
+              BYOK
+            </label>
+            <label title="Использовать прокси-токен">
+              <input type="radio" name="connection-mode" value="PROXY" data-field="connection-mode-proxy">
+              PROXY
+            </label>
+          </div>
+
+          <div class="popup__cred-block" data-field="byok-block">
+            <h3 class="popup__sub-title">BYOK ключ</h3>
+            <div class="popup__input-with-icon">
+              <input
+                type="password"
+                class="popup__input"
+                data-field="byok-input"
+                autocomplete="off"
+                placeholder="sk-..."
+                title="Введите OpenAI API ключ"
+              >
+              <button type="button" class="popup__toggle" data-action="toggle-byok-visibility" title="Показать/скрыть BYOK ключ" aria-label="Показать или скрыть BYOK ключ"></button>
+            </div>
+            <div class="popup__icon-row" data-field="byok-actions"></div>
+            <div class="popup__hint" data-field="byok-status">Ключ не установлен.</div>
+          </div>
+
+          <div class="popup__cred-block" data-field="proxy-block">
+            <h3 class="popup__sub-title">Прокси</h3>
+            <label class="popup__label" for="proxy-base-url">Базовый URL</label>
+            <input id="proxy-base-url" class="popup__input" data-field="proxy-base-url" type="url" placeholder="https://proxy.example.com" title="Базовый URL прокси">
+            <label class="popup__label" for="proxy-header-name">Имя заголовка</label>
+            <input id="proxy-header-name" class="popup__input" data-field="proxy-header-name" type="text" placeholder="X-NT-Token" title="Имя заголовка с токеном">
+            <label class="popup__label" for="proxy-project-id">Идентификатор проекта</label>
+            <input id="proxy-project-id" class="popup__input" data-field="proxy-project-id" type="text" placeholder="project-id" title="ID проекта для прокси">
+            <label class="popup__label" for="proxy-token">Токен</label>
+            <div class="popup__input-with-icon">
+              <input id="proxy-token" class="popup__input" data-field="proxy-token" type="password" autocomplete="off" placeholder="token" title="Токен прокси">
+              <button type="button" class="popup__toggle" data-action="toggle-proxy-visibility" title="Показать/скрыть токен прокси" aria-label="Показать или скрыть токен прокси"></button>
+            </div>
+            <div class="popup__icon-row" data-field="proxy-actions"></div>
+            <div class="popup__hint" data-field="proxy-status">Прокси не настроен.</div>
+          </div>
+
+          <div class="popup__icon-row" data-field="connection-actions"></div>
+        </section>
+      </section>
+
+      <section class="popup__panel" data-tab-panel="history" hidden>
+        <section class="popup__section">
+          <h2 class="popup__section-title">История JSON обмена</h2>
+          <div class="popup__history-toolbar">
+            <label class="popup__label" for="history-source-filter">Источник</label>
+            <select id="history-source-filter" class="popup__input popup__input--auto" data-field="history-source-filter" title="Фильтр по источнику записей">
+              <option value="all">Все</option>
+              <option value="agent">Агент</option>
+              <option value="translation">Перевод</option>
+              <option value="ai">AI runtime</option>
+              <option value="event">События</option>
+            </select>
+            <label class="popup__label" for="history-type-filter">Тип</label>
+            <select id="history-type-filter" class="popup__input popup__input--auto" data-field="history-type-filter" title="Фильтр по типу записи">
+              <option value="all">Все</option>
+              <option value="request">Запрос</option>
+              <option value="response">Ответ</option>
+              <option value="tool">Инструмент</option>
+              <option value="event">Событие</option>
+            </select>
+            <div class="popup__hint" data-field="history-count">Записей: 0</div>
+            <div class="popup__icon-row" data-field="history-actions"></div>
+          </div>
+          <div class="popup__history-list" data-field="history-list"></div>
+          <p class="popup__hint" data-field="history-empty">История пока пуста.</p>
+        </section>
+      </section>
+
+      <section class="popup__panel" data-tab-panel="errors" hidden>
+        <div class="popup__error" data-field="error-box" hidden>
+          <div><strong>Код:</strong> <span data-field="error-code">-</span></div>
+          <div><strong>Сообщение:</strong> <span data-field="error-message">-</span></div>
+          <div class="popup__icon-row" data-field="error-actions"></div>
+        </div>
+        <p class="popup__hint" data-field="error-empty">Нет ошибок.</p>
+      </section>
+
+      <div class="nt-toast-host" data-field="toast-host" aria-live="polite"></div>
+    </main>
+
+    <script src="../core/nt-namespace.js"></script>
+    <script src="../core/message-envelope.js"></script>
+    <script src="../core/ui-protocol.js"></script>
+    <script src="./ui-i18n-ru.js"></script>
+    <script src="./ui-icons.js"></script>
+    <script src="./ui-kit.js"></script>
+    <script src="./ui-state-store.js"></script>
+    <script src="./ui-protocol-client.js"></script>
+    <script src="./ui-module.js"></script>
+    <script src="./popup-view-model.js"></script>
+    <script src="./popup.js"></script>
+  </body>
+</html>

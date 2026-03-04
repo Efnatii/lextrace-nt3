@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Mega Chaos Translation Fixture</title>
+    <style>
+      :root {
+        --line: #d4d4d4;
+        --bg: #f4f5f7;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: Georgia, 'Times New Roman', serif;
+        background: linear-gradient(180deg, #f9fafb 0%, #eef1f5 100%);
+        color: #141414;
+      }
+      header.mega-top {
+        position: sticky;
+        top: 0;
+        z-index: 3;
+        border-bottom: 1px solid var(--line);
+        background: #ffffffea;
+        backdrop-filter: blur(2px);
+        padding: 10px 14px;
+      }
+      .mega-grid {
+        display: grid;
+        grid-template-columns: 220px minmax(0, 1fr) 280px;
+        gap: 14px;
+        max-width: 1500px;
+        margin: 0 auto;
+        padding: 14px;
+      }
+      nav.mega-nav,
+      main.mega-main,
+      aside.mega-side {
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: #fff;
+        min-height: 200px;
+      }
+      nav.mega-nav {
+        padding: 10px;
+        position: relative;
+      }
+      .nav-inner {
+        display: grid;
+        gap: 6px;
+      }
+      .nav-link {
+        display: block;
+        border: 1px solid #d9d9d9;
+        border-radius: 999px;
+        padding: 4px 8px;
+        text-decoration: none;
+        color: #222;
+        font-family: 'Segoe UI', sans-serif;
+        font-size: 12px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      main.mega-main {
+        padding: 12px;
+        overflow: hidden;
+      }
+      .hero {
+        border: 1px dashed #c6c6c6;
+        border-radius: 10px;
+        padding: 12px;
+        margin-bottom: 10px;
+      }
+      .hero h1 { margin: 0 0 8px; }
+      #mega-intro {
+        border-left: 4px solid #9b9b9b;
+        padding-left: 8px;
+        line-height: 1.45;
+      }
+      .chaos-columns {
+        display: grid;
+        grid-template-columns: 1.2fr 1fr;
+        gap: 10px;
+      }
+      .zone {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 8px;
+        margin-bottom: 10px;
+        background: #fff;
+      }
+      .zone h2 {
+        margin: 0 0 8px;
+        font: 700 14px/1.2 'Segoe UI', sans-serif;
+      }
+      .story-list {
+        columns: 2 220px;
+        column-gap: 14px;
+      }
+      .story-item {
+        margin: 0 0 8px;
+        break-inside: avoid;
+        line-height: 1.4;
+      }
+      .ui-stack {
+        display: grid;
+        gap: 6px;
+      }
+      .ui-stack label,
+      .ui-stack button,
+      .ui-stack input,
+      .ui-stack select,
+      .ui-stack textarea {
+        font-family: 'Segoe UI', sans-serif;
+        font-size: 12px;
+      }
+      .ui-stack input,
+      .ui-stack select,
+      .ui-stack textarea {
+        width: 100%;
+        border: 1px solid #d5d5d5;
+        border-radius: 6px;
+        padding: 4px 6px;
+      }
+      .code-wall pre {
+        margin: 0 0 6px;
+        padding: 8px;
+        border: 1px solid #ddd;
+        border-radius: 6px;
+        background: #f7f7f7;
+        overflow: auto;
+        font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      .table-wrap {
+        overflow: auto;
+      }
+      .table-wrap table {
+        width: 100%;
+        border-collapse: collapse;
+        font-family: 'Segoe UI', sans-serif;
+        font-size: 12px;
+      }
+      .table-wrap th,
+      .table-wrap td {
+        border: 1px solid #ddd;
+        padding: 4px 6px;
+      }
+      .figure-wall {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+      }
+      .figure-wall figure {
+        margin: 0;
+        border: 1px solid #ddd;
+        border-radius: 6px;
+        padding: 6px;
+      }
+      .figure-wall figcaption {
+        font: 12px/1.35 'Segoe UI', sans-serif;
+      }
+      aside.mega-side {
+        padding: 10px;
+        position: relative;
+      }
+      .ad-card {
+        border: 1px solid #d7d7d7;
+        border-radius: 8px;
+        padding: 8px;
+        margin-bottom: 8px;
+        background: #fffdfa;
+        font-family: 'Segoe UI', sans-serif;
+      }
+      .floating-promo {
+        position: absolute;
+        right: -30px;
+        top: 90px;
+        width: 140px;
+        transform: rotate(-5deg);
+        border: 1px solid #c8c8c8;
+        background: #fffff0;
+        padding: 8px;
+        font: 11px/1.3 'Segoe UI', sans-serif;
+      }
+      .rtl-strip {
+        direction: rtl;
+        unicode-bidi: plaintext;
+        border: 1px dotted #cfcfcf;
+        padding: 4px;
+        margin-bottom: 6px;
+      }
+      .vertical-strip {
+        writing-mode: vertical-rl;
+        text-orientation: mixed;
+        border: 1px dotted #cfcfcf;
+        padding: 6px;
+        height: 180px;
+        margin-bottom: 8px;
+      }
+      .chaos-overlap {
+        position: relative;
+        min-height: 56px;
+      }
+      .chaos-overlap .a {
+        position: absolute;
+        left: 8px;
+        top: 8px;
+        background: #f8f8ff;
+        border: 1px solid #dadcff;
+        padding: 2px 6px;
+      }
+      .chaos-overlap .b {
+        position: absolute;
+        left: 28px;
+        top: 24px;
+        background: #fffaf1;
+        border: 1px solid #f0dec3;
+        padding: 2px 6px;
+      }
+      footer.mega-footer {
+        max-width: 1500px;
+        margin: 0 auto 16px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: #fff;
+        padding: 10px 14px;
+        font: 12px/1.35 'Segoe UI', sans-serif;
+      }
+      .hidden-junk {
+        display: none;
+      }
+      #mega-ready {
+        position: fixed;
+        right: 6px;
+        bottom: 6px;
+        z-index: 999;
+        font: 11px/1.2 'Segoe UI', sans-serif;
+        background: #111;
+        color: #fff;
+        border-radius: 4px;
+        padding: 4px 6px;
+      }
+      @media (max-width: 1200px) {
+        .mega-grid {
+          grid-template-columns: 1fr;
+        }
+        .floating-promo { position: static; transform: none; width: auto; }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="mega-top">
+      <strong id="mega-title">Mega Chaos Site for Translation Pipeline</strong>
+      <span style="margin-left:8px;font:12px/1.2 'Segoe UI',sans-serif;">Blocks: <b id="mega-counter">0</b></span>
+    </header>
+
+    <div class="mega-grid">
+      <nav class="mega-nav">
+        <h2>Navigation</h2>
+        <div id="mega-nav-list" class="nav-inner"></div>
+      </nav>
+
+      <main class="mega-main">
+        <section class="hero">
+          <h1>Incident Ledger and Harbor Broadcast</h1>
+          <p id="mega-intro">
+            Before sunrise, the district registry printed a contradictory manifest: the same ship was marked as both arrived and missing.
+            Dispatch clerks wrote margin notes, and every note contradicted the previous note in calm, formal language.
+          </p>
+          <div class="chaos-overlap">
+            <span class="a">Overlay label A for weird layout testing.</span>
+            <span class="b">Overlay label B should still be readable.</span>
+          </div>
+        </section>
+
+        <section class="chaos-columns">
+          <section class="zone">
+            <h2>Main narrative blocks</h2>
+            <div id="mega-story" class="story-list"></div>
+          </section>
+          <section class="zone">
+            <h2>UI controls, forms and notices</h2>
+            <div id="mega-ui" class="ui-stack"></div>
+            <div class="rtl-strip" id="mega-rtl">RTL simulation: numbers, names, and route markers are listed in reverse visual order.</div>
+            <div class="vertical-strip" id="mega-vertical">Vertical memo: emergency fallback corridor map annotation line.</div>
+          </section>
+        </section>
+
+        <section class="zone code-wall">
+          <h2>Code / config snippets</h2>
+          <div id="mega-code"></div>
+        </section>
+
+        <section class="zone">
+          <h2>Data tables and manifests</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Route</th>
+                  <th>Origin</th>
+                  <th>Destination</th>
+                  <th>Manifest note</th>
+                </tr>
+              </thead>
+              <tbody id="mega-table"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="zone">
+          <h2>Figures and captions</h2>
+          <div id="mega-captions" class="figure-wall"></div>
+        </section>
+
+        <section class="hidden-junk" aria-hidden="true" id="mega-hidden"></section>
+      </main>
+
+      <aside class="mega-side">
+        <h2>Ads / promos / widgets</h2>
+        <div id="mega-ads"></div>
+        <div class="floating-promo" id="mega-floating">Floating promo: this awkward panel intentionally overlaps side content.</div>
+      </aside>
+    </div>
+
+    <footer class="mega-footer" id="mega-footer"></footer>
+
+    <div id="mega-ready" data-ready="0">booting</div>
+
+    <script>
+      (() => {
+        const navRoot = document.getElementById('mega-nav-list');
+        const storyRoot = document.getElementById('mega-story');
+        const uiRoot = document.getElementById('mega-ui');
+        const codeRoot = document.getElementById('mega-code');
+        const tableRoot = document.getElementById('mega-table');
+        const captionsRoot = document.getElementById('mega-captions');
+        const adsRoot = document.getElementById('mega-ads');
+        const hiddenRoot = document.getElementById('mega-hidden');
+        const footerRoot = document.getElementById('mega-footer');
+        const counterNode = document.getElementById('mega-counter');
+        const readyNode = document.getElementById('mega-ready');
+
+        let textBlocks = 0;
+        const addTextBlock = () => { textBlocks += 1; };
+
+        for (let i = 1; i <= 180; i += 1) {
+          const link = document.createElement('a');
+          link.className = 'nav-link';
+          link.href = '#';
+          link.textContent = 'Nav #' + i + ': dock map.';
+          navRoot.appendChild(link);
+          addTextBlock();
+        }
+
+        for (let i = 1; i <= 900; i += 1) {
+          const p = document.createElement('p');
+          p.className = 'story-item';
+          p.textContent = 'Story #' + i + ': ledger mismatch on route ' + ((i % 17) + 1) + '.';
+          storyRoot.appendChild(p);
+          addTextBlock();
+        }
+
+        for (let i = 1; i <= 120; i += 1) {
+          const wrap = document.createElement('div');
+          const label = document.createElement('label');
+          label.htmlFor = 'ui-field-' + i;
+          label.textContent = 'Control #' + i + ': mode.';
+          const input = document.createElement(i % 3 === 0 ? 'textarea' : (i % 2 === 0 ? 'select' : 'input'));
+          input.id = 'ui-field-' + i;
+          if (input.tagName === 'INPUT') {
+            input.value = 'Input default #' + i;
+          }
+          if (input.tagName === 'TEXTAREA') {
+            input.rows = 2;
+            input.value = 'Note #' + i + '.';
+          }
+          if (input.tagName === 'SELECT') {
+            const o1 = document.createElement('option');
+            o1.textContent = 'Auto mode';
+            const o2 = document.createElement('option');
+            o2.textContent = 'Manual mode';
+            input.appendChild(o1);
+            input.appendChild(o2);
+          }
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.textContent = 'Apply #' + i;
+          wrap.appendChild(label);
+          wrap.appendChild(input);
+          wrap.appendChild(btn);
+          uiRoot.appendChild(wrap);
+          addTextBlock();
+          addTextBlock();
+        }
+
+        for (let i = 1; i <= 120; i += 1) {
+          const pre = document.createElement('pre');
+          const code = document.createElement('code');
+          code.textContent = 'cfg.' + i + '={route:"' + (i % 2 === 0 ? 'fast' : 'strong') + '",r:' + (i % 4) + '};';
+          pre.appendChild(code);
+          codeRoot.appendChild(pre);
+          addTextBlock();
+        }
+
+        for (let i = 1; i <= 120; i += 1) {
+          const tr = document.createElement('tr');
+          const route = document.createElement('td');
+          route.textContent = 'R-' + String(i).padStart(4, '0');
+          const from = document.createElement('td');
+          from.textContent = 'Origin #' + ((i % 23) + 1);
+          const to = document.createElement('td');
+          to.textContent = 'Dest #' + ((i % 31) + 1);
+          const note = document.createElement('td');
+          note.textContent = 'Note #' + i + ': verify stamp.';
+          tr.appendChild(route);
+          tr.appendChild(from);
+          tr.appendChild(to);
+          tr.appendChild(note);
+          tableRoot.appendChild(tr);
+          addTextBlock();
+          addTextBlock();
+          addTextBlock();
+          addTextBlock();
+        }
+
+        for (let i = 1; i <= 80; i += 1) {
+          const figure = document.createElement('figure');
+          const caption = document.createElement('figcaption');
+          caption.textContent = 'Caption #' + i + ': crate near gate ' + ((i % 14) + 1) + '.';
+          figure.appendChild(caption);
+          captionsRoot.appendChild(figure);
+          addTextBlock();
+        }
+
+        for (let i = 1; i <= 70; i += 1) {
+          const card = document.createElement('section');
+          card.className = 'ad-card';
+          card.innerHTML = '<h3>Widget #' + i + '</h3><p>Promo #' + i + ': insurance bundle.</p>';
+          adsRoot.appendChild(card);
+          addTextBlock();
+          addTextBlock();
+        }
+
+        for (let i = 1; i <= 120; i += 1) {
+          const hidden = document.createElement('p');
+          hidden.textContent = 'Hidden archival annotation #' + i + ' that should not affect visible translation layout.';
+          hiddenRoot.appendChild(hidden);
+        }
+
+        for (let i = 1; i <= 40; i += 1) {
+          const line = document.createElement('p');
+          line.textContent = 'Footer #' + i + ': policy marker.';
+          footerRoot.appendChild(line);
+          addTextBlock();
+        }
+
+        const feed = document.createElement('p');
+        feed.id = 'mega-live-feed';
+        feed.textContent = 'Live feed: queue is idle.';
+        footerRoot.appendChild(feed);
+        addTextBlock();
+
+        const feedRows = [
+          'Live feed: checkpoint alpha switched to manual verification.',
+          'Live feed: category recommendation cache has been refreshed.',
+          'Live feed: glossary candidate set expanded after planner audit.',
+          'Live feed: runtime policy switched to throughput-safe mode.'
+        ];
+        let feedIndex = 0;
+        setInterval(() => {
+          feed.textContent = feedRows[feedIndex % feedRows.length];
+          feedIndex += 1;
+        }, 1800);
+
+        if (counterNode) {
+          counterNode.textContent = String(textBlocks);
+        }
+        if (readyNode) {
+          readyNode.dataset.ready = '1';
+          readyNode.textContent = 'ready:' + textBlocks;
+        }
+      })();
+    </script>
+  </body>
+</html>
