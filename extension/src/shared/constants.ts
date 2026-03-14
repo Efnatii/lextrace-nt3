@@ -1,0 +1,38 @@
+export const EXTENSION_DISPLAY_NAME = "LexTrace NT3";
+export const PROTOCOL_VERSION = 1;
+export const NATIVE_HOST_NAME = "com.lextrace.nt3.host";
+export const RUNTIME_STREAM_PORT = "lextrace-runtime-stream";
+export const RECONNECT_ALARM_NAME = "lextrace-native-reconnect";
+export const STORAGE_KEYS = {
+  localConfig: "lextrace.config.local",
+  sessionConfig: "lextrace.config.session",
+  runtimeState: "lextrace.runtime.state",
+  logs: "lextrace.runtime.logs"
+} as const;
+
+export const MAX_LOG_DETAILS_PREVIEW = 240;
+
+export const COMMANDS = {
+  ping: "ping",
+  overlayProbe: "overlay.probe",
+  overlayOpen: "overlay.open",
+  overlayClose: "overlay.close",
+  workerStart: "worker.start",
+  workerStop: "worker.stop",
+  workerStatus: "worker.status",
+  configGet: "config.get",
+  configPatch: "config.patch",
+  logList: "log.list",
+  logSubscribe: "log.subscribe",
+  logRecord: "log.record",
+  taskDemoStart: "task.demo.start",
+  taskDemoStop: "task.demo.stop",
+  testHostCrash: "test.host.crash"
+} as const;
+
+export const STREAM_EVENTS = {
+  snapshot: "runtime.snapshot",
+  log: "runtime.log",
+  status: "runtime.status",
+  config: "runtime.config"
+} as const;

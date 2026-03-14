@@ -1,0 +1,41 @@
+{
+  "name": "lextrace-nt3",
+  "version": "0.1.0",
+  "description": "Edge MV3 extension with overlay terminal, native-messaging runtime and Edge automation proof.",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "build": "node scripts/build-extension.mjs && node scripts/build-native-host.mjs",
+    "build:extension": "node scripts/build-extension.mjs",
+    "build:native-host": "node scripts/build-native-host.mjs",
+    "pack": "node scripts/pack-extension.mjs",
+    "register:native-host": "node scripts/register-native-host.mjs",
+    "test": "npm run test:unit",
+    "test:unit": "vitest run",
+    "test:edge": "node scripts/test-edge.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Efnatii/lextrace-nt3.git"
+  },
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/Efnatii/lextrace-nt3/issues"
+  },
+  "homepage": "https://github.com/Efnatii/lextrace-nt3#readme",
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "@types/chrome": "^0.1.37",
+    "@types/node": "^25.5.0",
+    "@vitest/coverage-v8": "^4.1.0",
+    "crx3": "^2.0.0",
+    "esbuild": "^0.27.4",
+    "selenium-webdriver": "^4.41.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.0"
+  }
+}

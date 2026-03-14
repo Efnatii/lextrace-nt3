@@ -1,0 +1,384 @@
+:root {
+  color-scheme: light;
+  --shell-bg: #f2f2f2;
+  --panel-bg: #ffffff;
+  --line: #111111;
+  --line-soft: #6f6f6f;
+  --fill-soft: #d8d8d8;
+  --fill-strong: #1a1a1a;
+  --text-main: #111111;
+  --text-soft: #5b5b5b;
+  --accent-info: #1d4ed8;
+  --accent-warn: #b45309;
+  --accent-error: #b91c1c;
+  --accent-ok: #166534;
+  --scroll-track: #dadada;
+  --scroll-thumb: #111111;
+  --scroll-thumb-hover: #303030;
+  --scroll-thumb-active: #000000;
+  --scroll-size: 12px;
+}
+
+* {
+  box-sizing: border-box;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scroll-thumb) var(--scroll-track);
+}
+
+*::-webkit-scrollbar {
+  width: var(--scroll-size);
+  height: var(--scroll-size);
+}
+
+*::-webkit-scrollbar-track {
+  background: var(--scroll-track);
+  border-left: 1px solid var(--line);
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border: 1px solid var(--panel-bg);
+  border-radius: 0;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-thumb-hover);
+}
+
+*::-webkit-scrollbar-thumb:active {
+  background: var(--scroll-thumb-active);
+}
+
+*::-webkit-scrollbar-button {
+  display: none;
+}
+
+*::-webkit-scrollbar-corner {
+  background: var(--scroll-track);
+}
+
+html,
+body {
+  margin: 0;
+  height: 420px;
+  min-width: 360px;
+  background: #e7e7e7;
+  color: var(--text-main);
+  font-family: "Bahnschrift", "Segoe UI Variable Text", "Segoe UI", sans-serif;
+  overflow: hidden;
+}
+
+.popup-shell {
+  display: grid;
+  grid-template-rows: auto auto 1fr;
+  height: 420px;
+  border: 1px solid var(--line);
+  background: var(--shell-bg);
+  overflow: hidden;
+}
+
+.shell-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.shell-header h1,
+.shell-kicker {
+  margin: 0;
+}
+
+.shell-kicker {
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-soft);
+}
+
+.shell-header h1 {
+  font-size: 24px;
+  line-height: 1;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.shell-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 0 10px;
+  border-left: 1px solid var(--line);
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  background: transparent;
+}
+
+.shell-badge[data-state="running"] {
+  color: var(--accent-ok);
+}
+
+.shell-badge[data-state="waiting"] {
+  color: var(--accent-warn);
+}
+
+.shell-badge[data-state="error"] {
+  color: var(--accent-error);
+}
+
+.tab-strip {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.tab-button {
+  appearance: none;
+  border: 0;
+  border-right: 1px solid var(--line);
+  background: var(--panel-bg);
+  color: var(--text-main);
+  min-height: 40px;
+  padding: 0 14px;
+  font: inherit;
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.tab-button.is-active {
+  background: var(--fill-strong);
+  color: var(--panel-bg);
+}
+
+.shell-main {
+  min-height: 0;
+  display: grid;
+  overflow: hidden;
+}
+
+.tab-panel {
+  display: none;
+  min-height: 0;
+}
+
+.tab-panel.is-active {
+  display: grid;
+}
+
+.tab-panel[data-panel="control"] {
+  grid-template-rows: auto auto;
+}
+
+.tab-panel[data-panel="config"] {
+  grid-template-rows: 1fr;
+  background: #e4e4e4;
+  overflow: hidden;
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+}
+
+.status-grid div {
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  background: var(--panel-bg);
+  padding: 8px 10px;
+}
+
+.status-grid div:nth-child(2n) {
+  border-right: 0;
+}
+
+.status-grid dt {
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-soft);
+  margin-bottom: 6px;
+}
+
+.status-grid dd {
+  margin: 0;
+  font-family: "Cascadia Code", "Consolas", monospace;
+  font-size: 12px;
+  word-break: break-word;
+}
+
+.control-row {
+  border-bottom: 1px solid var(--line);
+}
+
+.control-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 40px;
+  background: var(--panel-bg);
+  padding: 0 10px;
+  gap: 10px;
+}
+
+.terminal-trigger {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--text-main);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 12px;
+  font: inherit;
+  cursor: pointer;
+  padding: 0;
+}
+
+.terminal-trigger:hover {
+  color: var(--accent-info);
+}
+
+.terminal-state {
+  margin: 0;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.terminal-state {
+  color: var(--text-soft);
+  text-align: right;
+}
+
+.terminal-state[data-state="ready"] {
+  color: var(--accent-ok);
+}
+
+.terminal-state[data-state="warn"] {
+  color: var(--accent-warn);
+}
+
+.terminal-state[data-state="error"] {
+  color: var(--accent-error);
+}
+
+.config-viewer {
+  min-height: 100%;
+  margin: 0;
+  background: var(--panel-bg);
+  padding: 8px 0;
+  font-family: "Cascadia Code", "Consolas", monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.config-frame {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: 1fr;
+  border: 1px solid var(--line);
+  background: #ececec;
+  overflow: hidden;
+}
+
+.config-viewport {
+  margin: 0;
+  min-height: 0;
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--panel-bg);
+}
+
+.json-line {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  min-height: 24px;
+  padding-left: calc(var(--indent-level, 0) * 16px + 10px);
+  padding-right: 10px;
+  overflow: hidden;
+}
+
+.json-line:hover {
+  background: #f5f5f5;
+}
+
+.json-token {
+  flex: 0 0 auto;
+}
+
+.json-key {
+  color: #1f2937;
+}
+
+.json-punctuation {
+  color: #6b7280;
+}
+
+.json-value,
+.json-editor,
+.json-select {
+  flex: 0 1 auto;
+  min-width: 0;
+  font: inherit;
+  font-family: inherit;
+}
+
+.json-value {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: #111111;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.json-value.is-string,
+.json-value.is-enum,
+.json-editor.is-string,
+.json-select.is-enum {
+  color: #0f3f83;
+}
+
+.json-value.is-number,
+.json-editor.is-number {
+  color: #7c2d12;
+}
+
+.json-value.is-boolean,
+.json-select.is-boolean {
+  color: #166534;
+}
+
+.json-editor,
+.json-select {
+  border: 1px solid var(--line);
+  background: #ffffff;
+  color: #111111;
+  height: 20px;
+  padding: 0 4px;
+  outline: none;
+}
+
+.json-error {
+  margin-left: 8px;
+  color: var(--accent-error);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.json-ellipsis {
+  color: var(--text-soft);
+}
