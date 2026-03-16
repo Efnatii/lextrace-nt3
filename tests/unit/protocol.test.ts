@@ -61,4 +61,24 @@ describe("protocol validation", () => {
     expect(response.ok).toBe(false);
     expect(response.error?.code).toBe("content_not_ready");
   });
+
+  it("accepts AI chat payloads", () => {
+    const envelope = createEnvelope(COMMANDS.aiChatSend, "tests", "background", {
+      pageKey: "https://example.com/path",
+      pageUrl: "https://example.com/path?query=1#hash",
+      origin: "user",
+      text: "Hello from AI test"
+    });
+
+    expect(validateEnvelopePayload(validateEnvelope(envelope))).toMatchObject({
+      pageKey: "https://example.com/path",
+      origin: "user"
+    });
+  });
+
+  it("accepts AI model catalog payloads", () => {
+    const envelope = createEnvelope(COMMANDS.aiModelsCatalog, "tests", "background", {});
+
+    expect(validateEnvelopePayload(validateEnvelope(envelope))).toEqual({});
+  });
 });

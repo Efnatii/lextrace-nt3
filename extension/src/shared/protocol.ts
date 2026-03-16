@@ -1,5 +1,14 @@
 import { z } from "zod";
 
+import {
+  AiChatListResultSchema,
+  AiChatResetPayloadSchema,
+  AiChatResumePayloadSchema,
+  AiChatSendPayloadSchema,
+  AiChatStatusPayloadSchema,
+  AiModelsCatalogPayloadSchema,
+  AiStreamMessageSchema
+} from "./ai";
 import { COMMANDS, PROTOCOL_VERSION, STREAM_EVENTS } from "./constants";
 import { ExtensionConfigPatchSchema } from "./config";
 import { LogEntryInputSchema, LogEntrySchema } from "./logging";
@@ -68,6 +77,12 @@ export const CommandPayloadSchemas = {
     since: z.string().datetime().nullable().optional()
   }),
   [COMMANDS.logRecord]: LogEntryInputSchema,
+  [COMMANDS.aiModelsCatalog]: AiModelsCatalogPayloadSchema,
+  [COMMANDS.aiChatStatus]: AiChatStatusPayloadSchema,
+  [COMMANDS.aiChatSend]: AiChatSendPayloadSchema,
+  [COMMANDS.aiChatResume]: AiChatResumePayloadSchema,
+  [COMMANDS.aiChatReset]: AiChatResetPayloadSchema,
+  [COMMANDS.aiChatList]: z.object({}).passthrough().optional().default({}),
   [COMMANDS.taskDemoStart]: z
     .object({
       taskId: z.string().min(1).optional()
@@ -133,11 +148,17 @@ export const RuntimeStreamMessageSchema = z.object({
   desired: z.unknown().optional()
 });
 
+export const ExtensionStreamMessageSchema = z.union([
+  RuntimeStreamMessageSchema,
+  AiStreamMessageSchema
+]);
+
 export type MessageSource = z.infer<typeof MessageSourceSchema>;
 export type MessageTarget = z.infer<typeof MessageTargetSchema>;
 export type ProtocolEnvelope = z.infer<typeof ProtocolEnvelopeSchema>;
 export type ProtocolResponse = z.infer<typeof ProtocolResponseSchema>;
 export type RuntimeStreamMessage = z.infer<typeof RuntimeStreamMessageSchema>;
+export type ExtensionStreamMessage = z.infer<typeof ExtensionStreamMessageSchema>;
 export type SupportedAction = z.infer<typeof SupportedActionSchema>;
 
 export function createEnvelope(action: string, source: MessageSource, target: MessageTarget, payload?: unknown, correlationId?: string | null): ProtocolEnvelope {

@@ -1,6 +1,7 @@
+import { AiChatPageSessionSchema, createDefaultAiStatus, type AiChatPageSession, type AiStreamMessage } from "../shared/ai";
 import { COMMANDS } from "../shared/constants";
 import { connectRuntimeStream, recordLog, sendCommand } from "../shared/client";
-import { ExtensionConfigSchema, type ExtensionConfig } from "../shared/config";
+import { ExtensionConfigSchema, type ExtensionConfig, type OverlayTab } from "../shared/config";
 import { LogEntrySchema, serializeLogDetails, type LogEntry } from "../shared/logging";
 import {
   buildOverlayActivityFeed,
@@ -11,8 +12,10 @@ import {
   createErrorResponse,
   createOkResponse,
   validateEnvelope,
+  type ExtensionStreamMessage,
   type RuntimeStreamMessage
 } from "../shared/protocol";
+import { normalizePageKey, shortenPageKey } from "../shared/page";
 import { WorkerStatusSchema, type WorkerStatus } from "../shared/runtime-state";
 import { getTerminalHelpLines, getTerminalSuggestions, parseTerminalCommand, type TerminalCatalogOptions } from "../shared/terminal";
 
@@ -29,15 +32,27 @@ class OverlayTerminalController {
   private reconnectTimer: number | null = null;
   private streamKeepAliveTimer: number | null = null;
   private panelHeader: HTMLElement | null = null;
+  private tabButtons: HTMLButtonElement[] = [];
+  private consolePanel: HTMLElement | null = null;
+  private chatPanel: HTMLElement | null = null;
+  private consoleStatusRow: HTMLElement | null = null;
+  private chatStatusRow: HTMLElement | null = null;
+  private consoleToolRow: HTMLElement | null = null;
+  private chatToolRow: HTMLElement | null = null;
+  private chatFeed: HTMLElement | null = null;
+  private chatInput: HTMLInputElement | null = null;
+  private chatForm: HTMLFormElement | null = null;
+  private chatSendButton: HTMLButtonElement | null = null;
+  private chatResumeButton: HTMLButtonElement | null = null;
+  private chatResetButton: HTMLButtonElement | null = null;
 
   private activityFeed: HTMLElement | null = null;
   private terminalSuggestionList: HTMLElement | null = null;
   private terminalInput: HTMLInputElement | null = null;
   private panelWindow: HTMLElement | null = null;
-  private statusRow: HTMLElement | null = null;
-
   private currentConfig: ExtensionConfig | null = null;
   private currentStatus: WorkerStatus | null = null;
+  private aiSession: AiChatPageSession | null = null;
   private runtimeLogs: LogEntry[] = [];
   private consoleEntries: OverlayConsoleEntry[] = [];
   private runtimeLogSequences = new Map<string, number>();
@@ -46,6 +61,8 @@ class OverlayTerminalController {
   private currentSuggestions: string[] = [];
   private selectedSuggestionIndex = -1;
   private nextActivitySequence = 0;
+  private activeTab: OverlayTab = "console";
+  private readonly pageViewId = crypto.randomUUID();
   private visible = false;
   private dragState:
     | {
@@ -116,8 +133,9 @@ class OverlayTerminalController {
     });
     await this.ensureStream();
     await this.loadSnapshot();
+    await this.loadAiSnapshot();
     this.centerPanelInViewport();
-    this.terminalInput?.focus();
+    this.focusPreferredOverlayElement();
     await recordLog("content", "overlay.open", "Overlay terminal opened.");
   }
 
@@ -164,17 +182,39 @@ class OverlayTerminalController {
           </div>
           <button type="button" class="close-button" data-close="true">Close</button>
         </header>
-        <div class="status-row" data-role="status-row"></div>
-        <section class="panel-body">
-          <div class="activity-feed" data-role="activity-feed"></div>
-          <form class="terminal-form" data-role="terminal-form">
-            <span class="prompt-label">NT3&gt;</span>
-            <div class="terminal-input-shell">
-              <div class="terminal-suggestion-list is-hidden" data-role="terminal-suggestions"></div>
-              <input class="terminal-input" data-role="terminal-input" spellcheck="false" autocomplete="off" />
-            </div>
-          </form>
-        </section>
+        <nav class="overlay-tab-strip" data-role="overlay-tabs">
+          <button type="button" class="overlay-tab-button is-active" data-tab="console">Консоль</button>
+          <button type="button" class="overlay-tab-button" data-tab="chat">Чат</button>
+        </nav>
+        <div class="tab-surface is-active" data-panel="console">
+          <div class="status-row" data-role="console-status-row"></div>
+          <div class="tool-row" data-role="console-tool-row"></div>
+          <section class="panel-body console-body">
+            <div class="activity-feed" data-role="activity-feed"></div>
+            <form class="terminal-form" data-role="terminal-form">
+              <span class="prompt-label">NT3&gt;</span>
+              <div class="terminal-input-shell">
+                <div class="terminal-suggestion-list is-hidden" data-role="terminal-suggestions"></div>
+                <input class="terminal-input" data-role="terminal-input" spellcheck="false" autocomplete="off" />
+              </div>
+            </form>
+          </section>
+        </div>
+        <div class="tab-surface" data-panel="chat">
+          <div class="status-row" data-role="chat-status-row"></div>
+          <div class="tool-row" data-role="chat-tool-row">
+            <button type="button" class="tool-icon" data-role="chat-send" title="Отправить">Отправить</button>
+            <button type="button" class="tool-icon" data-role="chat-resume" title="Продолжить">Продолжить</button>
+            <button type="button" class="tool-icon" data-role="chat-reset" title="Сбросить">Сбросить</button>
+          </div>
+          <section class="panel-body chat-body">
+            <div class="chat-feed" data-role="chat-feed"></div>
+            <form class="chat-form" data-role="chat-form">
+              <span class="prompt-label">AI&gt;</span>
+              <input class="chat-input" data-role="chat-input" spellcheck="false" autocomplete="off" />
+            </form>
+          </section>
+        </div>
       </div>
     `;
 
@@ -183,10 +223,22 @@ class OverlayTerminalController {
 
     this.panelWindow = wrapper.querySelector<HTMLElement>(".panel-shell");
     this.panelHeader = wrapper.querySelector<HTMLElement>(".panel-header");
+    this.consolePanel = wrapper.querySelector<HTMLElement>("[data-panel='console']");
+    this.chatPanel = wrapper.querySelector<HTMLElement>("[data-panel='chat']");
+    this.consoleStatusRow = wrapper.querySelector<HTMLElement>("[data-role='console-status-row']");
+    this.chatStatusRow = wrapper.querySelector<HTMLElement>("[data-role='chat-status-row']");
+    this.consoleToolRow = wrapper.querySelector<HTMLElement>("[data-role='console-tool-row']");
+    this.chatToolRow = wrapper.querySelector<HTMLElement>("[data-role='chat-tool-row']");
     this.activityFeed = wrapper.querySelector<HTMLElement>("[data-role='activity-feed']");
+    this.chatFeed = wrapper.querySelector<HTMLElement>("[data-role='chat-feed']");
     this.terminalSuggestionList = wrapper.querySelector<HTMLElement>("[data-role='terminal-suggestions']");
     this.terminalInput = wrapper.querySelector<HTMLInputElement>("[data-role='terminal-input']");
-    this.statusRow = wrapper.querySelector<HTMLElement>("[data-role='status-row']");
+    this.chatInput = wrapper.querySelector<HTMLInputElement>("[data-role='chat-input']");
+    this.chatForm = wrapper.querySelector<HTMLFormElement>("[data-role='chat-form']");
+    this.chatSendButton = wrapper.querySelector<HTMLButtonElement>("[data-role='chat-send']");
+    this.chatResumeButton = wrapper.querySelector<HTMLButtonElement>("[data-role='chat-resume']");
+    this.chatResetButton = wrapper.querySelector<HTMLButtonElement>("[data-role='chat-reset']");
+    this.tabButtons = Array.from(wrapper.querySelectorAll<HTMLButtonElement>(".overlay-tab-button"));
 
     if (this.panelWindow) {
       this.panelWindow.tabIndex = 0;
@@ -235,6 +287,24 @@ class OverlayTerminalController {
       event.preventDefault();
       void this.executeCommand();
     });
+    this.chatForm?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void this.sendChatMessage();
+    });
+    this.chatSendButton?.addEventListener("click", () => {
+      void this.sendChatMessage();
+    });
+    this.chatResumeButton?.addEventListener("click", () => {
+      void this.resumeChat();
+    });
+    this.chatResetButton?.addEventListener("click", () => {
+      void this.resetChat();
+    });
+    this.tabButtons.forEach((button) => {
+      button.addEventListener("click", () => {
+        this.setActiveTab((button.dataset.tab as OverlayTab | undefined) ?? "console", true, true);
+      });
+    });
 
     this.terminalInput?.addEventListener("focus", () => {
       this.refreshTerminalSuggestions();
@@ -249,16 +319,21 @@ class OverlayTerminalController {
     this.terminalInput?.addEventListener("input", () => {
       this.refreshTerminalSuggestions();
     });
+    this.chatInput?.addEventListener("input", () => {
+      this.renderChatToolRow();
+    });
   }
 
   private async ensureStream(): Promise<void> {
     if (this.streamPort) {
+      this.subscribeCurrentPageToStream();
       return;
     }
 
     this.streamPort = connectRuntimeStream((message) => {
-      void this.handleStreamMessage(message as RuntimeStreamMessage & Record<string, unknown>);
+      void this.handleStreamMessage(message as ExtensionStreamMessage & Record<string, unknown>);
     });
+    this.subscribeCurrentPageToStream();
     this.startStreamKeepAlive();
 
     this.streamPort.onDisconnect.addListener(() => {
@@ -326,7 +401,57 @@ class OverlayTerminalController {
     });
   }
 
-  private async handleStreamMessage(message: RuntimeStreamMessage & Record<string, unknown>): Promise<void> {
+  private async loadAiSnapshot(): Promise<void> {
+    const pageContext = this.getCurrentPageContext();
+    if (!pageContext) {
+      this.aiSession = null;
+      this.render();
+      return;
+    }
+
+    try {
+      const snapshot = await sendCommand<{ session: AiChatPageSession }>(
+        COMMANDS.aiChatStatus,
+        "overlay",
+        "background",
+        {
+          pageKey: pageContext.pageKey,
+          pageUrl: pageContext.pageUrl
+        }
+      );
+      this.aiSession = AiChatPageSessionSchema.parse(snapshot.session);
+      this.render();
+    } catch (error) {
+      this.aiSession = {
+        pageKey: pageContext.pageKey,
+        pageUrlSample: pageContext.pageUrl,
+        attachedViewIds: [],
+        state: "error",
+        activeRequestId: null,
+        openaiResponseId: null,
+        lastSequenceNumber: null,
+        queuedCount: 0,
+        recoverable: false,
+        lastCheckpointAt: null,
+        lastError: error instanceof Error ? error.message : String(error),
+        messages: [],
+        queue: [],
+        status: {
+          ...createDefaultAiStatus(pageContext.pageKey, pageContext.pageUrl, false),
+          requestState: "error",
+          lastError: error instanceof Error ? error.message : String(error)
+        }
+      };
+      this.render();
+    }
+  }
+
+  private async handleStreamMessage(message: ExtensionStreamMessage & Record<string, unknown>): Promise<void> {
+    if (message.stream === "ai") {
+      await this.handleAiStreamMessage(message as AiStreamMessage);
+      return;
+    }
+
     if (message.event === "runtime.snapshot") {
       this.applySnapshot({
         config: ExtensionConfigSchema.parse(message.config),
@@ -340,7 +465,7 @@ class OverlayTerminalController {
 
     if (message.event === "runtime.status" && message.status) {
       this.currentStatus = WorkerStatusSchema.parse(message.status);
-      this.renderStatus();
+      this.renderConsoleStatus();
       return;
     }
 
@@ -358,6 +483,37 @@ class OverlayTerminalController {
     }
   }
 
+  private async handleAiStreamMessage(message: AiStreamMessage): Promise<void> {
+    const currentPageContext = this.getCurrentPageContext();
+    if (!currentPageContext || message.pageKey !== currentPageContext.pageKey) {
+      return;
+    }
+
+    if (message.session) {
+      this.aiSession = AiChatPageSessionSchema.parse(message.session);
+      this.renderChat();
+      return;
+    }
+
+    if (this.aiSession && message.status) {
+      this.aiSession = {
+        ...this.aiSession,
+        status: message.status,
+        state: message.status.requestState,
+        activeRequestId: message.status.activeRequestId,
+        openaiResponseId: message.status.openaiResponseId,
+        lastSequenceNumber: message.status.lastSequenceNumber,
+        queuedCount: message.status.queueCount,
+        recoverable: message.status.recoverable,
+        lastError: message.status.lastError
+      };
+      this.renderChat();
+      return;
+    }
+
+    await this.loadAiSnapshot();
+  }
+
   private applySnapshot(snapshot: RuntimeSnapshot): void {
     this.currentConfig = snapshot.config;
     this.currentStatus = snapshot.status;
@@ -367,12 +523,18 @@ class OverlayTerminalController {
   }
 
   private render(forceActivityScroll = false): void {
-    this.renderStatus();
+    if (this.currentConfig) {
+      this.activeTab = this.currentConfig.ui.overlay.activeTab;
+    }
+    this.renderConsoleStatus();
+    this.renderConsoleToolRow();
     this.renderActivityFeed(forceActivityScroll);
+    this.renderChat();
+    this.setActiveTab(this.activeTab, false);
   }
 
-  private renderStatus(): void {
-    if (!this.statusRow || !this.currentStatus) {
+  private renderConsoleStatus(): void {
+    if (!this.consoleStatusRow || !this.currentStatus) {
       return;
     }
 
@@ -385,7 +547,7 @@ class OverlayTerminalController {
       ["heartbeat", this.currentStatus.lastHeartbeatAt ?? "-"]
     ];
 
-    this.statusRow.replaceChildren(
+    this.consoleStatusRow.replaceChildren(
       ...fragments.map(([label, value]) => {
         const item = document.createElement("span");
         item.className = "status-chip";
@@ -393,6 +555,274 @@ class OverlayTerminalController {
         return item;
       })
     );
+  }
+
+  private renderConsoleToolRow(): void {
+    if (!this.consoleToolRow) {
+      return;
+    }
+
+    this.consoleToolRow.replaceChildren();
+    this.consoleToolRow.classList.add("is-collapsed");
+  }
+
+  private renderChat(): void {
+    this.renderChatStatus();
+    this.renderChatToolRow();
+    this.renderChatFeed();
+  }
+
+  private renderChatStatus(): void {
+    if (!this.chatStatusRow) {
+      return;
+    }
+
+    const pageContext = this.getCurrentPageContext();
+    const session = this.aiSession;
+    const status = session?.status ?? (pageContext ? createDefaultAiStatus(pageContext.pageKey, pageContext.pageUrl, false) : null);
+    if (!status) {
+      this.chatStatusRow.replaceChildren();
+      return;
+    }
+
+    const budget = status.currentModelBudget ?? status.rateLimits ?? null;
+    const rpmText =
+      budget && budget.serverRemainingRequests !== null && budget.serverLimitRequests !== null
+        ? `${budget.serverRemainingRequests}/${budget.serverLimitRequests}`
+        : "-";
+    const tpmText =
+      budget && budget.serverRemainingTokens !== null && budget.serverLimitTokens !== null
+        ? `${budget.serverRemainingTokens}/${budget.serverLimitTokens}`
+        : "-";
+    const resetText = budget?.serverResetRequests ?? budget?.serverResetTokens ?? "-";
+    const configuredModelText = status.model
+      ? `${status.model.model} [${status.model.tier}]`
+      : "не задана";
+    const formatText = status.structuredOutputEnabled
+      ? `${status.structuredOutputName ?? "json_schema"}${status.structuredOutputStrict ? " strict" : ""}`
+      : "text";
+
+    const fragments = [
+      ["provider", status.provider],
+      ["key", status.apiKeyPresent ? "обнаружен" : "нет"],
+      ["model", configuredModelText],
+      ["rpm", rpmText],
+      ["tpm", tpmText],
+      ["reset", resetText],
+      ["format", formatText],
+      ["stream", status.streamingEnabled ? "вкл" : "выкл"],
+      ["state", status.requestState],
+      ["page", shortenPageKey(status.pageKey)],
+      ["queue", String(status.queueCount)]
+    ];
+
+    if (status.resolvedServiceTier) {
+      fragments.splice(6, 0, ["served", status.resolvedServiceTier]);
+    }
+
+    this.chatStatusRow.replaceChildren(
+      ...fragments.map(([label, value]) => {
+        const item = document.createElement("span");
+        item.className = "status-chip";
+        item.textContent = `${label}: ${value}`;
+        return item;
+      })
+    );
+  }
+
+  private renderChatToolRow(): void {
+    const status = this.aiSession?.status;
+    const chatInputValue = this.chatInput?.value.trim() ?? "";
+    const configuredModel = status?.model?.model ?? this.currentConfig?.ai.chat.model?.model ?? "";
+    const canSendFromInput = configuredModel.trim().length > 0 && chatInputValue.length > 0;
+
+    if (this.chatSendButton) {
+      this.chatSendButton.hidden = !canSendFromInput;
+    }
+    if (this.chatResumeButton) {
+      this.chatResumeButton.hidden = !(status?.availableActions.canResume ?? false);
+    }
+    if (this.chatResetButton) {
+      this.chatResetButton.hidden = !(status?.availableActions.canReset ?? false);
+    }
+
+    if (this.chatToolRow) {
+      const hasVisibleActions = [
+        this.chatSendButton,
+        this.chatResumeButton,
+        this.chatResetButton
+      ].some((button) => button && !button.hidden);
+      this.chatToolRow.classList.toggle("is-collapsed", !hasVisibleActions);
+    }
+  }
+
+  private renderChatFeed(): void {
+    if (!this.chatFeed) {
+      return;
+    }
+
+    const messages = this.aiSession?.messages ?? [];
+    this.chatFeed.replaceChildren(
+      ...messages.map((message) => this.createChatMessageElement(message))
+    );
+    this.chatFeed.scrollTop = this.chatFeed.scrollHeight;
+  }
+
+  private createChatMessageElement(message: AiChatPageSession["messages"][number]): HTMLElement {
+    const card = document.createElement("article");
+    card.className = `chat-entry kind-${message.kind} state-${message.state}`;
+
+    const header = document.createElement("div");
+    header.className = "chat-entry-header";
+
+    const badge = document.createElement("span");
+    badge.className = "chat-entry-badge";
+    badge.textContent = message.kind.toUpperCase();
+
+    const meta = document.createElement("span");
+    meta.className = "chat-entry-meta";
+    meta.textContent = `${message.origin} • ${new Date(message.ts).toLocaleTimeString()}`;
+
+    const body = document.createElement("div");
+    body.className = "chat-entry-body";
+    body.textContent = message.text || (message.state === "streaming" ? "…" : "");
+
+    header.append(badge, meta);
+    card.append(header, body);
+    return card;
+  }
+
+  private setActiveTab(tab: OverlayTab, focusInput = true, persist = false): void {
+    this.activeTab = tab;
+    if (this.currentConfig) {
+      this.currentConfig = {
+        ...this.currentConfig,
+        ui: {
+          ...this.currentConfig.ui,
+          overlay: {
+            ...this.currentConfig.ui.overlay,
+            activeTab: tab
+          }
+        }
+      };
+    }
+    this.tabButtons.forEach((button) => {
+      button.classList.toggle("is-active", button.dataset.tab === tab);
+    });
+    this.consolePanel?.classList.toggle("is-active", tab === "console");
+    this.chatPanel?.classList.toggle("is-active", tab === "chat");
+    this.consoleToolRow?.classList.toggle("is-collapsed", tab === "console" && this.consoleToolRow.childElementCount === 0);
+
+    if (persist) {
+      void this.patchOverlaySessionConfig({
+        activeTab: tab
+      });
+    }
+
+    if (focusInput) {
+      if (tab === "chat") {
+        this.chatInput?.focus();
+      } else {
+        this.terminalInput?.focus();
+      }
+    }
+  }
+
+  private getCurrentPageContext(): { pageKey: string; pageUrl: string } | null {
+    const pageUrl = window.location.href;
+    const pageKey = normalizePageKey(pageUrl);
+    if (!pageKey) {
+      return null;
+    }
+
+    return {
+      pageKey,
+      pageUrl
+    };
+  }
+
+  private subscribeCurrentPageToStream(): void {
+    const pageContext = this.getCurrentPageContext();
+    if (!pageContext) {
+      return;
+    }
+
+    try {
+      this.streamPort?.postMessage({
+        type: "page.subscribe",
+        pageKey: pageContext.pageKey,
+        pageUrl: pageContext.pageUrl,
+        viewId: this.pageViewId
+      });
+    } catch {
+      // Reconnect path owns recovery.
+    }
+  }
+
+  private async sendChatMessage(): Promise<void> {
+    const pageContext = this.getCurrentPageContext();
+    const text = this.chatInput?.value.trim() ?? "";
+    if (!pageContext || !text) {
+      this.renderChatToolRow();
+      return;
+    }
+
+    try {
+      this.chatInput!.value = "";
+      this.renderChatToolRow();
+      const response = await sendCommand<{ session: AiChatPageSession }>(
+        COMMANDS.aiChatSend,
+        "overlay",
+        "background",
+        {
+          pageKey: pageContext.pageKey,
+          pageUrl: pageContext.pageUrl,
+          origin: "user",
+          text
+        }
+      );
+      this.aiSession = AiChatPageSessionSchema.parse(response.session);
+      this.renderChat();
+    } catch (error) {
+      this.pushConsole("error", error instanceof Error ? error.message : String(error));
+      await recordLog("content", "chat.send.failed", "AI chat send failed.", serializeLogDetails(error), "error");
+    }
+  }
+
+  private async resumeChat(): Promise<void> {
+    const pageContext = this.getCurrentPageContext();
+    if (!pageContext) {
+      return;
+    }
+
+    const response = await sendCommand<{ session: AiChatPageSession }>(
+      COMMANDS.aiChatResume,
+      "overlay",
+      "background",
+      {
+        pageKey: pageContext.pageKey
+      }
+    );
+    this.aiSession = AiChatPageSessionSchema.parse(response.session);
+    this.renderChat();
+  }
+
+  private async resetChat(): Promise<void> {
+    const pageContext = this.getCurrentPageContext();
+    if (!pageContext) {
+      return;
+    }
+
+    const response = await sendCommand<{ session: AiChatPageSession }>(
+      COMMANDS.aiChatReset,
+      "overlay",
+      "background",
+      {
+        pageKey: pageContext.pageKey
+      }
+    );
+    this.aiSession = AiChatPageSessionSchema.parse(response.session);
+    this.renderChat();
   }
 
   private renderActivityFeed(forceScrollToEnd = false): void {
@@ -1039,7 +1469,11 @@ class OverlayTerminalController {
   }
 
   private focusPreferredOverlayElement(): void {
-    this.terminalInput?.focus();
+    if (this.activeTab === "chat") {
+      this.chatInput?.focus();
+    } else {
+      this.terminalInput?.focus();
+    }
     if (this.shadowRoot?.activeElement || this.panelWindow?.matches(":focus-within")) {
       return;
     }
@@ -1109,7 +1543,7 @@ class OverlayTerminalController {
       return null;
     }
 
-    const scrollContainer = candidate.closest<HTMLElement>(".activity-feed");
+    const scrollContainer = candidate.closest<HTMLElement>(".activity-feed, .chat-feed");
     if (scrollContainer) {
       return scrollContainer;
     }
@@ -1274,12 +1708,66 @@ const overlayStyles = `
     cursor: pointer;
   }
 
+  .overlay-tab-strip {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid #111111;
+    background: #ffffff;
+  }
+
+  .overlay-tab-button {
+    appearance: none;
+    border: 0;
+    border-right: 1px solid #111111;
+    background: #ffffff;
+    color: #111111;
+    min-height: 36px;
+    padding: 0 14px;
+    font: inherit;
+    font-size: 12px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    cursor: pointer;
+  }
+
+  .overlay-tab-button.is-active {
+    background: #111111;
+    color: #ffffff;
+  }
+
+  .tab-surface {
+    display: none;
+    min-height: 0;
+    grid-template-rows: auto auto 1fr;
+  }
+
+  .tab-surface.is-active {
+    display: grid;
+  }
+
   .status-row {
     display: flex;
     flex-wrap: wrap;
     gap: 0;
     border-bottom: 1px solid #111111;
     background: #ffffff;
+  }
+
+  .tool-row {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    min-height: 32px;
+    border-bottom: 1px solid #111111;
+    background: #fafafa;
+  }
+
+  .tool-row.is-collapsed {
+    min-height: 0;
+    height: 0;
+    border-bottom: 0;
+    overflow: hidden;
+    pointer-events: none;
   }
 
   .status-chip {
@@ -1291,6 +1779,21 @@ const overlayStyles = `
     font-size: 11px;
     letter-spacing: 0.08em;
     text-transform: uppercase;
+  }
+
+  .tool-icon {
+    appearance: none;
+    border: 0;
+    border-right: 1px solid #111111;
+    background: transparent;
+    color: #111111;
+    min-height: 32px;
+    padding: 0 10px;
+    font: inherit;
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    cursor: pointer;
   }
 
   .panel-body {
@@ -1306,6 +1809,14 @@ const overlayStyles = `
     overflow-x: hidden;
     border: 0;
     padding: 0;
+    overscroll-behavior: contain;
+  }
+
+  .chat-feed {
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    background: #ffffff;
     overscroll-behavior: contain;
   }
 
@@ -1418,6 +1929,17 @@ const overlayStyles = `
     min-height: 40px;
   }
 
+  .chat-form {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 8px;
+    align-items: center;
+    border-top: 1px solid #111111;
+    background: #ffffff;
+    padding: 0 10px;
+    min-height: 40px;
+  }
+
   .prompt-label {
     font-family: "Cascadia Code", "Consolas", monospace;
     font-size: 12px;
@@ -1430,6 +1952,17 @@ const overlayStyles = `
   }
 
   .terminal-input {
+    width: 100%;
+    border: 0;
+    background: transparent;
+    font: inherit;
+    font-family: "Cascadia Code", "Consolas", monospace;
+    font-size: 13px;
+    color: #111111;
+    outline: none;
+  }
+
+  .chat-input {
     width: 100%;
     border: 0;
     background: transparent;
@@ -1548,6 +2081,71 @@ const overlayStyles = `
   }
 
   .level-error {
+    color: #b91c1c;
+  }
+
+  .chat-entry {
+    display: grid;
+    gap: 0;
+    border-bottom: 1px solid rgba(17, 17, 17, 0.14);
+    background: #ffffff;
+  }
+
+  .chat-entry-header {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 8px;
+    align-items: center;
+    min-height: 26px;
+    padding: 4px 8px;
+  }
+
+  .chat-entry-badge {
+    display: inline-flex;
+    justify-content: center;
+    min-width: 52px;
+    border: 1px solid currentColor;
+    padding: 2px 6px;
+    font-size: 10px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+  }
+
+  .chat-entry-meta {
+    min-width: 0;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #5b5b5b;
+  }
+
+  .chat-entry-body {
+    padding: 0 10px 10px;
+    font-size: 12px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    overflow-x: hidden;
+  }
+
+  .chat-entry.kind-assistant .chat-entry-badge {
+    color: #166534;
+  }
+
+  .chat-entry.kind-user .chat-entry-badge,
+  .chat-entry.kind-code .chat-entry-badge {
+    color: #1d4ed8;
+  }
+
+  .chat-entry.kind-compaction .chat-entry-badge,
+  .chat-entry.kind-rate-limit .chat-entry-badge,
+  .chat-entry.kind-queue .chat-entry-badge,
+  .chat-entry.kind-resume .chat-entry-badge,
+  .chat-entry.kind-reset .chat-entry-badge {
+    color: #4b5563;
+  }
+
+  .chat-entry.kind-error .chat-entry-badge {
     color: #b91c1c;
   }
 `;

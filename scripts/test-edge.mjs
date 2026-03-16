@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { promises as fs } from "node:fs";
 import http from "node:http";
+import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { chromium } from "@playwright/test";
@@ -17,6 +19,7 @@ import {
 } from "./lib/common.mjs";
 
 async function main() {
+  const aiOnly = process.argv.includes("--ai-only");
   await prepareArtifacts();
 
   const extensionMetadata = await ensureExtensionKeyMetadata();
@@ -31,14 +34,16 @@ async function main() {
       await runPlaywrightFlow({
         popupUrl,
         pageUrl: server.url,
-        slowUrl: server.slowUrl
+        slowUrl: server.slowUrl,
+        aiOnly
       });
     } catch (error) {
       console.warn(`Playwright harness failed, switching to EdgeDriver fallback: ${error.message}`);
       await runSeleniumFlow({
         popupUrl,
         pageUrl: server.url,
-        slowUrl: server.slowUrl
+        slowUrl: server.slowUrl,
+        aiOnly
       });
     }
   } finally {
@@ -47,6 +52,7 @@ async function main() {
 }
 
 async function prepareArtifacts() {
+  await fs.rm(getNativeHostStatePath(), { force: true });
   await run(process.execPath, ["scripts/build-extension.mjs"]);
   await run(process.execPath, ["scripts/build-native-host.mjs"]);
   await run(process.execPath, ["scripts/pack-extension.mjs"]);
@@ -54,6 +60,15 @@ async function prepareArtifacts() {
 
   assert.equal(await fileExists(paths.packagedCrx), true, "Packed CRX is missing.");
   assert.equal(await fileExists(getNativeHostExePath()), true, "Native host executable is missing.");
+}
+
+function getNativeHostStatePath() {
+  const localAppData = process.env.LOCALAPPDATA;
+  if (!localAppData) {
+    throw new Error("LOCALAPPDATA is unavailable.");
+  }
+
+  return path.join(localAppData, "LexTraceNt3", "native-host-state.json");
 }
 
 async function seedEdgeProfile(popupUrl) {
@@ -150,6 +165,31 @@ async function runPlaywrightFlow({ popupUrl, pageUrl, slowUrl }) {
       return button?.textContent?.trim() === "2500";
     });
 
+    await setPlaywrightAllowedModel(popupPage, "gpt-5", "standard");
+    await setPlaywrightModelPanelValue(popupPage, "ai.model", "gpt-5", "standard");
+    await popupPage.waitForFunction(() => {
+      const button = document.querySelector("button[data-config-path='ai.model']");
+      const text = button?.textContent?.trim() ?? "";
+      return text.includes("gpt-5") && text.includes("standard");
+    });
+
+    await setPlaywrightModalTextValue(
+      popupPage,
+      "ai.instructions",
+      "Всегда отвечай кратко.\nВозвращай только релевантный результат."
+    );
+    await popupPage.waitForFunction(() => {
+      const button = document.querySelector("button[data-config-path='ai.instructions']");
+      return (button?.textContent ?? "").includes("Всегда отвечай кратко.");
+    });
+
+    await popupPage.locator("button[data-config-path='ai.streamingEnabled']").click();
+    await popupPage.locator("[data-editor-path='ai.streamingEnabled']").selectOption("true");
+    await popupPage.waitForFunction(() => {
+      const button = document.querySelector("button[data-config-path='ai.streamingEnabled']");
+      return button?.textContent?.trim() === "true";
+    });
+
     await popupPage.locator("button[data-config-path='ui.overlay.visible']").click();
     await popupPage.locator("[data-editor-path='ui.overlay.visible']").selectOption("true");
     await popupPage.waitForFunction(() => {
@@ -191,7 +231,7 @@ async function runPlaywrightFlow({ popupUrl, pageUrl, slowUrl }) {
     await overlayRoot.locator("text=LexTrace Terminal").waitFor({ timeout: 10000 });
     const activityFeed = overlayRoot.locator("[data-role='activity-feed']");
     await activityFeed.waitFor();
-    assert.equal(await overlayRoot.locator(".tab-strip").count(), 0, "Overlay tab strip should be removed.");
+    assert.equal(await overlayRoot.locator(".overlay-tab-strip").count(), 1, "Overlay tab strip should be present.");
 
     await overlayRoot.locator(".close-button").click();
     await popupPage.locator("#open-terminal").click();
@@ -264,6 +304,80 @@ async function runPlaywrightFlow({ popupUrl, pageUrl, slowUrl }) {
     assert.equal(collapsedCount, await allActivityEntries.count(), "All terminal activity entries must be collapsed by default.");
     assert.equal(await overlayRoot.locator(".log-preview").count(), 0, "Collapsed log summary must not duplicate expanded content.");
 
+    await overlayRoot.locator(".overlay-tab-button[data-tab='chat']").click();
+    const chatFeed = overlayRoot.locator("[data-role='chat-feed']");
+    const chatInput = overlayRoot.locator("[data-role='chat-input']");
+    await chatFeed.waitFor();
+    await overlayRoot.locator("[data-role='chat-status-row']").waitFor();
+    await appPage.waitForFunction(() => {
+      const text = document.querySelector("#lextrace-overlay-root")
+        ?.shadowRoot
+        ?.querySelector("[data-role='chat-status-row']")
+        ?.textContent ?? "";
+      return text.includes("provider: openai");
+    });
+    assert.equal(await overlayRoot.locator("[data-role='chat-send']").isHidden(), true, "Send button should be hidden on empty chat input.");
+
+    await chatInput.fill("Reply with exact token EDGE_AI_OK and nothing else.");
+    await appPage.waitForFunction(() => {
+      const button = document.querySelector("#lextrace-overlay-root")
+        ?.shadowRoot
+        ?.querySelector("[data-role='chat-send']");
+      return button instanceof HTMLButtonElement && button.hidden === false;
+    });
+    await chatInput.press("Enter");
+    await appPage.waitForFunction(() => {
+      const feed = document.querySelector("#lextrace-overlay-root")
+        ?.shadowRoot
+        ?.querySelector("[data-role='chat-feed']");
+      return (feed?.textContent ?? "").includes("EDGE_AI_OK");
+    }, undefined, { timeout: 90000 });
+    await appPage.waitForFunction(() => {
+      const root = document.querySelector("#lextrace-overlay-root")?.shadowRoot;
+      return !!root?.querySelector(".chat-entry.kind-assistant.state-streaming, .chat-entry.kind-assistant.state-completed");
+    }, undefined, { timeout: 30000 });
+
+    const sharedPage = await context.newPage();
+    await sharedPage.goto(`${pageUrl}?shared=1#copy`, { waitUntil: "load" });
+    await sharedPage.bringToFront();
+    await popupPage.bringToFront();
+    await popupPage.locator("#open-terminal").click();
+    const sharedOverlay = sharedPage.locator("#lextrace-overlay-root");
+    await sharedOverlay.waitFor({ state: "attached", timeout: 10000 });
+    await sharedOverlay.locator(".overlay-tab-button[data-tab='chat']").click();
+    await sharedPage.waitForFunction(() => {
+      const feed = document.querySelector("#lextrace-overlay-root")
+        ?.shadowRoot
+        ?.querySelector("[data-role='chat-feed']");
+      return (feed?.textContent ?? "").includes("EDGE_AI_OK");
+    }, undefined, { timeout: 30000 });
+
+    await sendPlaywrightCodeChatRequest(
+      popupPage,
+      `${new URL(pageUrl).origin}/`,
+      pageUrl,
+      "Reply with exact token EDGE_CODE_OK and nothing else."
+    );
+    await popupPage.waitForFunction(async ([targetPageKey, targetPageUrl]) => {
+      const response = await chrome.runtime.sendMessage({
+        id: crypto.randomUUID(),
+        version: 1,
+        scope: "command",
+        action: "ai.chat.status",
+        source: "tests",
+        target: "background",
+        ts: new Date().toISOString(),
+        payload: {
+          pageKey: targetPageKey,
+          pageUrl: targetPageUrl
+        },
+        correlationId: null
+      });
+
+      const text = JSON.stringify(response?.result?.session ?? {});
+      return text.includes("EDGE_CODE_OK") && text.includes("\"origin\":\"code\"");
+    }, [`${new URL(pageUrl).origin}/`, pageUrl], { timeout: 90000 });
+
     await runTerminalCommand(terminalInput, "test.host.crash");
     await popupPage.waitForFunction(() => {
       const badge = document.querySelector("#status-badge");
@@ -275,8 +389,9 @@ async function runPlaywrightFlow({ popupUrl, pageUrl, slowUrl }) {
 
     await runTerminalCommand(terminalInput, "worker.stop");
     await popupPage.waitForFunction(() => {
-      const badge = document.querySelector("#status-badge");
-      return badge?.textContent?.trim() === "offline";
+      const workerRunning = document.querySelector("#worker-running")?.textContent?.trim();
+      const workerTask = document.querySelector("#worker-task")?.textContent?.trim();
+      return workerRunning === "stopped" && workerTask === "-";
     }, undefined, { timeout: 10000 });
 
     await runTerminalCommand(terminalInput, "clear");
@@ -294,7 +409,7 @@ async function runPlaywrightFlow({ popupUrl, pageUrl, slowUrl }) {
   }
 }
 
-async function runSeleniumFlow({ popupUrl, pageUrl, slowUrl }) {
+async function runSeleniumFlow({ popupUrl, pageUrl, slowUrl, aiOnly = false }) {
   await cleanDir(paths.edgeProfile);
 
   const options = createEdgeOptions(paths.edgeProfile);
@@ -316,51 +431,53 @@ async function runSeleniumFlow({ popupUrl, pageUrl, slowUrl }) {
     const popupTitle = await driver.executeScript("return document.querySelector('h1')?.textContent ?? null;");
     assert.equal(popupTitle, "LexTrace NT3", "Popup shell did not render.");
 
-    await driver.switchTo().window(popupHandle);
-    const slowTabId = await createSeleniumExtensionTab(driver, slowUrl);
-    await waitFor(async () => {
-      const tabInfo = await readSeleniumTabInfo(driver, slowTabId);
-      return (
-        typeof tabInfo?.url === "string" && tabInfo.url.includes("/slow")
-      ) || (
-        typeof tabInfo?.pendingUrl === "string" && tabInfo.pendingUrl.includes("/slow")
-      );
-    }, 10000, "Slow tab did not expose slowUrl state.");
-    await driver.get(`${popupUrl}?targetTabId=${slowTabId}&targetUrl=${encodeURIComponent(slowUrl)}`);
-    await driver.executeScript("document.querySelector('#open-terminal')?.click();");
-    try {
+    if (!aiOnly) {
+      await driver.switchTo().window(popupHandle);
+      const slowTabId = await createSeleniumExtensionTab(driver, slowUrl);
+      await waitFor(async () => {
+        const tabInfo = await readSeleniumTabInfo(driver, slowTabId);
+        return (
+          typeof tabInfo?.url === "string" && tabInfo.url.includes("/slow")
+        ) || (
+          typeof tabInfo?.pendingUrl === "string" && tabInfo.pendingUrl.includes("/slow")
+        );
+      }, 10000, "Slow tab did not expose slowUrl state.");
+      await driver.get(`${popupUrl}?targetTabId=${slowTabId}&targetUrl=${encodeURIComponent(slowUrl)}`);
+      await driver.executeScript("document.querySelector('#open-terminal')?.click();");
+      try {
+        await waitFor(async () => {
+          const message = await driver.executeScript("return document.querySelector('#terminal-state')?.textContent ?? null;");
+          return typeof message === "string" && message.toLowerCase().includes("opened on tab");
+        }, 10000, "Popup did not open terminal on slow current page.");
+      } catch (error) {
+        const slowDebug = await driver.executeScript(`
+          return {
+            terminalState: document.querySelector('#terminal-state')?.textContent ?? null,
+            badge: document.querySelector('#status-badge')?.textContent ?? null,
+            location: window.location.href
+          };
+        `);
+        throw new Error(`${error.message}\nSlow debug: ${JSON.stringify(slowDebug, null, 2)}`);
+      }
+      await removeSeleniumTab(driver, slowTabId);
+
+      const unsupportedTabId = await createSeleniumExtensionTab(driver, "about:blank");
+      await waitFor(async () => {
+        const tabInfo = await readSeleniumTabInfo(driver, unsupportedTabId);
+        return (
+          typeof tabInfo?.url === "string" && tabInfo.url === "about:blank"
+        ) || (
+          typeof tabInfo?.pendingUrl === "string" && tabInfo.pendingUrl === "about:blank"
+        );
+      }, 10000, "Unsupported tab did not expose about:blank state.");
+      await driver.get(`${popupUrl}?targetTabId=${unsupportedTabId}&targetUrl=${encodeURIComponent("about:blank")}`);
+      await driver.executeScript("document.querySelector('#open-terminal')?.click();");
       await waitFor(async () => {
         const message = await driver.executeScript("return document.querySelector('#terminal-state')?.textContent ?? null;");
-        return typeof message === "string" && message.toLowerCase().includes("opened on tab");
-      }, 10000, "Popup did not open terminal on slow current page.");
-    } catch (error) {
-      const slowDebug = await driver.executeScript(`
-        return {
-          terminalState: document.querySelector('#terminal-state')?.textContent ?? null,
-          badge: document.querySelector('#status-badge')?.textContent ?? null,
-          location: window.location.href
-        };
-      `);
-      throw new Error(`${error.message}\nSlow debug: ${JSON.stringify(slowDebug, null, 2)}`);
+        return typeof message === "string" && message.toLowerCase().includes("regular http(s) page");
+      }, 10000, "Popup did not report unsupported tab.");
+      await removeSeleniumTab(driver, unsupportedTabId);
     }
-    await removeSeleniumTab(driver, slowTabId);
-
-    const unsupportedTabId = await createSeleniumExtensionTab(driver, "about:blank");
-    await waitFor(async () => {
-      const tabInfo = await readSeleniumTabInfo(driver, unsupportedTabId);
-      return (
-        typeof tabInfo?.url === "string" && tabInfo.url === "about:blank"
-      ) || (
-        typeof tabInfo?.pendingUrl === "string" && tabInfo.pendingUrl === "about:blank"
-      );
-    }, 10000, "Unsupported tab did not expose about:blank state.");
-    await driver.get(`${popupUrl}?targetTabId=${unsupportedTabId}&targetUrl=${encodeURIComponent("about:blank")}`);
-    await driver.executeScript("document.querySelector('#open-terminal')?.click();");
-    await waitFor(async () => {
-      const message = await driver.executeScript("return document.querySelector('#terminal-state')?.textContent ?? null;");
-      return typeof message === "string" && message.toLowerCase().includes("regular http(s) page");
-    }, 10000, "Popup did not report unsupported tab.");
-    await removeSeleniumTab(driver, unsupportedTabId);
 
     await driver.switchTo().window(appHandle);
     await driver.get(pageUrl);
@@ -391,66 +508,93 @@ async function runSeleniumFlow({ popupUrl, pageUrl, slowUrl }) {
     assert.equal(configViewerPresent.overflowY, "auto", "Config viewport must own vertical scrolling.");
     assert.equal(configViewerPresent.noHorizontalScroll, true, "Config viewport should not scroll horizontally.");
 
-    await setSeleniumJsonSelectValue(driver, "logging.level", "warn");
-    await waitFor(async () => {
-      const value = await readSeleniumJsonValue(driver, "logging.level");
-      return value === "warn";
-    }, 10000, "Enum dropdown edit did not commit.");
+    if (!aiOnly) {
+      await setSeleniumJsonSelectValue(driver, "logging.level", "warn");
+      await waitFor(async () => {
+        const value = await readSeleniumJsonValue(driver, "logging.level");
+        return value === "warn";
+      }, 10000, "Enum dropdown edit did not commit.");
 
-    await setSeleniumJsonInputValue(driver, "runtime.commandTimeoutMs", "2500", "enter");
-    await waitFor(async () => {
-      const value = await readSeleniumJsonValue(driver, "runtime.commandTimeoutMs");
-      return value === "2500";
-    }, 10000, "Numeric inline edit did not commit.");
+      await setSeleniumJsonInputValue(driver, "runtime.commandTimeoutMs", "2500", "enter");
+      await waitFor(async () => {
+        const value = await readSeleniumJsonValue(driver, "runtime.commandTimeoutMs");
+        return value === "2500";
+      }, 10000, "Numeric inline edit did not commit.");
 
-    await setSeleniumJsonInputValue(driver, "runtime.commandTimeoutMs", "broken", "enter");
-    await waitFor(async () => {
-      const message = await driver.executeScript("return document.querySelector('#terminal-state')?.textContent ?? null;");
-      return typeof message === "string" && message.toLowerCase().includes("integer");
-    }, 10000, "Invalid numeric edit did not report an error.");
-    assert.equal(await readSeleniumJsonValue(driver, "runtime.commandTimeoutMs"), "2500");
+      await setSeleniumJsonInputValue(driver, "runtime.commandTimeoutMs", "broken", "enter");
+      await waitFor(async () => {
+        const message = await driver.executeScript("return document.querySelector('#terminal-state')?.textContent ?? null;");
+        return typeof message === "string" && message.toLowerCase().includes("integer");
+      }, 10000, "Invalid numeric edit did not report an error.");
+      assert.equal(await readSeleniumJsonValue(driver, "runtime.commandTimeoutMs"), "2500");
+    }
 
-    await setSeleniumJsonSelectValue(driver, "ui.overlay.visible", "true");
+    await setSeleniumAllowedModel(driver, "gpt-5", "standard");
+    await setSeleniumModelPanelValue(driver, "ai.model", "gpt-5", "standard");
     await waitFor(async () => {
-      const state = await driver.executeScript(`
-        return {
-          value: document.querySelector("button[data-config-path='ui.overlay.visible']")?.textContent?.trim() ?? null,
-          activeTab: document.querySelector(".tab-button.is-active")?.getAttribute("data-tab") ?? null
-        };
-      `);
-      return state?.value === "true" && state?.activeTab === "config";
-    }, 10000, "Visible=true did not persist or switched popup tab.");
-    await driver.switchTo().window(appHandle);
-    await waitFor(async () => {
-      const display = await driver.executeScript(`
-        return document.querySelector('#lextrace-overlay-root')?.style?.display ?? null;
-      `);
-      return display === "block";
-    }, 10000, "Visible=true did not open overlay.");
-    await driver.switchTo().window(popupHandle);
+      const value = await readSeleniumJsonValue(driver, "ai.model");
+      return typeof value === "string" && value.includes("gpt-5") && value.includes("standard");
+    }, 10000, "AI model edit did not commit.");
 
-    await setSeleniumJsonSelectValue(driver, "ui.overlay.visible", "false");
+    await setSeleniumModalTextValue(
+      driver,
+      "ai.instructions",
+      "Всегда отвечай кратко.\nВозвращай только релевантный результат."
+    );
     await waitFor(async () => {
-      const state = await driver.executeScript(`
-        return {
-          value: document.querySelector("button[data-config-path='ui.overlay.visible']")?.textContent?.trim() ?? null,
-          activeTab: document.querySelector(".tab-button.is-active")?.getAttribute("data-tab") ?? null
-        };
-      `);
-      return state?.value === "false" && state?.activeTab === "config";
-    }, 10000, "Visible=false did not persist or switched popup tab.");
-    await driver.switchTo().window(appHandle);
-    await waitFor(async () => {
-      const display = await driver.executeScript(`
-        return document.querySelector('#lextrace-overlay-root')?.style?.display ?? null;
-      `);
-      return display === "none";
-    }, 10000, "Visible=false did not close overlay.");
-    await driver.switchTo().window(popupHandle);
+      const value = await readSeleniumJsonValue(driver, "ai.instructions");
+      return typeof value === "string" && value.includes("Всегда отвечай кратко.");
+    }, 10000, "AI instructions edit did not commit.");
 
-    const originalHostName = await readSeleniumJsonValue(driver, "runtime.nativeHostName");
-    await setSeleniumJsonInputValue(driver, "runtime.nativeHostName", "com.lextrace.changed", "escape");
-    assert.equal(await readSeleniumJsonValue(driver, "runtime.nativeHostName"), originalHostName);
+    await setSeleniumJsonSelectValue(driver, "ai.streamingEnabled", "true");
+    await waitFor(async () => {
+      const value = await readSeleniumJsonValue(driver, "ai.streamingEnabled");
+      return value === "true";
+    }, 10000, "AI streaming edit did not commit.");
+
+    if (!aiOnly) {
+      await setSeleniumJsonSelectValue(driver, "ui.overlay.visible", "true");
+      await waitFor(async () => {
+        const state = await driver.executeScript(`
+          return {
+            value: document.querySelector("button[data-config-path='ui.overlay.visible']")?.textContent?.trim() ?? null,
+            activeTab: document.querySelector(".tab-button.is-active")?.getAttribute("data-tab") ?? null
+          };
+        `);
+        return state?.value === "true" && state?.activeTab === "config";
+      }, 10000, "Visible=true did not persist or switched popup tab.");
+      await driver.switchTo().window(appHandle);
+      await waitFor(async () => {
+        const display = await driver.executeScript(`
+          return document.querySelector('#lextrace-overlay-root')?.style?.display ?? null;
+        `);
+        return display === "block";
+      }, 10000, "Visible=true did not open overlay.");
+      await driver.switchTo().window(popupHandle);
+
+      await setSeleniumJsonSelectValue(driver, "ui.overlay.visible", "false");
+      await waitFor(async () => {
+        const state = await driver.executeScript(`
+          return {
+            value: document.querySelector("button[data-config-path='ui.overlay.visible']")?.textContent?.trim() ?? null,
+            activeTab: document.querySelector(".tab-button.is-active")?.getAttribute("data-tab") ?? null
+          };
+        `);
+        return state?.value === "false" && state?.activeTab === "config";
+      }, 10000, "Visible=false did not persist or switched popup tab.");
+      await driver.switchTo().window(appHandle);
+      await waitFor(async () => {
+        const display = await driver.executeScript(`
+          return document.querySelector('#lextrace-overlay-root')?.style?.display ?? null;
+        `);
+        return display === "none";
+      }, 10000, "Visible=false did not close overlay.");
+      await driver.switchTo().window(popupHandle);
+
+      const originalHostName = await readSeleniumJsonValue(driver, "runtime.nativeHostName");
+      await setSeleniumJsonInputValue(driver, "runtime.nativeHostName", "com.lextrace.changed", "escape");
+      assert.equal(await readSeleniumJsonValue(driver, "runtime.nativeHostName"), originalHostName);
+    }
 
     await driver.executeScript("document.querySelector(\".tab-button[data-tab='control']\")?.click();");
     await driver.executeScript("document.querySelector('#open-terminal')?.click();");
@@ -481,196 +625,338 @@ async function runSeleniumFlow({ popupUrl, pageUrl, slowUrl }) {
       return title === "LexTrace Terminal";
     }, 10000, "Overlay terminal did not reopen after Close.");
 
-    await driver.executeScript(`
+    const overlayStructure = await driver.executeScript(`
       const root = document.querySelector('#lextrace-overlay-root')?.shadowRoot;
-      const input = root?.querySelector('[data-role="terminal-input"]');
-      if (!(input instanceof HTMLInputElement)) {
-        throw new Error('Terminal input is unavailable.');
-      }
-      input.focus();
-      input.value = 'work';
-      input.dispatchEvent(new Event('input', { bubbles: true }));
+      return {
+        overlayTabs: root?.querySelectorAll('.overlay-tab-button')?.length ?? 0,
+        chatStatus: !!root?.querySelector('[data-role="chat-status-row"]')
+      };
     `);
-    await waitFor(async () => {
-      const suggestionCount = await driver.executeScript(`
-        return document
+    assert.equal(overlayStructure.overlayTabs, 2, "Overlay must expose Console and Chat tabs.");
+    assert.equal(overlayStructure.chatStatus, true, "Chat status row is missing.");
+
+    if (!aiOnly) {
+      await driver.executeScript(`
+        const root = document.querySelector('#lextrace-overlay-root')?.shadowRoot;
+        const input = root?.querySelector('[data-role="terminal-input"]');
+        if (!(input instanceof HTMLInputElement)) {
+          throw new Error('Terminal input is unavailable.');
+        }
+        input.focus();
+        input.value = 'work';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      `);
+      await waitFor(async () => {
+        const suggestionCount = await driver.executeScript(`
+          return document
+            .querySelector('#lextrace-overlay-root')
+            ?.shadowRoot
+            ?.querySelectorAll('.terminal-suggestion-item')
+            ?.length ?? 0;
+        `);
+        return suggestionCount > 0;
+      }, 10000, "Terminal autocomplete suggestions did not appear.");
+      await driver.actions().sendKeys("\uE004").perform();
+      await waitFor(async () => {
+        const inputValue = await driver.executeScript(`
+          return document
+            .querySelector('#lextrace-overlay-root')
+            ?.shadowRoot
+            ?.querySelector('[data-role="terminal-input"]')
+            ?.value ?? null;
+        `);
+        return inputValue === 'worker.start';
+      }, 10000, "Terminal autocomplete did not apply the selected suggestion.");
+      await driver.executeScript(`
+        const input = document
           .querySelector('#lextrace-overlay-root')
           ?.shadowRoot
-          ?.querySelectorAll('.terminal-suggestion-item')
-          ?.length ?? 0;
+          ?.querySelector('[data-role="terminal-input"]');
+        if (input instanceof HTMLInputElement) {
+          input.value = '';
+        }
       `);
-      return suggestionCount > 0;
-    }, 10000, "Terminal autocomplete suggestions did not appear.");
-    await driver.actions().sendKeys("\uE004").perform();
-    await waitFor(async () => {
-      const inputValue = await driver.executeScript(`
+
+      const initialOverlayPosition = await readSeleniumOverlayPosition(driver);
+      const seleniumDragDelta = getOverlayDragDelta(initialOverlayPosition);
+      assert.ok(
+        seleniumDragDelta.deltaX !== 0 || seleniumDragDelta.deltaY !== 0,
+        "Overlay had no draggable room inside the viewport."
+      );
+      await dragSeleniumOverlay(driver, seleniumDragDelta.deltaX, seleniumDragDelta.deltaY);
+      const draggedOverlayPosition = await readSeleniumOverlayPosition(driver);
+      assert.ok(
+        draggedOverlayPosition.left !== initialOverlayPosition.left ||
+          draggedOverlayPosition.top !== initialOverlayPosition.top,
+        "Overlay position did not change after drag."
+      );
+
+      const pageKeyCountBeforeTyping = await driver.executeScript("return (window.lextraceHarnessKeys ?? []).length;");
+      await driver.executeScript(`
+        document
+          .querySelector('#lextrace-overlay-root')
+          ?.shadowRoot
+          ?.querySelector('[data-role="terminal-input"]')
+          ?.focus();
+      `);
+      await driver.actions().sendKeys("abc").perform();
+      await delay(300);
+      const pageKeyCountAfterTyping = await driver.executeScript("return (window.lextraceHarnessKeys ?? []).length;");
+      const terminalValue = await driver.executeScript(`
         return document
           .querySelector('#lextrace-overlay-root')
           ?.shadowRoot
           ?.querySelector('[data-role="terminal-input"]')
           ?.value ?? null;
       `);
-      return inputValue === 'worker.start';
-    }, 10000, "Terminal autocomplete did not apply the selected suggestion.");
-    await driver.executeScript(`
-      const input = document
-        .querySelector('#lextrace-overlay-root')
-        ?.shadowRoot
-        ?.querySelector('[data-role="terminal-input"]');
-      if (input instanceof HTMLInputElement) {
-        input.value = '';
+      assert.equal(pageKeyCountAfterTyping, pageKeyCountBeforeTyping, "Page received keyboard input while terminal was focused.");
+      assert.equal(terminalValue, "abc", "Terminal input did not retain typed text.");
+      await driver.executeScript(`
+        const input = document
+          .querySelector('#lextrace-overlay-root')
+          ?.shadowRoot
+          ?.querySelector('[data-role="terminal-input"]');
+        if (input instanceof HTMLInputElement) {
+          input.value = "";
+        }
+      `);
+
+      await delay(35000);
+      const idleDisconnectCount = await driver.executeScript(`
+        return document
+          .querySelector('#lextrace-overlay-root')
+          ?.shadowRoot
+          ?.textContent
+          ?.includes('Runtime stream disconnected. Retrying…') ?? false;
+      `);
+      assert.equal(idleDisconnectCount, false, "Overlay runtime stream disconnected during idle period.");
+
+      await runSeleniumTerminalCommand(driver, "worker.start");
+      await runSeleniumTerminalCommand(driver, "task.demo.start {\"taskId\":\"demo-task\"}");
+
+      await driver.switchTo().window(popupHandle);
+      try {
+        await waitFor(async () => {
+          const badgeText = await driver.executeScript("return document.querySelector('#status-badge')?.textContent?.trim() ?? null;");
+          return badgeText === "running";
+        }, 10000, "Worker did not enter running state.");
+      } catch (error) {
+        const popupDebug = await driver.executeScript(`
+          return {
+            badge: document.querySelector('#status-badge')?.textContent ?? null,
+            terminalState: document.querySelector('#terminal-state')?.textContent ?? null
+          };
+        `);
+        await driver.switchTo().window(appHandle);
+        const overlayDebug = await driver.executeScript(`
+          const root = document.querySelector('#lextrace-overlay-root')?.shadowRoot;
+          return {
+            activityText: root?.querySelector('[data-role="activity-feed"]')?.textContent ?? null,
+            statusRow: root?.querySelector('[data-role="status-row"]')?.textContent ?? null
+          };
+        `);
+
+        throw new Error(
+          `${error.message}\nPopup debug: ${JSON.stringify(popupDebug, null, 2)}\nOverlay debug: ${JSON.stringify(overlayDebug, null, 2)}`
+        );
       }
-    `);
 
-    const initialOverlayPosition = await readSeleniumOverlayPosition(driver);
-    const seleniumDragDelta = getOverlayDragDelta(initialOverlayPosition);
-    assert.ok(
-      seleniumDragDelta.deltaX !== 0 || seleniumDragDelta.deltaY !== 0,
-      "Overlay had no draggable room inside the viewport."
-    );
-    await dragSeleniumOverlay(driver, seleniumDragDelta.deltaX, seleniumDragDelta.deltaY);
-    const draggedOverlayPosition = await readSeleniumOverlayPosition(driver);
-    assert.ok(
-      draggedOverlayPosition.left !== initialOverlayPosition.left ||
-        draggedOverlayPosition.top !== initialOverlayPosition.top,
-      "Overlay position did not change after drag."
-    );
+      const initialBootId = await driver.executeScript("return document.querySelector('#worker-boot')?.textContent?.trim() ?? null;");
+      assert.ok(initialBootId && initialBootId !== "-", "bootId was not populated in popup.");
 
-    const pageKeyCountBeforeTyping = await driver.executeScript("return (window.lextraceHarnessKeys ?? []).length;");
+      await delay(125000);
+
+      const stableBootId = await driver.executeScript("return document.querySelector('#worker-boot')?.textContent?.trim() ?? null;");
+      assert.equal(stableBootId, initialBootId, "bootId changed during >120s Edge keepalive run.");
+
+      await driver.switchTo().window(appHandle);
+
+      const logMetrics = await driver.executeScript(`
+        const root = document.querySelector('#lextrace-overlay-root')?.shadowRoot;
+        const feed = root?.querySelector('[data-role="activity-feed"]');
+        const logEntries = [...(root?.querySelectorAll('.activity-log') ?? [])];
+        const terminalEntries = [...(root?.querySelectorAll('.activity-terminal') ?? [])];
+        const allActivityEntries = [...(root?.querySelectorAll('.activity-entry') ?? [])];
+        return {
+          tabStripPresent: !!root?.querySelector('.overlay-tab-strip'),
+          logCount: logEntries.length,
+          terminalCount: terminalEntries.length,
+          activityCount: allActivityEntries.length,
+          logPreviewCount: root?.querySelectorAll('.log-preview').length ?? 0,
+          noHorizontalScroll: feed ? feed.scrollWidth <= feed.clientWidth + 1 : false,
+          collapsedCount: allActivityEntries.filter((entry) => entry instanceof HTMLDetailsElement && entry.open === false).length
+        };
+      `);
+
+      assert.equal(logMetrics.tabStripPresent, true, "Overlay tab strip should be present.");
+      assert.ok(logMetrics.logCount >= 10, "Expected at least 10 detailed log entries.");
+      assert.ok(logMetrics.terminalCount >= 4, "Expected terminal activity entries in unified feed.");
+      assert.equal(logMetrics.logPreviewCount, 0, "Collapsed log summary must not duplicate expanded content.");
+      assert.equal(logMetrics.noHorizontalScroll, true, "Unified activity feed has horizontal scroll.");
+      assert.equal(logMetrics.collapsedCount, logMetrics.activityCount, "All terminal activity entries must be collapsed by default.");
+    }
+
     await driver.executeScript(`
       document
         .querySelector('#lextrace-overlay-root')
         ?.shadowRoot
-        ?.querySelector('[data-role="terminal-input"]')
-        ?.focus();
+        ?.querySelector('.overlay-tab-button[data-tab="chat"]')
+        ?.click();
     `);
-    await driver.actions().sendKeys("abc").perform();
-    await delay(300);
-    const pageKeyCountAfterTyping = await driver.executeScript("return (window.lextraceHarnessKeys ?? []).length;");
-    const terminalValue = await driver.executeScript(`
-      return document
-        .querySelector('#lextrace-overlay-root')
-        ?.shadowRoot
-        ?.querySelector('[data-role="terminal-input"]')
-        ?.value ?? null;
-    `);
-    assert.equal(pageKeyCountAfterTyping, pageKeyCountBeforeTyping, "Page received keyboard input while terminal was focused.");
-    assert.equal(terminalValue, "abc", "Terminal input did not retain typed text.");
+    await waitFor(async () => {
+      const statusText = await driver.executeScript(`
+        return document
+          .querySelector('#lextrace-overlay-root')
+          ?.shadowRoot
+          ?.querySelector('[data-role="chat-status-row"]')
+          ?.textContent ?? null;
+      `);
+      return typeof statusText === "string" && statusText.includes("provider: openai");
+    }, 15000, "Chat status row did not render OpenAI state.");
+
     await driver.executeScript(`
-      const input = document
-        .querySelector('#lextrace-overlay-root')
-        ?.shadowRoot
-        ?.querySelector('[data-role="terminal-input"]');
-      if (input instanceof HTMLInputElement) {
-        input.value = "";
-      }
-    `);
-
-    await delay(35000);
-    const idleDisconnectCount = await driver.executeScript(`
-      return document
-        .querySelector('#lextrace-overlay-root')
-        ?.shadowRoot
-        ?.textContent
-        ?.includes('Runtime stream disconnected. Retrying…') ?? false;
-    `);
-    assert.equal(idleDisconnectCount, false, "Overlay runtime stream disconnected during idle period.");
-
-    await runSeleniumTerminalCommand(driver, "worker.start");
-    await runSeleniumTerminalCommand(driver, "task.demo.start {\"taskId\":\"demo-task\"}");
-
-    await driver.switchTo().window(popupHandle);
-    try {
-      await waitFor(async () => {
-        const badgeText = await driver.executeScript("return document.querySelector('#status-badge')?.textContent?.trim() ?? null;");
-        return badgeText === "running";
-      }, 10000, "Worker did not enter running state.");
-    } catch (error) {
-      const popupDebug = await driver.executeScript(`
-        return {
-          badge: document.querySelector('#status-badge')?.textContent ?? null,
-          terminalState: document.querySelector('#terminal-state')?.textContent ?? null
-        };
-      `);
-      await driver.switchTo().window(appHandle);
-      const overlayDebug = await driver.executeScript(`
-        const root = document.querySelector('#lextrace-overlay-root')?.shadowRoot;
-        return {
-          activityText: root?.querySelector('[data-role="activity-feed"]')?.textContent ?? null,
-          statusRow: root?.querySelector('[data-role="status-row"]')?.textContent ?? null
-        };
-      `);
-
-      throw new Error(
-        `${error.message}\nPopup debug: ${JSON.stringify(popupDebug, null, 2)}\nOverlay debug: ${JSON.stringify(overlayDebug, null, 2)}`
-      );
-    }
-
-    const initialBootId = await driver.executeScript("return document.querySelector('#worker-boot')?.textContent?.trim() ?? null;");
-    assert.ok(initialBootId && initialBootId !== "-", "bootId was not populated in popup.");
-
-    await delay(125000);
-
-    const stableBootId = await driver.executeScript("return document.querySelector('#worker-boot')?.textContent?.trim() ?? null;");
-    assert.equal(stableBootId, initialBootId, "bootId changed during >120s Edge keepalive run.");
-
-    await driver.switchTo().window(appHandle);
-
-    const logMetrics = await driver.executeScript(`
       const root = document.querySelector('#lextrace-overlay-root')?.shadowRoot;
-      const feed = root?.querySelector('[data-role="activity-feed"]');
-      const logEntries = [...(root?.querySelectorAll('.activity-log') ?? [])];
-      const terminalEntries = [...(root?.querySelectorAll('.activity-terminal') ?? [])];
-      const allActivityEntries = [...(root?.querySelectorAll('.activity-entry') ?? [])];
-      return {
-        tabStripPresent: !!root?.querySelector('.tab-strip'),
-        logCount: logEntries.length,
-        terminalCount: terminalEntries.length,
-        activityCount: allActivityEntries.length,
-        logPreviewCount: root?.querySelectorAll('.log-preview').length ?? 0,
-        noHorizontalScroll: feed ? feed.scrollWidth <= feed.clientWidth + 1 : false,
-        collapsedCount: allActivityEntries.filter((entry) => entry instanceof HTMLDetailsElement && entry.open === false).length
-      };
+      const input = root?.querySelector('[data-role="chat-input"]');
+      if (!(input instanceof HTMLInputElement)) {
+        throw new Error('Chat input is unavailable.');
+      }
+      input.focus();
+      input.value = 'Reply with exact token EDGE_AI_OK and nothing else.';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
     `);
-
-    assert.equal(logMetrics.tabStripPresent, false, "Overlay tab strip should be removed.");
-    assert.ok(logMetrics.logCount >= 10, "Expected at least 10 detailed log entries.");
-    assert.ok(logMetrics.terminalCount >= 4, "Expected terminal activity entries in unified feed.");
-    assert.equal(logMetrics.logPreviewCount, 0, "Collapsed log summary must not duplicate expanded content.");
-    assert.equal(logMetrics.noHorizontalScroll, true, "Unified activity feed has horizontal scroll.");
-    assert.equal(logMetrics.collapsedCount, logMetrics.activityCount, "All terminal activity entries must be collapsed by default.");
-    await runSeleniumTerminalCommand(driver, "test.host.crash");
+    await waitFor(async () => {
+      const hidden = await driver.executeScript(`
+        const button = document
+          .querySelector('#lextrace-overlay-root')
+          ?.shadowRoot
+          ?.querySelector('[data-role="chat-send"]');
+        return button instanceof HTMLButtonElement ? button.hidden : null;
+      `);
+      return hidden === false;
+    }, 10000, "Chat send button did not become available.");
+    await driver.actions().sendKeys("\uE007").perform();
+    await waitFor(async () => {
+      const chatText = await driver.executeScript(`
+        return document
+          .querySelector('#lextrace-overlay-root')
+          ?.shadowRoot
+          ?.querySelector('[data-role="chat-feed"]')
+          ?.textContent ?? null;
+      `);
+      return typeof chatText === "string" && chatText.includes("EDGE_AI_OK");
+    }, 90000, "Live AI response did not appear in chat.");
 
     await driver.switchTo().window(popupHandle);
+    const sharedTabId = await createSeleniumExtensionTab(driver, `${pageUrl}?shared=1#copy`);
     await waitFor(async () => {
-      const badgeText = await driver.executeScript("return document.querySelector('#status-badge')?.textContent?.trim() ?? null;");
-      const taskText = await driver.executeScript("return document.querySelector('#worker-task')?.textContent?.trim() ?? null;");
-      return badgeText === "running" && taskText === "demo-task";
-    }, 15000, "Host did not recover after crash.");
-
+      const tabInfo = await readSeleniumTabInfo(driver, sharedTabId);
+      return typeof tabInfo?.url === "string" && tabInfo.url.includes("?shared=1");
+    }, 10000, "Shared same-page tab did not open.");
+    await driver.get(`${popupUrl}?targetTabId=${sharedTabId}&targetUrl=${encodeURIComponent(`${pageUrl}?shared=1#copy`)}`);
+    await driver.executeScript("document.querySelector('#open-terminal')?.click();");
     await driver.switchTo().window(appHandle);
-    await runSeleniumTerminalCommand(driver, "worker.stop");
-
-    await driver.switchTo().window(popupHandle);
-    await waitFor(async () => {
-      const badgeText = await driver.executeScript("return document.querySelector('#status-badge')?.textContent?.trim() ?? null;");
-      return badgeText === "offline";
-    }, 10000, "Worker did not stop cleanly.");
-
-    await driver.switchTo().window(appHandle);
-    await runSeleniumTerminalCommand(driver, "clear");
     await waitFor(async () => {
       const feedText = await driver.executeScript(`
         return document
           .querySelector('#lextrace-overlay-root')
           ?.shadowRoot
-          ?.querySelector('[data-role="activity-feed"]')
-          ?.textContent ?? '';
+          ?.querySelector('[data-role="chat-feed"]')
+          ?.textContent ?? null;
       `);
-      return feedText.trim().length === 0;
-    }, 10000, "Clear command did not fully empty the unified feed.");
+      return typeof feedText === "string" && feedText.includes("EDGE_AI_OK");
+    }, 30000, "Shared page did not reuse the same AI chat session.");
+    await driver.switchTo().window(popupHandle);
+    await removeSeleniumTab(driver, sharedTabId);
 
-    console.log("Edge e2e flow passed via EdgeDriver fallback.");
+    await driver.switchTo().window(popupHandle);
+    await sendSeleniumCodeChatRequest(
+      driver,
+      `${new URL(pageUrl).origin}/`,
+      pageUrl,
+      "Reply with exact token EDGE_CODE_OK and nothing else."
+    );
+    await waitFor(async () => {
+      const sessionText = await driver.executeAsyncScript(
+        `
+          const done = arguments[arguments.length - 1];
+          chrome.runtime.sendMessage({
+            id: crypto.randomUUID(),
+            version: 1,
+            scope: 'command',
+            action: 'ai.chat.status',
+            source: 'tests',
+            target: 'background',
+            ts: new Date().toISOString(),
+            payload: {
+              pageKey: arguments[0],
+              pageUrl: arguments[1]
+            },
+            correlationId: null
+          }, (response) => done(JSON.stringify(response?.result?.session ?? {})));
+        `,
+        `${new URL(pageUrl).origin}/`,
+        pageUrl
+      );
+      return typeof sessionText === "string" && sessionText.includes("EDGE_CODE_OK") && sessionText.includes("\"origin\":\"code\"");
+    }, 90000, "Code-origin AI request did not complete in the page session.");
+    await driver.switchTo().window(appHandle);
+    await driver.executeScript(`
+      document
+        .querySelector('#lextrace-overlay-root')
+        ?.shadowRoot
+        ?.querySelector('.overlay-tab-button[data-tab="chat"]')
+        ?.click();
+    `);
+    await waitFor(async () => {
+      const feedText = await driver.executeScript(`
+        return document
+          .querySelector('#lextrace-overlay-root')
+          ?.shadowRoot
+          ?.querySelector('[data-role="chat-feed"]')
+          ?.textContent ?? null;
+      `);
+      return typeof feedText === "string" && feedText.includes("CODE");
+    }, 30000, "Code-origin marker did not appear in shared page chat.");
+
+    if (!aiOnly) {
+      await runSeleniumTerminalCommand(driver, "test.host.crash");
+
+      await driver.switchTo().window(popupHandle);
+      await waitFor(async () => {
+        const badgeText = await driver.executeScript("return document.querySelector('#status-badge')?.textContent?.trim() ?? null;");
+        const taskText = await driver.executeScript("return document.querySelector('#worker-task')?.textContent?.trim() ?? null;");
+        return badgeText === "running" && taskText === "demo-task";
+      }, 15000, "Host did not recover after crash.");
+
+      await driver.switchTo().window(appHandle);
+      await runSeleniumTerminalCommand(driver, "worker.stop");
+
+      await driver.switchTo().window(popupHandle);
+      await waitFor(async () => {
+        const state = await driver.executeScript(`
+          return {
+            workerRunning: document.querySelector('#worker-running')?.textContent?.trim() ?? null,
+            workerTask: document.querySelector('#worker-task')?.textContent?.trim() ?? null
+          };
+        `);
+        return state?.workerRunning === "stopped" && state?.workerTask === "-";
+      }, 10000, "Worker did not stop cleanly.");
+
+      await driver.switchTo().window(appHandle);
+      await runSeleniumTerminalCommand(driver, "clear");
+      await waitFor(async () => {
+        const feedText = await driver.executeScript(`
+          return document
+            .querySelector('#lextrace-overlay-root')
+            ?.shadowRoot
+            ?.querySelector('[data-role="activity-feed"]')
+            ?.textContent ?? '';
+        `);
+        return feedText.trim().length === 0;
+      }, 10000, "Clear command did not fully empty the unified feed.");
+    }
+
+    console.log(aiOnly ? "Edge AI e2e flow passed via EdgeDriver fallback." : "Edge e2e flow passed via EdgeDriver fallback.");
   } finally {
     await driver.quit();
   }
@@ -728,6 +1014,112 @@ async function expectTextInLocator(locator, expectedText) {
       }
       return `#${element.id}`;
     }), expectedText.toLowerCase()]
+  );
+}
+
+async function setPlaywrightAllowedModel(page, modelId, tier) {
+  await page.locator("button[data-config-path='ai.allowedModels']").click();
+  await page.waitForFunction(([targetModelId, targetTier]) => {
+    const sections = [...document.querySelectorAll(".popup-modal-root .json-model-section")];
+    const section = sections.find(
+      (element) => element.querySelector(".json-model-section-title")?.textContent?.trim() === targetTier
+    );
+    return [...(section?.querySelectorAll(".json-model-option") ?? [])].some(
+      (element) => element.querySelector(".json-model-name")?.textContent?.trim() === targetModelId
+    );
+  }, [modelId, tier]);
+  await page.evaluate(([targetModelId, targetTier]) => {
+    const sections = [...document.querySelectorAll(".popup-modal-root .json-model-section")];
+    const section = sections.find(
+      (element) => element.querySelector(".json-model-section-title")?.textContent?.trim() === targetTier
+    );
+    const option = [...(section?.querySelectorAll(".json-model-option") ?? [])].find(
+      (element) => element.querySelector(".json-model-name")?.textContent?.trim() === targetModelId
+    );
+    const checkbox = option?.querySelector(".json-model-checkbox");
+    if (!(checkbox instanceof HTMLInputElement)) {
+      throw new Error(`Allowed model checkbox ${targetTier}/${targetModelId} is unavailable.`);
+    }
+
+    if (!checkbox.checked) {
+      checkbox.click();
+    }
+  }, [modelId, tier]);
+  await page.waitForFunction((targetModelId) => {
+    const button = document.querySelector("button[data-config-path='ai.allowedModels']");
+    return (button?.textContent ?? "").includes(targetModelId);
+  }, modelId);
+}
+
+async function setPlaywrightModelPanelValue(page, path, modelId, tier) {
+  await page.locator(`button[data-config-path='${path}']`).click();
+  await page.waitForFunction(([targetPath, targetModelId, targetTier]) => {
+    const panel = document.querySelector(".popup-modal-root .json-model-panel.is-single-select");
+    const sections = [...(panel?.querySelectorAll(".json-model-section") ?? [])];
+    const section = sections.find(
+      (element) => element.querySelector(".json-model-section-title")?.textContent?.trim() === targetTier
+    );
+    return [...(section?.querySelectorAll(".json-model-option.is-single-select") ?? [])].some(
+      (element) => element.querySelector(".json-model-name")?.textContent?.trim() === targetModelId
+    );
+  }, [path, modelId, tier]);
+  await page.evaluate(([targetPath, targetModelId, targetTier]) => {
+    const panel = document.querySelector(".popup-modal-root .json-model-panel.is-single-select");
+    if (!panel) {
+      throw new Error(`Model panel for ${targetPath} is unavailable.`);
+    }
+
+    const sections = [...panel.querySelectorAll(".json-model-section")];
+    const section = sections.find(
+      (element) => element.querySelector(".json-model-section-title")?.textContent?.trim() === targetTier
+    );
+    const option = [...(section?.querySelectorAll(".json-model-option.is-single-select") ?? [])].find(
+      (element) => element.querySelector(".json-model-name")?.textContent?.trim() === targetModelId
+    );
+    if (!(option instanceof HTMLButtonElement)) {
+      throw new Error(`Model option ${targetTier}/${targetModelId} is unavailable for ${targetPath}.`);
+    }
+
+    option.click();
+  }, [path, modelId, tier]);
+  await page.waitForFunction(([targetPath, targetModelId, targetTier]) => {
+    const button = document.querySelector(`button[data-config-path='${targetPath}']`);
+    const text = button?.textContent?.trim() ?? "";
+    return text.includes(targetModelId) && text.includes(targetTier);
+  }, [path, modelId, tier]);
+}
+
+async function setPlaywrightModalTextValue(page, path, value) {
+  await page.locator(`button[data-config-path='${path}']`).click();
+  await page.locator(".popup-modal-textarea").fill(value);
+  await page.locator(".popup-modal-button.is-primary").click();
+}
+
+async function sendPlaywrightCodeChatRequest(page, pageKey, pageUrl, text) {
+  await page.evaluate(
+    async ([targetPageKey, targetPageUrl, requestText]) => {
+      const response = await chrome.runtime.sendMessage({
+        id: crypto.randomUUID(),
+        version: 1,
+        scope: "command",
+        action: "ai.chat.send",
+        source: "tests",
+        target: "background",
+        ts: new Date().toISOString(),
+        payload: {
+          pageKey: targetPageKey,
+          pageUrl: targetPageUrl,
+          origin: "code",
+          text: requestText
+        },
+        correlationId: null
+      });
+
+      if (!response?.ok) {
+        throw new Error(response?.error?.message ?? "ai.chat.send failed");
+      }
+    },
+    [pageKey, pageUrl, text]
   );
 }
 
@@ -888,6 +1280,154 @@ async function setSeleniumJsonInputValue(driver, path, value, mode) {
     mode
   );
   await delay(500);
+}
+
+async function setSeleniumAllowedModel(driver, modelId, tier) {
+  await waitFor(async () => {
+    return driver.executeScript(
+      `
+        const button = document.querySelector("button[data-config-path='ai.allowedModels']");
+        const panel = document.querySelector('.popup-modal-root .json-model-panel');
+        if (!(panel instanceof HTMLElement)) {
+          button?.click();
+        }
+        const sections = [...document.querySelectorAll('.popup-modal-root .json-model-section')];
+        const section = sections.find((element) => element.querySelector('.json-model-section-title')?.textContent?.trim() === arguments[1]);
+        return [...(section?.querySelectorAll('.json-model-option') ?? [])].some(
+          (element) => element.querySelector('.json-model-name')?.textContent?.trim() === arguments[0]
+        );
+      `,
+      modelId,
+      tier
+    );
+  }, 20000, `Allowed model checkbox ${tier}/${modelId} did not load.`);
+  await driver.executeScript(
+    `
+      const button = document.querySelector("button[data-config-path='ai.allowedModels']");
+      const panel = document.querySelector('.popup-modal-root .json-model-panel');
+      if (!(panel instanceof HTMLElement)) {
+        button?.click();
+      }
+      const sections = [...document.querySelectorAll('.popup-modal-root .json-model-section')];
+      const section = sections.find((element) => element.querySelector('.json-model-section-title')?.textContent?.trim() === arguments[1]);
+      const option = [...(section?.querySelectorAll('.json-model-option') ?? [])].find(
+        (element) => element.querySelector('.json-model-name')?.textContent?.trim() === arguments[0]
+      );
+      const checkbox = option?.querySelector('.json-model-checkbox');
+      if (!(checkbox instanceof HTMLInputElement)) {
+        throw new Error('Allowed model checkbox is unavailable for ' + arguments[1] + '/' + arguments[0]);
+      }
+      if (!checkbox.checked) {
+        checkbox.click();
+      }
+    `,
+    modelId,
+    tier
+  );
+  await delay(500);
+}
+
+async function setSeleniumModelPanelValue(driver, path, modelId, tier) {
+  await waitFor(async () => {
+    return driver.executeScript(
+      `
+        const button = document.querySelector("button[data-config-path='" + arguments[0] + "']");
+        let panel = document.querySelector('.popup-modal-root .json-model-panel.is-single-select');
+        if (!(panel instanceof HTMLElement)) {
+          button?.click();
+          panel = document.querySelector('.popup-modal-root .json-model-panel.is-single-select');
+        }
+        const sections = [...(panel?.querySelectorAll('.json-model-section') ?? [])];
+        const section = sections.find((element) => element.querySelector('.json-model-section-title')?.textContent?.trim() === arguments[2]);
+        return [...(section?.querySelectorAll('.json-model-option.is-single-select') ?? [])].some(
+          (element) => element.querySelector('.json-model-name')?.textContent?.trim() === arguments[1]
+        );
+      `,
+      path,
+      modelId,
+      tier
+    );
+  }, 20000, `Model option ${tier}/${modelId} did not load for ${path}.`);
+  await driver.executeScript(
+    `
+      const button = document.querySelector("button[data-config-path='" + arguments[0] + "']");
+      let panel = document.querySelector('.popup-modal-root .json-model-panel.is-single-select');
+      if (!(panel instanceof HTMLElement)) {
+        button?.click();
+        panel = document.querySelector('.popup-modal-root .json-model-panel.is-single-select');
+      }
+      if (!(panel instanceof HTMLElement)) {
+        throw new Error('Model panel is unavailable for ' + arguments[0]);
+      }
+      const sections = [...panel.querySelectorAll('.json-model-section')];
+      const section = sections.find((element) => element.querySelector('.json-model-section-title')?.textContent?.trim() === arguments[2]);
+      const option = [...(section?.querySelectorAll('.json-model-option.is-single-select') ?? [])].find(
+        (element) => element.querySelector('.json-model-name')?.textContent?.trim() === arguments[1]
+      );
+      if (!(option instanceof HTMLButtonElement)) {
+        throw new Error('Model option is unavailable for ' + arguments[2] + '/' + arguments[1]);
+      }
+      option.click();
+    `,
+    path,
+    modelId,
+    tier
+  );
+  await delay(500);
+}
+
+async function setSeleniumModalTextValue(driver, path, value) {
+  await driver.executeScript(
+    `
+      const button = document.querySelector("button[data-config-path='" + arguments[0] + "']");
+      button?.click();
+      const textarea = document.querySelector('.popup-modal-textarea');
+      if (!(textarea instanceof HTMLTextAreaElement)) {
+        throw new Error('Modal textarea is unavailable for ' + arguments[0]);
+      }
+      textarea.value = arguments[1];
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+      const saveButton = document.querySelector('.popup-modal-button.is-primary');
+      if (!(saveButton instanceof HTMLButtonElement)) {
+        throw new Error('Modal save button is unavailable.');
+      }
+      saveButton.click();
+    `,
+    path,
+    value
+  );
+  await delay(500);
+}
+
+async function sendSeleniumCodeChatRequest(driver, pageKey, pageUrl, text) {
+  const response = await driver.executeAsyncScript(
+    `
+      const done = arguments[arguments.length - 1];
+      chrome.runtime.sendMessage({
+        id: crypto.randomUUID(),
+        version: 1,
+        scope: 'command',
+        action: 'ai.chat.send',
+        source: 'tests',
+        target: 'background',
+        ts: new Date().toISOString(),
+        payload: {
+          pageKey: arguments[0],
+          pageUrl: arguments[1],
+          origin: 'code',
+          text: arguments[2]
+        },
+        correlationId: null
+      }, done);
+    `,
+    pageKey,
+    pageUrl,
+    text
+  );
+
+  if (!response?.ok) {
+    throw new Error(response?.error?.message ?? "ai.chat.send failed");
+  }
 }
 
 function createEdgeOptions(userDataDir) {

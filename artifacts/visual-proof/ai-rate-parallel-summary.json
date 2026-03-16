@@ -1,0 +1,254 @@
+{
+  "pageUrl": "http://127.0.0.1:63938/parallel-proof",
+  "model": "gpt-5-nano [standard]",
+  "queuedRequests": 4,
+  "acceptedRequestIds": [
+    null,
+    null,
+    null,
+    null
+  ],
+  "before": {
+    "format": "text",
+    "key": "обнаружен",
+    "model": "gpt-5-nano [standard]",
+    "page": "http://127.0.0.1:63938/pa...",
+    "provider": "openai",
+    "queue": "0",
+    "reset": "12ms",
+    "rpm": "4999/5000",
+    "state": "idle",
+    "stream": "вкл",
+    "tpm": "4000000/4000000"
+  },
+  "beforeStatus": {
+    "activeRequestId": null,
+    "apiKeyPresent": true,
+    "availableActions": {
+      "canReset": true,
+      "canResume": false,
+      "canSend": true
+    },
+    "currentModelBudget": {
+      "lastResolvedServiceTier": null,
+      "model": "gpt-5-nano",
+      "observedAt": "2026-03-15T23:13:19.5638534+00:00",
+      "serverLimitRequests": 5000,
+      "serverLimitTokens": 4000000,
+      "serverRemainingRequests": 4999,
+      "serverRemainingTokens": 4000000,
+      "serverResetRequests": "12ms",
+      "serverResetTokens": "0s"
+    },
+    "historyScope": "page",
+    "lastError": null,
+    "lastSequenceNumber": null,
+    "model": {
+      "model": "gpt-5-nano",
+      "tier": "standard"
+    },
+    "modelBudgets": {
+      "gpt-5-nano": {
+        "lastResolvedServiceTier": null,
+        "model": "gpt-5-nano",
+        "observedAt": "2026-03-15T23:13:19.5638534+00:00",
+        "serverLimitRequests": 5000,
+        "serverLimitTokens": 4000000,
+        "serverRemainingRequests": 4999,
+        "serverRemainingTokens": 4000000,
+        "serverResetRequests": "12ms",
+        "serverResetTokens": "0s"
+      }
+    },
+    "openaiResponseId": null,
+    "pageKey": "http://127.0.0.1:63938/parallel-proof",
+    "pageUrlSample": "http://127.0.0.1:63938/parallel-proof",
+    "provider": "openai",
+    "queueCount": 0,
+    "rateLimits": {
+      "serverLimitRequests": 5000,
+      "serverLimitTokens": 4000000,
+      "serverRemainingRequests": 4999,
+      "serverRemainingTokens": 4000000,
+      "serverResetRequests": "12ms",
+      "serverResetTokens": "0s"
+    },
+    "recoverable": false,
+    "requestState": "idle",
+    "resolvedServiceTier": null,
+    "streamingEnabled": true,
+    "structuredOutputEnabled": false,
+    "structuredOutputName": "chat_response",
+    "structuredOutputStrict": true
+  },
+  "during": {
+    "format": "text",
+    "key": "обнаружен",
+    "model": "gpt-5-nano [standard]",
+    "page": "http://127.0.0.1:63938/pa...",
+    "provider": "openai",
+    "queue": "4",
+    "reset": "12ms",
+    "rpm": "4999/5000",
+    "state": "running",
+    "stream": "вкл",
+    "tpm": "4000000/4000000"
+  },
+  "duringStatus": {
+    "activeRequestId": "f80f8639-b524-4830-bc97-22f2226dba80",
+    "apiKeyPresent": true,
+    "availableActions": {
+      "canReset": true,
+      "canResume": true,
+      "canSend": true
+    },
+    "currentModelBudget": {
+      "lastResolvedServiceTier": "default",
+      "model": "gpt-5-nano",
+      "observedAt": "2026-03-15T23:13:21.5207409+00:00",
+      "serverLimitRequests": 5000,
+      "serverLimitTokens": 4000000,
+      "serverRemainingRequests": 4999,
+      "serverRemainingTokens": 4000000,
+      "serverResetRequests": "12ms",
+      "serverResetTokens": "0s"
+    },
+    "historyScope": "page",
+    "lastError": null,
+    "lastSequenceNumber": 1,
+    "model": {
+      "model": "gpt-5-nano",
+      "tier": "standard"
+    },
+    "modelBudgets": {
+      "gpt-5-nano": {
+        "lastResolvedServiceTier": "default",
+        "model": "gpt-5-nano",
+        "observedAt": "2026-03-15T23:13:21.5207409+00:00",
+        "serverLimitRequests": 5000,
+        "serverLimitTokens": 4000000,
+        "serverRemainingRequests": 4999,
+        "serverRemainingTokens": 4000000,
+        "serverResetRequests": "12ms",
+        "serverResetTokens": "0s"
+      }
+    },
+    "openaiResponseId": "resp_0ac7bb99a68a2b020069b73d0ffd2c819696b99794ab5f5376",
+    "pageKey": "http://127.0.0.1:63938/parallel-proof",
+    "pageUrlSample": "http://127.0.0.1:63938/parallel-proof",
+    "provider": "openai",
+    "queueCount": 4,
+    "rateLimits": {
+      "serverLimitRequests": 5000,
+      "serverLimitTokens": 4000000,
+      "serverRemainingRequests": 4999,
+      "serverRemainingTokens": 4000000,
+      "serverResetRequests": "12ms",
+      "serverResetTokens": "0s"
+    },
+    "recoverable": true,
+    "requestState": "queued",
+    "resolvedServiceTier": "default",
+    "streamingEnabled": true,
+    "structuredOutputEnabled": false,
+    "structuredOutputName": "chat_response",
+    "structuredOutputStrict": true
+  },
+  "after": {
+    "format": "text",
+    "key": "обнаружен",
+    "model": "gpt-5-nano [standard]",
+    "page": "http://127.0.0.1:63938/pa...",
+    "provider": "openai",
+    "queue": "0",
+    "reset": "12ms",
+    "rpm": "4999/5000",
+    "served": "default",
+    "state": "idle",
+    "stream": "вкл",
+    "tpm": "4000000/4000000"
+  },
+  "afterStatus": {
+    "activeRequestId": null,
+    "apiKeyPresent": true,
+    "availableActions": {
+      "canReset": true,
+      "canResume": false,
+      "canSend": true
+    },
+    "currentModelBudget": {
+      "lastResolvedServiceTier": "default",
+      "model": "gpt-5-nano",
+      "observedAt": "2026-03-15T23:13:48.0768912+00:00",
+      "serverLimitRequests": 5000,
+      "serverLimitTokens": 4000000,
+      "serverRemainingRequests": 4999,
+      "serverRemainingTokens": 4000000,
+      "serverResetRequests": "12ms",
+      "serverResetTokens": "0s"
+    },
+    "historyScope": "page",
+    "lastError": null,
+    "lastSequenceNumber": null,
+    "model": {
+      "model": "gpt-5-nano",
+      "tier": "standard"
+    },
+    "modelBudgets": {
+      "gpt-5-nano": {
+        "lastResolvedServiceTier": "default",
+        "model": "gpt-5-nano",
+        "observedAt": "2026-03-15T23:13:48.0768912+00:00",
+        "serverLimitRequests": 5000,
+        "serverLimitTokens": 4000000,
+        "serverRemainingRequests": 4999,
+        "serverRemainingTokens": 4000000,
+        "serverResetRequests": "12ms",
+        "serverResetTokens": "0s"
+      }
+    },
+    "openaiResponseId": null,
+    "pageKey": "http://127.0.0.1:63938/parallel-proof",
+    "pageUrlSample": "http://127.0.0.1:63938/parallel-proof",
+    "provider": "openai",
+    "queueCount": 0,
+    "rateLimits": {
+      "serverLimitRequests": 5000,
+      "serverLimitTokens": 4000000,
+      "serverRemainingRequests": 4999,
+      "serverRemainingTokens": 4000000,
+      "serverResetRequests": "12ms",
+      "serverResetTokens": "0s"
+    },
+    "recoverable": false,
+    "requestState": "idle",
+    "resolvedServiceTier": "default",
+    "streamingEnabled": true,
+    "structuredOutputEnabled": false,
+    "structuredOutputName": "chat_response",
+    "structuredOutputStrict": true
+  },
+  "assistantReplies": [
+    {
+      "id": "327728f9-131a-43ba-b196-5978be161215",
+      "text": "PARALLEL_B1"
+    },
+    {
+      "id": "73c92761-683a-471f-ae38-7ee94a87e6bc",
+      "text": "PARALLEL_B2"
+    },
+    {
+      "id": "caf7f23b-4de4-47d3-8d96-404c86d491d4",
+      "text": "PARALLEL_B3"
+    },
+    {
+      "id": "c16e25dc-51c7-4925-b45e-69e0fcfc9d68",
+      "text": "PARALLEL_B4"
+    }
+  ],
+  "screenshots": [
+    "C:\\__MY_PROJECTS__\\git\\lextrace-nt3\\artifacts\\visual-proof\\ai-rate-parallel-before.png",
+    "C:\\__MY_PROJECTS__\\git\\lextrace-nt3\\artifacts\\visual-proof\\ai-rate-parallel-during.png",
+    "C:\\__MY_PROJECTS__\\git\\lextrace-nt3\\artifacts\\visual-proof\\ai-rate-parallel-after.png"
+  ]
+}

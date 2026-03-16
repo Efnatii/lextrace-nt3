@@ -1,0 +1,35 @@
+{
+  "pageUrl": "http://127.0.0.1:54343/visual-proof",
+  "model": "gpt-5-nano [standard]",
+  "before": {
+    "provider": "openai",
+    "key": "обнаружен",
+    "model": "gpt-5-nano [standard]",
+    "rpm": "4999/5000",
+    "tpm": "4000000/4000000",
+    "reset": "12ms",
+    "format": "text",
+    "stream": "вкл",
+    "state": "idle",
+    "page": "http://127.0.0.1:54343/vi...",
+    "queue": "0"
+  },
+  "after": {
+    "provider": "openai",
+    "key": "обнаружен",
+    "model": "gpt-5-nano [standard]",
+    "rpm": "4999/5000",
+    "tpm": "4000000/4000000",
+    "reset": "12ms",
+    "served": "default",
+    "format": "text",
+    "stream": "вкл",
+    "state": "idle",
+    "page": "http://127.0.0.1:54343/vi...",
+    "queue": "0"
+  },
+  "screenshots": [
+    "C:\\__MY_PROJECTS__\\git\\lextrace-nt3\\artifacts\\visual-proof\\ai-rate-before.png",
+    "C:\\__MY_PROJECTS__\\git\\lextrace-nt3\\artifacts\\visual-proof\\ai-rate-after.png"
+  ]
+}

@@ -318,6 +318,11 @@ body {
   color: #1f2937;
 }
 
+.json-key.is-resettable {
+  cursor: pointer;
+  user-select: none;
+}
+
 .json-punctuation {
   color: #6b7280;
 }
@@ -344,6 +349,11 @@ body {
   text-overflow: ellipsis;
 }
 
+.json-value.is-empty {
+  min-width: 24px;
+  min-height: 16px;
+}
+
 .json-value.is-string,
 .json-value.is-enum,
 .json-editor.is-string,
@@ -354,6 +364,14 @@ body {
 .json-value.is-number,
 .json-editor.is-number {
   color: #7c2d12;
+}
+
+.json-value.is-string-array {
+  color: #0f3f83;
+}
+
+.json-value.is-model-rule-array {
+  color: #0f3f83;
 }
 
 .json-value.is-boolean,
@@ -381,4 +399,311 @@ body {
 
 .json-ellipsis {
   color: var(--text-soft);
+}
+
+.json-model-panel-line {
+  padding-top: 4px;
+  padding-bottom: 6px;
+}
+
+.json-model-panel {
+  width: 100%;
+  border: 1px solid var(--line);
+  background: #f6f6f6;
+}
+
+.json-model-panel.is-modal {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  border: 0;
+  overflow: hidden;
+}
+
+.json-model-toolbar {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  min-height: 28px;
+  border-bottom: 1px solid var(--line);
+  background: #ededed;
+}
+
+.json-model-count {
+  min-width: 0;
+  padding: 0 8px;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.json-model-sort {
+  height: 28px;
+  border: 0;
+  border-left: 1px solid var(--line);
+  background: #ffffff;
+  color: var(--text-main);
+  font: inherit;
+  font-family: "Bahnschrift", "Segoe UI Variable Text", "Segoe UI", sans-serif;
+  font-size: 11px;
+  padding: 0 8px;
+}
+
+.json-model-list {
+  max-height: 180px;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.json-model-panel.is-modal .json-model-list {
+  height: 100%;
+  max-height: none;
+  min-height: 0;
+}
+
+.json-model-section {
+  display: grid;
+  gap: 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.json-model-section:last-child {
+  border-bottom: 0;
+}
+
+.json-model-section-title {
+  min-height: 24px;
+  padding: 4px 8px;
+  border-bottom: 1px solid #dadada;
+  background: #efefef;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-soft);
+}
+
+.json-model-section-list {
+  display: grid;
+}
+
+.json-model-option {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 24px;
+  padding: 4px 8px;
+  border-bottom: 1px solid #dadada;
+  cursor: pointer;
+}
+
+.json-model-option:last-child {
+  border-bottom: 0;
+}
+
+.json-model-option:hover {
+  background: #efefef;
+}
+
+.json-model-checkbox {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  border: 1px solid var(--line);
+  background: #ffffff;
+  border-radius: 0;
+  box-shadow: none;
+  cursor: pointer;
+}
+
+.json-model-checkbox:hover {
+  background: #f0f0f0;
+}
+
+.json-model-checkbox:checked {
+  background: #111111;
+  box-shadow: inset 0 0 0 2px #ffffff;
+}
+
+.json-model-checkbox:focus-visible {
+  outline: 1px solid #111111;
+  outline-offset: 1px;
+}
+
+.json-model-option.is-single-select {
+  width: 100%;
+  border: 0;
+  grid-template-columns: 1fr auto;
+  background: transparent;
+  text-align: left;
+  font: inherit;
+  font-family: inherit;
+}
+
+.json-model-option.is-single-select.is-selected {
+  background: #1a1a1a;
+}
+
+.json-model-option.is-single-select.is-selected .json-model-name,
+.json-model-option.is-single-select.is-selected .json-model-summary {
+  color: #ffffff;
+}
+
+.json-model-name,
+.json-model-summary {
+  min-width: 0;
+  font: inherit;
+  font-family: "Cascadia Code", "Consolas", monospace;
+  font-size: 11px;
+}
+
+.json-model-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-main);
+}
+
+.json-model-summary {
+  color: var(--text-soft);
+  white-space: nowrap;
+}
+
+.json-model-empty {
+  padding: 8px;
+  font-size: 11px;
+  color: var(--text-soft);
+}
+
+.json-model-empty.is-error {
+  color: var(--accent-error);
+}
+
+.popup-tooltip {
+  position: fixed;
+  z-index: 1200;
+  max-width: min(240px, calc(100vw - 16px));
+  max-height: min(180px, calc(100vh - 16px));
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  background: #ffffff;
+  color: var(--text-main);
+  font-family: "Cascadia Code", "Consolas", monospace;
+  font-size: 10px;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow: hidden;
+  pointer-events: none;
+  box-shadow: 0 0 0 1px rgba(17, 17, 17, 0.08);
+}
+
+.popup-modal-root {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+}
+
+.popup-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.16);
+  display: grid;
+  place-items: center;
+  padding: 10px;
+}
+
+.popup-modal-shell {
+  display: grid;
+  grid-template-rows: 1fr;
+  width: min(100%, 520px);
+  min-height: 260px;
+  max-height: calc(100vh - 20px);
+  border: 1px solid var(--line);
+  background: var(--panel-bg);
+  overflow: hidden;
+}
+
+.popup-modal-shell.is-picker {
+  width: min(100%, 760px);
+  min-height: 340px;
+  height: min(360px, calc(100vh - 20px));
+}
+
+.popup-modal-frame {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.popup-modal-body {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: 1fr;
+  overflow: hidden;
+  background: #f6f6f6;
+}
+
+.popup-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 36px;
+  border-bottom: 1px solid var(--line);
+  padding: 0 10px;
+  background: #ededed;
+}
+
+.popup-modal-title {
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-soft);
+}
+
+.popup-modal-actions {
+  display: flex;
+  align-items: center;
+  gap: 0;
+}
+
+.popup-modal-button {
+  min-height: 28px;
+  border: 0;
+  border-left: 1px solid var(--line);
+  background: transparent;
+  color: var(--text-main);
+  font: inherit;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 0 10px;
+  cursor: pointer;
+}
+
+.popup-modal-button.is-primary {
+  background: #1a1a1a;
+  color: #ffffff;
+}
+
+.popup-modal-textarea {
+  width: 100%;
+  min-height: 0;
+  border: 0;
+  resize: none;
+  outline: none;
+  padding: 10px;
+  background: #ffffff;
+  color: var(--text-main);
+  font-family: "Cascadia Code", "Consolas", monospace;
+  font-size: 12px;
+  line-height: 1.5;
 }

@@ -7,7 +7,8 @@ export const STORAGE_KEYS = {
   localConfig: "lextrace.config.local",
   sessionConfig: "lextrace.config.session",
   runtimeState: "lextrace.runtime.state",
-  logs: "lextrace.runtime.logs"
+  logs: "lextrace.runtime.logs",
+  aiSessions: "lextrace.ai.sessions"
 } as const;
 
 export const MAX_LOG_DETAILS_PREVIEW = 240;
@@ -25,6 +26,12 @@ export const COMMANDS = {
   logList: "log.list",
   logSubscribe: "log.subscribe",
   logRecord: "log.record",
+  aiModelsCatalog: "ai.models.catalog",
+  aiChatStatus: "ai.chat.status",
+  aiChatSend: "ai.chat.send",
+  aiChatResume: "ai.chat.resume",
+  aiChatReset: "ai.chat.reset",
+  aiChatList: "ai.chat.list",
   taskDemoStart: "task.demo.start",
   taskDemoStop: "task.demo.stop",
   testHostCrash: "test.host.crash"
@@ -35,4 +42,15 @@ export const STREAM_EVENTS = {
   log: "runtime.log",
   status: "runtime.status",
   config: "runtime.config"
+} as const;
+
+export const AI_STREAM_EVENTS = {
+  snapshot: "ai.chat.snapshot",
+  status: "ai.chat.status",
+  delta: "ai.chat.delta",
+  completed: "ai.chat.completed",
+  error: "ai.chat.error",
+  compactionStarted: "ai.chat.compaction.started",
+  compactionCompleted: "ai.chat.compaction.completed",
+  rateLimitWaiting: "ai.chat.rate_limit.waiting"
 } as const;

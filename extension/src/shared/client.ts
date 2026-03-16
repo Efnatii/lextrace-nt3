@@ -1,7 +1,7 @@
 import { COMMANDS, RUNTIME_STREAM_PORT } from "./constants";
-import { ProtocolResponseSchema, createEnvelope, type MessageSource, type MessageTarget, type RuntimeStreamMessage } from "./protocol";
+import { ProtocolResponseSchema, createEnvelope, type ExtensionStreamMessage, type MessageSource, type MessageTarget } from "./protocol";
 
-type RuntimeStreamHandler = (message: RuntimeStreamMessage | Record<string, unknown>) => void;
+type RuntimeStreamHandler = (message: ExtensionStreamMessage | Record<string, unknown>) => void;
 
 export class ProtocolCommandError extends Error {
   readonly code: string;
@@ -60,7 +60,7 @@ export function connectRuntimeStream(handler: RuntimeStreamHandler): chrome.runt
   });
 
   port.onMessage.addListener((message) => {
-    handler(message as RuntimeStreamMessage | Record<string, unknown>);
+    handler(message as ExtensionStreamMessage | Record<string, unknown>);
   });
 
   return port;

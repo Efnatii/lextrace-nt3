@@ -1,3 +1,14 @@
+import {
+  AiChatListResultSchema,
+  AiModelCatalogResultSchema,
+  AiChatPageSessionSchema,
+  AiChatStatusResultSchema,
+  AiStreamMessageSchema,
+  createDefaultAiStatus,
+  type AiChatPageSession,
+  type AiModelCatalogResult,
+  type AiStreamMessage
+} from "../shared/ai";
 import { COMMANDS, RECONNECT_ALARM_NAME, RUNTIME_STREAM_PORT, STORAGE_KEYS, STREAM_EVENTS } from "../shared/constants";
 import { buildEffectiveConfig, defaultConfig, mergeConfigPatch, normalizeConfigPatch, type ExtensionConfig, type ExtensionConfigPatch } from "../shared/config";
 import { createLogEntry, isLogLevelEnabled, LogEntryInputSchema, LogEntrySchema, serializeError, type LogEntry } from "../shared/logging";
@@ -13,8 +24,8 @@ import {
   createEnvelope,
   createErrorResponse,
   createOkResponse,
+  ExtensionStreamMessageSchema,
   ProtocolResponseSchema,
-  RuntimeStreamMessageSchema,
   type ProtocolResponse,
   type RuntimeStreamMessage,
   validateEnvelope,
@@ -44,6 +55,16 @@ type OverlayTargetPayload = {
   expectedUrl?: string;
 };
 
+type UiPortState = {
+  port: chrome.runtime.Port;
+  viewId: string;
+  pageKey: string | null;
+  pageUrl: string | null;
+};
+
+const NATIVE_CONFIG_SYNC_ACTION = "config.sync";
+const AI_MODEL_CATALOG_CACHE_TTL_MS = 5 * 60 * 1000;
+
 const bootId = crypto.randomUUID();
 let bootstrapPromise: Promise<void> | null = null;
 let localConfigPatch: ExtensionConfigPatch = {};
@@ -52,7 +73,9 @@ let configCache: ExtensionConfig = defaultConfig;
 let logs: LogEntry[] = [];
 let workerStatus: WorkerStatus = createInitialWorkerStatus(bootId);
 let desiredRuntime: DesiredRuntimeState = createInitialDesiredRuntime();
-const uiPorts = new Map<string, chrome.runtime.Port>();
+const uiPorts = new Map<string, UiPortState>();
+const aiSessions = new Map<string, AiChatPageSession>();
+let aiModelCatalogCache: { expiresAt: number; result: AiModelCatalogResult } | null = null;
 
 class NativeHostBridge {
   private port: chrome.runtime.Port | null = null;
@@ -144,9 +167,13 @@ class NativeHostBridge {
       return;
     }
 
-    const streamResult = RuntimeStreamMessageSchema.safeParse(message);
+    const streamResult = ExtensionStreamMessageSchema.safeParse(message);
     if (streamResult.success) {
-      await handleRuntimeStream(streamResult.data);
+      if (streamResult.data.stream === "runtime") {
+        await handleRuntimeStream(streamResult.data);
+      } else {
+        await handleAiStream(streamResult.data);
+      }
       return;
     }
 
@@ -164,6 +191,7 @@ class NativeHostBridge {
     const wasManual = this.manualDisconnect;
     this.port = null;
     this.manualDisconnect = false;
+    aiModelCatalogCache = null;
     this.clearPending(lastErrorMessage ?? "Native host disconnected.");
 
     workerStatus = {
@@ -189,7 +217,7 @@ class NativeHostBridge {
       }
     });
 
-    if (!wasManual && desiredRuntime.desiredRunning) {
+    if (!wasManual && shouldKeepNativeConnection()) {
       await scheduleReconnect("native-host-disconnect");
     }
   }
@@ -257,19 +285,36 @@ chrome.runtime.onConnect.addListener((port) => {
   }
 
   const portId = port.sender?.documentId ?? crypto.randomUUID();
-  uiPorts.set(portId, port);
+  uiPorts.set(portId, {
+    port,
+    viewId: portId,
+    pageKey: null,
+    pageUrl: null
+  });
 
   port.onDisconnect.addListener(() => {
-    uiPorts.delete(portId);
+    void detachViewFromPort(portId);
   });
 
   port.onMessage.addListener((message) => {
-    if (message && typeof message === "object" && (message as { type?: string }).type === "snapshot.request") {
-      void sendSnapshot(port);
-    }
+    void (async () => {
+      await bootstrap("onConnect.message");
+
+      if (message && typeof message === "object" && (message as { type?: string }).type === "snapshot.request") {
+        await sendSnapshot(port);
+        return;
+      }
+
+      if (message && typeof message === "object" && (message as { type?: string }).type === "page.subscribe") {
+        await handlePortPageSubscribe(portId, message as { pageKey?: unknown; pageUrl?: unknown });
+      }
+    })();
   });
 
-  void sendSnapshot(port);
+  void (async () => {
+    await bootstrap("onConnect");
+    await sendSnapshot(port);
+  })();
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -285,7 +330,8 @@ async function bootstrap(reason: string): Promise<void> {
       const sessionValues = await chrome.storage.session.get([
         STORAGE_KEYS.sessionConfig,
         STORAGE_KEYS.runtimeState,
-        STORAGE_KEYS.logs
+        STORAGE_KEYS.logs,
+        STORAGE_KEYS.aiSessions
       ]);
 
       localConfigPatch = normalizeConfigPatch(localValues[STORAGE_KEYS.localConfig] ?? {});
@@ -298,6 +344,17 @@ async function bootstrap(reason: string): Promise<void> {
             .map((item: unknown) => createLogEntryFromPersisted(item))
             .filter((item): item is LogEntry => item !== null)
         : [];
+
+      const storedAiSessions = sessionValues[STORAGE_KEYS.aiSessions];
+      aiSessions.clear();
+      if (Array.isArray(storedAiSessions)) {
+        for (const item of storedAiSessions) {
+          const parsedSession = AiChatPageSessionSchema.safeParse(item);
+          if (parsedSession.success) {
+            aiSessions.set(parsedSession.data.pageKey, parsedSession.data);
+          }
+        }
+      }
 
       const persistedRuntimeRaw = sessionValues[STORAGE_KEYS.runtimeState];
       if (persistedRuntimeRaw) {
@@ -324,7 +381,7 @@ async function bootstrap(reason: string): Promise<void> {
         }
       });
 
-      if (desiredRuntime.desiredRunning) {
+      if (shouldKeepNativeConnection()) {
         await reconnectNative("bootstrap-resume");
       } else {
         await persistRuntimeState();
@@ -435,6 +492,30 @@ async function handleRuntimeMessage(
     case COMMANDS.logSubscribe:
       return createOkResponse(envelope.id, getRuntimeSnapshot());
 
+    case COMMANDS.aiModelsCatalog:
+      return handleAiModelsCatalogCommand(envelope.id);
+
+    case COMMANDS.aiChatStatus:
+      return handleAiStatusCommand(
+        envelope.id,
+        payload as { pageKey: string; pageUrl?: string }
+      );
+
+    case COMMANDS.aiChatSend:
+      return handleAiSendCommand(
+        envelope.id,
+        payload as { pageKey: string; pageUrl: string; origin: "user" | "code"; text: string; requestId?: string }
+      );
+
+    case COMMANDS.aiChatResume:
+      return handleAiResumeCommand(envelope.id, payload as { pageKey: string });
+
+    case COMMANDS.aiChatReset:
+      return handleAiResetCommand(envelope.id, payload as { pageKey: string });
+
+    case COMMANDS.aiChatList:
+      return handleAiListCommand(envelope.id);
+
     default:
       return createErrorResponse(
         envelope.id,
@@ -478,17 +559,19 @@ async function stopWorker(payload: { reason?: string }): Promise<void> {
       const result = await nativeBridge.sendRequest(COMMANDS.workerStop, payload);
       applyNativeStatus(result);
     } finally {
-      await nativeBridge.disconnect();
+      if (!shouldKeepNativeConnection()) {
+        await nativeBridge.disconnect();
+      }
     }
   }
 
   workerStatus = {
     ...workerStatus,
     running: false,
-    hostConnected: false,
+    hostConnected: nativeBridge.connected,
     taskId: null,
     sessionId: null,
-    nativeHostPid: null
+    nativeHostPid: nativeBridge.connected ? workerStatus.nativeHostPid : null
   };
   await persistRuntimeState();
   await broadcastStatus();
@@ -523,14 +606,17 @@ async function ensureNativeConnection(reason: string): Promise<void> {
     reconnectAttempt: 0
   };
 
+  await syncNativeConfig();
+
   const statusResult = await nativeBridge.sendRequest(COMMANDS.workerStatus, {});
   applyNativeStatus(statusResult);
+  await syncAiSessionsFromNative();
   await persistRuntimeState();
   await broadcastStatus();
 }
 
 async function reconnectNative(reason: string): Promise<void> {
-  if (!desiredRuntime.desiredRunning) {
+  if (!shouldKeepNativeConnection()) {
     return;
   }
 
@@ -687,6 +773,175 @@ async function handleRuntimeStream(message: RuntimeStreamMessage): Promise<void>
     broadcastStream(message);
   } else if (message.event === STREAM_EVENTS.status) {
     broadcastStream(message);
+  }
+}
+
+async function handleAiStream(message: AiStreamMessage): Promise<void> {
+  if (message.session) {
+    updateAiSessionCache(message.session);
+  } else if (message.status) {
+    const currentSession = aiSessions.get(message.pageKey);
+    if (currentSession) {
+      updateAiSessionCache({
+        ...currentSession,
+        status: message.status,
+        state: deriveSessionState(message.status.requestState, currentSession.attachedViewIds.length > 0),
+        activeRequestId: message.status.activeRequestId,
+        openaiResponseId: message.status.openaiResponseId,
+        lastSequenceNumber: message.status.lastSequenceNumber,
+        queuedCount: message.status.queueCount,
+        recoverable: message.status.recoverable,
+        lastError: message.status.lastError
+      });
+    }
+  }
+
+  await persistAiSessions();
+  broadcastAiStream(message);
+  await syncNativeConnectionLifecycle();
+}
+
+async function handleAiStatusCommand(
+  requestId: string,
+  payload: { pageKey: string; pageUrl?: string }
+): Promise<ProtocolResponse> {
+  try {
+    await ensureNativeConnection(COMMANDS.aiChatStatus);
+    const result = AiChatStatusResultSchema.parse(
+      await nativeBridge.sendRequest(COMMANDS.aiChatStatus, payload)
+    );
+    updateAiSessionCache(result.session);
+    await persistAiSessions();
+    return createOkResponse(requestId, result);
+  } catch (error) {
+    return createErrorResponse(
+      requestId,
+      "ai_status_failed",
+      error instanceof Error ? error.message : String(error),
+      serializeError(error)
+    );
+  }
+}
+
+async function handleAiModelsCatalogCommand(requestId: string): Promise<ProtocolResponse> {
+  try {
+    if (aiModelCatalogCache && Date.now() < aiModelCatalogCache.expiresAt) {
+      return createOkResponse(requestId, aiModelCatalogCache.result);
+    }
+
+    await ensureNativeConnection(COMMANDS.aiModelsCatalog);
+    const result = AiModelCatalogResultSchema.parse(
+      await nativeBridge.sendRequest(COMMANDS.aiModelsCatalog, {})
+    );
+
+    aiModelCatalogCache = {
+      expiresAt: Date.now() + AI_MODEL_CATALOG_CACHE_TTL_MS,
+      result
+    };
+
+    return createOkResponse(requestId, result);
+  } catch (error) {
+    return createErrorResponse(
+      requestId,
+      "ai_models_catalog_failed",
+      error instanceof Error ? error.message : String(error),
+      serializeError(error)
+    );
+  }
+}
+
+async function handleAiSendCommand(
+  requestId: string,
+  payload: { pageKey: string; pageUrl: string; origin: "user" | "code"; text: string; requestId?: string }
+): Promise<ProtocolResponse> {
+  try {
+    await ensureNativeConnection(COMMANDS.aiChatSend);
+    const result = AiChatStatusResultSchema.parse(
+      await nativeBridge.sendRequest(COMMANDS.aiChatSend, payload)
+    );
+    updateAiSessionCache(result.session);
+    await persistAiSessions();
+    broadcastAiSessionSnapshot(result.session, "AI request queued.");
+    return createOkResponse(requestId, result);
+  } catch (error) {
+    return createErrorResponse(
+      requestId,
+      "ai_send_failed",
+      error instanceof Error ? error.message : String(error),
+      serializeError(error)
+    );
+  }
+}
+
+async function handleAiResumeCommand(
+  requestId: string,
+  payload: { pageKey: string }
+): Promise<ProtocolResponse> {
+  try {
+    await ensureNativeConnection(COMMANDS.aiChatResume);
+    const result = AiChatStatusResultSchema.parse(
+      await nativeBridge.sendRequest(COMMANDS.aiChatResume, payload)
+    );
+    updateAiSessionCache(result.session);
+    await persistAiSessions();
+    broadcastAiSessionSnapshot(result.session, "AI page session resumed.");
+    return createOkResponse(requestId, result);
+  } catch (error) {
+    return createErrorResponse(
+      requestId,
+      "ai_resume_failed",
+      error instanceof Error ? error.message : String(error),
+      serializeError(error)
+    );
+  }
+}
+
+async function handleAiResetCommand(
+  requestId: string,
+  payload: { pageKey: string }
+): Promise<ProtocolResponse> {
+  try {
+    await ensureNativeConnection(COMMANDS.aiChatReset);
+    const result = AiChatStatusResultSchema.parse(
+      await nativeBridge.sendRequest(COMMANDS.aiChatReset, payload)
+    );
+    updateAiSessionCache(result.session);
+    await persistAiSessions();
+    broadcastAiSessionSnapshot(result.session, "AI page session reset.");
+    await syncNativeConnectionLifecycle();
+    return createOkResponse(requestId, result);
+  } catch (error) {
+    return createErrorResponse(
+      requestId,
+      "ai_reset_failed",
+      error instanceof Error ? error.message : String(error),
+      serializeError(error)
+    );
+  }
+}
+
+async function handleAiListCommand(requestId: string): Promise<ProtocolResponse> {
+  try {
+    await ensureNativeConnection(COMMANDS.aiChatList);
+    const result = AiChatListResultSchema.parse(
+      await nativeBridge.sendRequest(COMMANDS.aiChatList, {})
+    );
+
+    for (const session of result.sessions) {
+      updateAiSessionCache(session);
+    }
+    await persistAiSessions();
+
+    return createOkResponse(requestId, {
+      sessions: [...aiSessions.values()]
+    });
+  } catch (error) {
+    return createErrorResponse(
+      requestId,
+      "ai_list_failed",
+      error instanceof Error ? error.message : String(error),
+      serializeError(error)
+    );
   }
 }
 
@@ -1008,6 +1263,202 @@ function createOverlayErrorResponse(
   return createErrorResponse(requestId, code, message, details);
 }
 
+async function handlePortPageSubscribe(
+  portId: string,
+  message: { pageKey?: unknown; pageUrl?: unknown }
+): Promise<void> {
+  const portState = uiPorts.get(portId);
+  if (!portState) {
+    return;
+  }
+
+  const nextPageKey = typeof message.pageKey === "string" && message.pageKey.length > 0 ? message.pageKey : null;
+  const nextPageUrl = typeof message.pageUrl === "string" && message.pageUrl.length > 0 ? message.pageUrl : null;
+
+  if (portState.pageKey && portState.pageKey !== nextPageKey) {
+    const previousSession = aiSessions.get(portState.pageKey);
+    if (previousSession) {
+      updateAiSessionCache({
+        ...previousSession,
+        attachedViewIds: previousSession.attachedViewIds.filter((viewId) => viewId !== portState.viewId)
+      });
+    }
+  }
+
+  portState.pageKey = nextPageKey;
+  portState.pageUrl = nextPageUrl;
+  uiPorts.set(portId, portState);
+
+  if (!nextPageKey) {
+    await persistAiSessions();
+    return;
+  }
+
+  const existingSession = aiSessions.get(nextPageKey);
+  if (existingSession) {
+    updateAiSessionCache({
+      ...existingSession,
+      pageUrlSample: nextPageUrl ?? existingSession.pageUrlSample,
+      attachedViewIds: mergeAttachedViewIds(existingSession.attachedViewIds, portState.viewId)
+    });
+  } else {
+    const status = createDefaultAiStatus(nextPageKey, nextPageUrl, false);
+    updateAiSessionCache({
+      pageKey: nextPageKey,
+      pageUrlSample: nextPageUrl,
+      attachedViewIds: [portState.viewId],
+      state: deriveSessionState(status.requestState, true),
+      activeRequestId: null,
+      openaiResponseId: null,
+      lastSequenceNumber: null,
+      queuedCount: 0,
+      recoverable: false,
+      lastCheckpointAt: null,
+      lastError: null,
+      messages: [],
+      queue: [],
+      status
+    });
+  }
+
+  await persistAiSessions();
+}
+
+async function detachViewFromPort(portId: string): Promise<void> {
+  const portState = uiPorts.get(portId);
+  uiPorts.delete(portId);
+  if (!portState?.pageKey) {
+    await syncNativeConnectionLifecycle();
+    return;
+  }
+
+  const session = aiSessions.get(portState.pageKey);
+  if (!session) {
+    return;
+  }
+
+  updateAiSessionCache({
+    ...session,
+    attachedViewIds: session.attachedViewIds.filter((viewId) => viewId !== portState.viewId)
+  });
+  await persistAiSessions();
+  await syncNativeConnectionLifecycle();
+}
+
+function mergeAttachedViewIds(currentIds: readonly string[], nextId: string): string[] {
+  return Array.from(new Set([...currentIds, nextId]));
+}
+
+function deriveSessionState(
+  requestState: AiChatPageSession["status"]["requestState"],
+  hasAttachedViews: boolean
+): AiChatPageSession["state"] {
+  if (!hasAttachedViews && requestState !== "idle") {
+    return "detached";
+  }
+
+  return requestState;
+}
+
+function updateAiSessionCache(session: AiChatPageSession): void {
+  const currentSession = aiSessions.get(session.pageKey);
+  const attachedViewIds = session.attachedViewIds.length > 0
+    ? session.attachedViewIds
+    : currentSession?.attachedViewIds ?? [];
+  const normalizedSession: AiChatPageSession = {
+    ...session,
+    pageUrlSample: session.pageUrlSample ?? currentSession?.pageUrlSample ?? null,
+    attachedViewIds,
+    state: deriveSessionState(session.status.requestState, attachedViewIds.length > 0),
+    activeRequestId: session.activeRequestId ?? session.status.activeRequestId,
+    openaiResponseId: session.openaiResponseId ?? session.status.openaiResponseId,
+    lastSequenceNumber: session.lastSequenceNumber ?? session.status.lastSequenceNumber,
+    queuedCount: session.queuedCount ?? session.status.queueCount,
+    recoverable: session.recoverable ?? session.status.recoverable,
+    lastError: session.lastError ?? session.status.lastError
+  };
+  aiSessions.set(normalizedSession.pageKey, normalizedSession);
+}
+
+async function persistAiSessions(): Promise<void> {
+  await chrome.storage.session.set({
+    [STORAGE_KEYS.aiSessions]: [...aiSessions.values()]
+  });
+}
+
+function shouldKeepNativeConnection(): boolean {
+  return desiredRuntime.desiredRunning || hasActiveAiSessions() || uiPorts.size > 0;
+}
+
+function hasActiveAiSessions(): boolean {
+  for (const session of aiSessions.values()) {
+    if (
+      session.queuedCount > 0 ||
+      session.recoverable ||
+      session.activeRequestId !== null ||
+      session.openaiResponseId !== null ||
+      (session.status.requestState !== "idle" && session.status.requestState !== "error")
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function syncNativeConfig(): Promise<void> {
+  if (!nativeBridge.connected) {
+    return;
+  }
+
+  await nativeBridge.sendRequest(NATIVE_CONFIG_SYNC_ACTION, {
+    config: configCache
+  });
+}
+
+async function syncAiSessionsFromNative(): Promise<void> {
+  if (!nativeBridge.connected) {
+    return;
+  }
+
+  try {
+    const result = AiChatListResultSchema.parse(
+      await nativeBridge.sendRequest(COMMANDS.aiChatList, {})
+    );
+
+    const attachedByPage = new Map<string, string[]>();
+    for (const existingSession of aiSessions.values()) {
+      attachedByPage.set(existingSession.pageKey, [...existingSession.attachedViewIds]);
+    }
+
+    aiSessions.clear();
+    for (const session of result.sessions) {
+      updateAiSessionCache({
+        ...session,
+        attachedViewIds: attachedByPage.get(session.pageKey) ?? session.attachedViewIds
+      });
+    }
+
+    await persistAiSessions();
+  } catch (error) {
+    await appendLog({
+      level: "warn",
+      source: "background",
+      event: "ai.chat.list.sync.failed",
+      summary: "Failed to hydrate AI sessions from native host.",
+      details: serializeError(error)
+    });
+  }
+}
+
+async function syncNativeConnectionLifecycle(): Promise<void> {
+  if (shouldKeepNativeConnection() || !nativeBridge.connected) {
+    return;
+  }
+
+  await nativeBridge.disconnect();
+}
+
 async function patchConfig(input: {
   scope: "local" | "session";
   patch: ExtensionConfigPatch;
@@ -1066,7 +1517,16 @@ async function syncConfigSideEffects(patch: ExtensionConfigPatch): Promise<void>
     });
   }
 
-  if (!nativeBridge.connected || !workerStatus.running) {
+  if (!nativeBridge.connected) {
+    return;
+  }
+
+  if (patch.ai || patch.runtime?.nativeHostName !== undefined) {
+    await syncNativeConfig();
+  }
+
+  if (!workerStatus.running) {
+    await syncNativeConnectionLifecycle();
     return;
   }
 
@@ -1090,6 +1550,8 @@ async function syncConfigSideEffects(patch: ExtensionConfigPatch): Promise<void>
     await persistRuntimeState();
     await broadcastStatus();
   }
+
+  await syncNativeConnectionLifecycle();
 }
 
 async function persistRuntimeState(): Promise<void> {
@@ -1154,11 +1616,55 @@ async function broadcastConfig(): Promise<void> {
 }
 
 function broadcastStream(message: unknown): void {
-  for (const [portId, port] of uiPorts.entries()) {
+  for (const [portId, portState] of uiPorts.entries()) {
     try {
-      port.postMessage(message);
+      portState.port.postMessage(message);
     } catch {
       uiPorts.delete(portId);
     }
   }
+}
+
+function broadcastAiStream(message: AiStreamMessage): void {
+  const session = aiSessions.get(message.pageKey);
+  const enrichedMessage: AiStreamMessage =
+    session && message.session
+      ? {
+          ...message,
+          session
+        }
+      : message;
+
+  for (const [portId, portState] of uiPorts.entries()) {
+    if (portState.pageKey !== message.pageKey) {
+      continue;
+    }
+
+    try {
+      portState.port.postMessage(enrichedMessage);
+    } catch {
+      uiPorts.delete(portId);
+    }
+  }
+}
+
+function broadcastAiSessionSnapshot(session: AiChatPageSession, summary: string): void {
+  const normalizedSession = aiSessions.get(session.pageKey) ?? session;
+  broadcastAiStream(AiStreamMessageSchema.parse({
+    stream: "ai",
+    event: "ai.chat.snapshot",
+    level: "info",
+    summary,
+    details: null,
+    ts: new Date().toISOString(),
+    correlationId: null,
+    pageKey: normalizedSession.pageKey,
+    pageUrl: normalizedSession.pageUrlSample,
+    requestId: normalizedSession.activeRequestId,
+    sequenceNumber: normalizedSession.lastSequenceNumber,
+    status: normalizedSession.status,
+    session: normalizedSession,
+    queue: normalizedSession.queue,
+    delta: undefined
+  }));
 }

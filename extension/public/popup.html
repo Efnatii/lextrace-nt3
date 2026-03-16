@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="ru">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -16,16 +16,16 @@
         <span class="shell-badge" id="status-badge">offline</span>
       </header>
 
-      <nav class="tab-strip" aria-label="Popup tabs">
-        <button type="button" class="tab-button is-active" data-tab="control">Control</button>
-        <button type="button" class="tab-button" data-tab="config">Config</button>
+      <nav class="tab-strip" aria-label="Вкладки popup">
+        <button type="button" class="tab-button is-active" data-tab="control">Управление</button>
+        <button type="button" class="tab-button" data-tab="config">Конфиг</button>
       </nav>
 
       <main class="shell-main">
         <section class="tab-panel is-active" data-panel="control">
           <dl class="status-grid">
             <div>
-              <dt>Worker</dt>
+              <dt>Воркер</dt>
               <dd id="worker-running">unknown</dd>
             </div>
             <div>
@@ -33,25 +33,25 @@
               <dd id="worker-boot">-</dd>
             </div>
             <div>
-              <dt>Session</dt>
+              <dt>Сессия</dt>
               <dd id="worker-session">-</dd>
             </div>
             <div>
-              <dt>Task</dt>
+              <dt>Задача</dt>
               <dd id="worker-task">-</dd>
             </div>
           </dl>
 
           <div class="control-row">
-            <button type="button" id="open-terminal" class="terminal-trigger">Open terminal</button>
-            <span class="terminal-state" id="terminal-state">Checking current page…</span>
+            <button type="button" id="open-terminal" class="terminal-trigger">Открыть терминал</button>
+            <span class="terminal-state" id="terminal-state">Проверка текущей страницы…</span>
           </div>
         </section>
 
         <section class="tab-panel" data-panel="config">
           <div class="config-frame" id="config-frame">
             <div class="config-viewport" id="config-viewport">
-              <div class="config-viewer" id="config-viewer" aria-label="Extension config JSON viewer"></div>
+              <div class="config-viewer" id="config-viewer" aria-label="JSON-просмотрщик конфига расширения"></div>
             </div>
           </div>
         </section>

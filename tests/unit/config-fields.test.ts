@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildConfigPatchFromPath,
+  getConfigFieldTooltipValue,
   getEditableConfigField,
+  getOrderedConfigEntries,
   parseConfigFieldDraft
 } from "../../extension/src/shared/config-fields";
 
@@ -14,10 +16,64 @@ describe("editable config fields", () => {
       editorType: "select"
     });
 
+    expect(getEditableConfigField("ui.overlay.activeTab")).toMatchObject({
+      scope: "session",
+      valueType: "enum",
+      editorType: "select"
+    });
+
     expect(getEditableConfigField("runtime.nativeHostName")).toMatchObject({
       scope: "local",
       valueType: "string",
       editorType: "inline"
+    });
+
+    expect(getEditableConfigField("ai.chat.streamingEnabled")).toMatchObject({
+      scope: "local",
+      valueType: "boolean",
+      editorType: "select"
+    });
+
+    expect(getEditableConfigField("ai.allowedModels")).toMatchObject({
+      scope: "local",
+      valueType: "model-rule-array",
+      editorType: "model-multiselect"
+    });
+
+    expect(getEditableConfigField("ai.chat.model")).toMatchObject({
+      scope: "local",
+      valueType: "model-rule",
+      editorType: "model-select-panel"
+    });
+
+    expect(getEditableConfigField("ai.chat.instructions")).toMatchObject({
+      scope: "local",
+      valueType: "string",
+      editorType: "modal-text"
+    });
+
+    expect(getEditableConfigField("ai.chat.structuredOutput.schema")).toMatchObject({
+      scope: "local",
+      valueType: "string",
+      editorType: "modal-text"
+    });
+
+    expect(getEditableConfigField("ai.chat.structuredOutput.strict")).toMatchObject({
+      scope: "local",
+      valueType: "boolean",
+      editorType: "select"
+    });
+
+    expect(getEditableConfigField("ai.compaction.instructions")).toMatchObject({
+      scope: "local",
+      valueType: "string",
+      editorType: "modal-text"
+    });
+
+    expect(getEditableConfigField("ai.compaction.streamingEnabled")).toMatchObject({
+      scope: "local",
+      valueType: "boolean",
+      editorType: "select"
     });
   });
 
@@ -35,6 +91,97 @@ describe("editable config fields", () => {
       "com.lextrace.custom"
     );
     expect(parseConfigFieldDraft("protocol.testCommandsEnabled", "true")).toBe(true);
+    expect(parseConfigFieldDraft("ai.chat.model", '{"model":"gpt-5","tier":"priority"}')).toEqual({
+      model: "gpt-5",
+      tier: "priority"
+    });
+    expect(
+      parseConfigFieldDraft(
+        "ai.chat.structuredOutput.schema",
+        '{\n  "type": "object",\n  "properties": {\n    "translation": { "type": "string" }\n  },\n  "required": ["translation"],\n  "additionalProperties": false\n}'
+      )
+    ).toContain('"translation"');
+    expect(
+      parseConfigFieldDraft(
+        "ai.allowedModels",
+        '[{"model":"gpt-5","tier":"standard"},{"model":"gpt-4.1","tier":"priority"}]'
+      )
+    ).toEqual([
+      { model: "gpt-5", tier: "standard" },
+      { model: "gpt-4.1", tier: "priority" }
+    ]);
+    expect(parseConfigFieldDraft("ai.allowedModels", '["gpt-5","gpt-4.1"]')).toEqual([
+      { model: "gpt-4.1", tier: "standard" },
+      { model: "gpt-5", tier: "standard" }
+    ]);
     expect(() => parseConfigFieldDraft("logging.maxEntries", "8.5")).toThrow(/integer/i);
+    expect(() => parseConfigFieldDraft("ai.chat.structuredOutput.schema", "[]")).toThrow(/JSON object/i);
+  });
+
+  it("orders config groups and nested keys by the explicit viewer registry", () => {
+    expect(
+      getOrderedConfigEntries(
+        {
+          runtime: {},
+          test: {},
+          ai: {},
+          ui: {},
+          protocol: {},
+          logging: {}
+        },
+        ""
+      ).map(([key]) => key)
+    ).toEqual(["ui", "ai", "logging", "runtime", "protocol", "test"]);
+
+    expect(
+      getOrderedConfigEntries(
+        {
+          width: 920,
+          top: 12,
+          visible: false,
+          left: 8,
+          height: 620,
+          activeTab: "chat"
+        },
+        "ui.overlay"
+      ).map(([key]) => key)
+    ).toEqual(["activeTab", "visible", "width", "height", "left", "top"]);
+
+    expect(
+      getOrderedConfigEntries(
+        {
+          enabled: true,
+          streamingEnabled: true,
+          modelOverride: null,
+          instructions: "",
+          triggerPromptTokens: 131072,
+          preserveRecentTurns: 24,
+          maxPassesPerPage: 16
+        },
+        "ai.compaction"
+      ).map(([key]) => key)
+    ).toEqual(["enabled", "streamingEnabled", "modelOverride", "instructions", "triggerPromptTokens", "preserveRecentTurns", "maxPassesPerPage"]);
+
+    expect(
+      getOrderedConfigEntries(
+        {
+          instructions: "",
+          model: null,
+          structuredOutput: {},
+          streamingEnabled: true
+        },
+        "ai.chat"
+      ).map(([key]) => key)
+    ).toEqual(["model", "streamingEnabled", "instructions", "structuredOutput"]);
+  });
+
+  it("formats multiline config tooltip text without collapsing the original value", () => {
+    expect(getConfigFieldTooltipValue("ai.chat.instructions", "line 1\nline 2")).toBe("line 1\nline 2");
+    expect(getConfigFieldTooltipValue("ai.compaction.instructions", "line 3\nline 4")).toBe("line 3\nline 4");
+    expect(getConfigFieldTooltipValue("ai.chat.structuredOutput.schema", "{\n  \"type\": \"object\"\n}")).toContain("\"type\"");
+    expect(getConfigFieldTooltipValue("ai.chat.model", { model: "gpt-5", tier: "flex" })).toContain("\"tier\": \"flex\"");
+    expect(getConfigFieldTooltipValue("ai.allowedModels", [{ model: "gpt-5", tier: "standard" }])).toContain(
+      "\"model\": \"gpt-5\""
+    );
   });
 });

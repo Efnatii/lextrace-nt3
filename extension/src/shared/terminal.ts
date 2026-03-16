@@ -29,6 +29,11 @@ const PROTOCOL_ACTIONS = new Set<string>([
   COMMANDS.logList,
   COMMANDS.ping,
   COMMANDS.overlayClose,
+  COMMANDS.aiChatStatus,
+  COMMANDS.aiChatSend,
+  COMMANDS.aiChatResume,
+  COMMANDS.aiChatReset,
+  COMMANDS.aiChatList,
   COMMANDS.testHostCrash
 ]);
 
@@ -42,7 +47,12 @@ const BASE_TERMINAL_COMMAND_TEMPLATES = [
   "config.patch {\"scope\":\"local\",\"patch\":{\"logging\":{\"level\":\"warn\"}}}",
   "log.list {\"limit\":50}",
   "ping",
-  "overlay.close"
+  "overlay.close",
+  "ai.chat.status {\"pageKey\":\"https://example.com/path\",\"pageUrl\":\"https://example.com/path\"}",
+  "ai.chat.send {\"pageKey\":\"https://example.com/path\",\"pageUrl\":\"https://example.com/path\",\"origin\":\"code\",\"text\":\"Reply with exact token EDGE_CODE_OK and nothing else.\"}",
+  "ai.chat.resume {\"pageKey\":\"https://example.com/path\"}",
+  "ai.chat.reset {\"pageKey\":\"https://example.com/path\"}",
+  "ai.chat.list"
 ] as const satisfies readonly string[];
 
 const TEST_TERMINAL_COMMAND_TEMPLATES = [
