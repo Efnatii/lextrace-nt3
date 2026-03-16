@@ -13,6 +13,7 @@
     "test": "npm run test:unit",
     "test:unit": "vitest run",
     "test:edge": "node scripts/test-edge.mjs",
+    "test:edge:ai": "node scripts/test-edge-ai.mjs",
     "typecheck": "tsc --noEmit"
   },
   "repository": {

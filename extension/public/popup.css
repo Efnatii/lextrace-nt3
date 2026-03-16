@@ -652,6 +652,10 @@ body {
   background: #f6f6f6;
 }
 
+.popup-modal-body.is-text-editor {
+  grid-template-rows: 1fr auto;
+}
+
 .popup-modal-header {
   display: flex;
   align-items: center;
@@ -706,4 +710,13 @@ body {
   font-family: "Cascadia Code", "Consolas", monospace;
   font-size: 12px;
   line-height: 1.5;
+}
+
+.popup-modal-note {
+  border-top: 1px solid var(--line);
+  padding: 8px 10px;
+  background: #efefef;
+  color: var(--text-soft);
+  font-size: 10px;
+  line-height: 1.45;
 }

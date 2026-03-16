@@ -27,11 +27,12 @@ import {
   getConfigFieldDisplayValue,
   getEditableConfigField,
   getOrderedConfigEntries,
+  isSensitiveConfigPath,
   readConfigValue,
   validateEffectiveConfig,
   type EditableConfigFieldDescriptor
 } from "../shared/config-fields";
-import { COMMANDS } from "../shared/constants";
+import { COMMANDS, OPENAI_API_KEY_ENV_VAR_NAME } from "../shared/constants";
 import { defaultConfig, mergeConfig, type ExtensionConfig, type ExtensionConfigPatch, type PopupTab } from "../shared/config";
 import { ProtocolCommandError, connectRuntimeStream, recordLog, sendCommand } from "../shared/client";
 import { LogEntrySchema, type LogEntry } from "../shared/logging";
@@ -60,6 +61,7 @@ type ModelSelectPanelState = {
 type ConfigPanelState = AllowedModelsPanelState | ModelSelectPanelState;
 
 type ModalTextPath =
+  | "ai.openAiApiKey"
   | "ai.chat.instructions"
   | "ai.chat.structuredOutput.description"
   | "ai.chat.structuredOutput.schema"
@@ -501,7 +503,7 @@ function appendConfigKeyToken(
   token.className = "json-token json-key";
   token.textContent = `"${key}"`;
 
-  if (resetPath) {
+  if (resetPath && !isSensitiveConfigPath(resetPath)) {
     token.classList.add("is-resettable");
     token.addEventListener("dblclick", (event) => {
       event.preventDefault();
@@ -1605,7 +1607,19 @@ function createModalTextEditorContent(): HTMLDivElement {
     }
   });
 
-  fragment.append(header, textarea);
+  const body = document.createElement("div");
+  body.className = "popup-modal-body is-text-editor";
+  body.append(textarea);
+
+  const noteText = getModalTextEditorNote(currentModalTextState?.path ?? null);
+  if (noteText) {
+    const note = document.createElement("div");
+    note.className = "popup-modal-note";
+    note.textContent = noteText;
+    body.append(note);
+  }
+
+  fragment.append(header, body);
   return fragment;
 }
 
@@ -1641,6 +1655,14 @@ async function commitModalTextEditor(): Promise<void> {
       error
     }, "error");
   }
+}
+
+function getModalTextEditorNote(path: ModalTextPath | null): string | null {
+  if (path === "ai.openAiApiKey") {
+    return `A non-empty value writes ${OPENAI_API_KEY_ENV_VAR_NAME} for the current Windows user. Save an empty value to remove the variable.`;
+  }
+
+  return null;
 }
 
 function setControlMessage(

@@ -59,6 +59,7 @@ describe("config merge", () => {
     expect(defaultConfig.runtime.reconnectPolicy.maxDelayMs).toBe(30000);
     expect(defaultConfig.runtime.reconnectPolicy.maxAttempts).toBe(10);
     expect(defaultConfig.logging.maxEntries).toBe(1000);
+    expect(defaultConfig.ai.openAiApiKey).toBeNull();
     expect(defaultConfig.ai.compaction.streamingEnabled).toBe(true);
     expect(defaultConfig.ai.compaction.triggerPromptTokens).toBe(131072);
     expect(defaultConfig.ai.compaction.preserveRecentTurns).toBe(24);
@@ -71,6 +72,7 @@ describe("config merge", () => {
   it("merges nested ai config without dropping sibling defaults", () => {
     const merged = mergeConfig(defaultConfig, {
       ai: {
+        openAiApiKey: "sk-test",
         allowedModels: [
           { model: "gpt-5", tier: "standard" },
           { model: "gpt-4.1", tier: "priority" }
@@ -90,6 +92,7 @@ describe("config merge", () => {
       }
     });
 
+    expect(merged.ai.openAiApiKey).toBe("sk-test");
     expect(merged.ai.chat.model).toEqual({
       model: "gpt-5",
       tier: "flex"

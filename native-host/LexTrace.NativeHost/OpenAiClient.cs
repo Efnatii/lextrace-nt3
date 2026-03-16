@@ -7,24 +7,49 @@ namespace LexTrace.NativeHost;
 
 internal sealed class OpenAiClient
 {
+    public const string ApiKeyEnvironmentVariableName = "OPENAI_API_KEY";
     private const string ResponsesPath = "https://api.openai.com/v1/responses";
     private const string ModelsPath = "https://api.openai.com/v1/models";
     private const string PricingPageUrl = "https://developers.openai.com/api/docs/pricing";
     private readonly HttpClient _httpClient;
-    private readonly string? _apiKey;
+    private string? _apiKey;
     private readonly SemaphoreSlim _catalogLock = new(1, 1);
     private OpenAiModelCatalogResult? _catalogCache;
     private DateTimeOffset _catalogCacheExpiresAt = DateTimeOffset.MinValue;
 
     public OpenAiClient()
     {
-        _apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+        ReloadApiKeyFromEnvironment();
         _httpClient = new HttpClient();
         _httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         _httpClient.DefaultRequestHeaders.Add("OpenAI-Beta", "assistants=v2");
     }
 
     public bool HasApiKey => !string.IsNullOrWhiteSpace(_apiKey);
+
+    public void ReloadApiKeyFromEnvironment()
+    {
+        _apiKey = NormalizeApiKey(Environment.GetEnvironmentVariable(ApiKeyEnvironmentVariableName));
+    }
+
+    public void ConfigureManagedApiKey(string? apiKey)
+    {
+        var normalizedApiKey = NormalizeApiKey(apiKey);
+
+        try
+        {
+            Environment.SetEnvironmentVariable(ApiKeyEnvironmentVariableName, normalizedApiKey);
+            Environment.SetEnvironmentVariable(ApiKeyEnvironmentVariableName, normalizedApiKey, EnvironmentVariableTarget.User);
+            _apiKey = normalizedApiKey;
+        }
+        catch (Exception error)
+        {
+            throw new InvalidOperationException(
+                $"Failed to update {ApiKeyEnvironmentVariableName}: {error.Message}",
+                error
+            );
+        }
+    }
 
     public async Task<OpenAiModelCatalogResult> ListChatModelsAsync(CancellationToken cancellationToken)
     {
@@ -183,7 +208,7 @@ internal sealed class OpenAiClient
     {
         if (!HasApiKey)
         {
-            throw new InvalidOperationException("OPENAI_API_KEY environment variable is missing.");
+            throw new InvalidOperationException($"{ApiKeyEnvironmentVariableName} environment variable is missing.");
         }
 
         var request = new HttpRequestMessage(method, url);
@@ -287,6 +312,12 @@ internal sealed class OpenAiClient
             : string.Equals(serviceTier, "flex", StringComparison.OrdinalIgnoreCase)
                 ? "flex"
                 : "default";
+
+    private static string? NormalizeApiKey(string? apiKey)
+    {
+        var trimmedApiKey = apiKey?.Trim();
+        return string.IsNullOrWhiteSpace(trimmedApiKey) ? null : trimmedApiKey;
+    }
 
     private static JsonArray BuildInputArray(IReadOnlyList<string> inputItemsJson)
     {

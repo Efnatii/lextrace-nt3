@@ -5,7 +5,8 @@ import {
   getConfigFieldTooltipValue,
   getEditableConfigField,
   getOrderedConfigEntries,
-  parseConfigFieldDraft
+  parseConfigFieldDraft,
+  redactSensitiveConfigData
 } from "../../extension/src/shared/config-fields";
 
 describe("editable config fields", () => {
@@ -38,6 +39,13 @@ describe("editable config fields", () => {
       scope: "local",
       valueType: "model-rule-array",
       editorType: "model-multiselect"
+    });
+
+    expect(getEditableConfigField("ai.openAiApiKey")).toMatchObject({
+      scope: "local",
+      valueType: "string",
+      editorType: "modal-text",
+      sensitive: true
     });
 
     expect(getEditableConfigField("ai.chat.model")).toMatchObject({
@@ -90,6 +98,7 @@ describe("editable config fields", () => {
     expect(parseConfigFieldDraft("runtime.nativeHostName", "com.lextrace.custom")).toBe(
       "com.lextrace.custom"
     );
+    expect(parseConfigFieldDraft("ai.openAiApiKey", "sk-test")).toBe("sk-test");
     expect(parseConfigFieldDraft("protocol.testCommandsEnabled", "true")).toBe(true);
     expect(parseConfigFieldDraft("ai.chat.model", '{"model":"gpt-5","tier":"priority"}')).toEqual({
       model: "gpt-5",
@@ -165,6 +174,19 @@ describe("editable config fields", () => {
     expect(
       getOrderedConfigEntries(
         {
+          allowedModels: [],
+          chat: {},
+          openAiApiKey: null,
+          compaction: {},
+          rateLimits: {}
+        },
+        "ai"
+      ).map(([key]) => key)
+    ).toEqual(["openAiApiKey", "allowedModels", "chat", "compaction", "rateLimits"]);
+
+    expect(
+      getOrderedConfigEntries(
+        {
           instructions: "",
           model: null,
           structuredOutput: {},
@@ -183,5 +205,27 @@ describe("editable config fields", () => {
     expect(getConfigFieldTooltipValue("ai.allowedModels", [{ model: "gpt-5", tier: "standard" }])).toContain(
       "\"model\": \"gpt-5\""
     );
+    expect(getConfigFieldTooltipValue("ai.openAiApiKey", "sk-secret-value")).toContain("OPENAI_API_KEY");
+    expect(getConfigFieldTooltipValue("ai.openAiApiKey", "sk-secret-value")).not.toContain("sk-secret-value");
+  });
+
+  it("redacts sensitive config values before they hit logs", () => {
+    expect(
+      redactSensitiveConfigData({
+        ai: {
+          openAiApiKey: "sk-secret-value",
+          chat: {
+            instructions: "keep me"
+          }
+        }
+      })
+    ).toEqual({
+      ai: {
+        openAiApiKey: "[redacted]",
+        chat: {
+          instructions: "keep me"
+        }
+      }
+    });
   });
 });

@@ -16,6 +16,7 @@ import {
   OverlayTabSchema,
   PopupTabSchema
 } from "./config";
+import { OPENAI_API_KEY_ENV_VAR_NAME } from "./constants";
 
 export const ConfigFieldScopeSchema = z.enum(["local", "session"]);
 export const ConfigFieldValueTypeSchema = z.enum(["string", "number", "boolean", "enum", "string-array", "model-rule", "model-rule-array"]);
@@ -42,6 +43,7 @@ export type EditableConfigFieldDescriptor = {
   valueType: ConfigFieldValueType;
   editorType: ConfigFieldEditorType;
   schema: z.ZodTypeAny;
+  sensitive?: boolean;
   options?: readonly ConfigFieldOption[];
 };
 
@@ -71,7 +73,8 @@ function createDescriptor(
   valueType: ConfigFieldValueType,
   schema: z.ZodTypeAny,
   options?: readonly ConfigFieldOption[],
-  editorType?: ConfigFieldEditorType
+  editorType?: ConfigFieldEditorType,
+  sensitive = false
 ): EditableConfigFieldDescriptor {
   return {
     path,
@@ -80,6 +83,7 @@ function createDescriptor(
     editorType:
       editorType ?? (valueType === "string" || valueType === "number" ? "inline" : "select"),
     schema,
+    sensitive,
     options
   };
 }
@@ -113,6 +117,15 @@ export const editableConfigFields = [
     "boolean",
     z.boolean(),
     createSelectOptions(["true", "false"])
+  ),
+  createDescriptor(
+    "ai.openAiApiKey",
+    "local",
+    "string",
+    z.string().nullable(),
+    undefined,
+    "modal-text",
+    true
   ),
   createDescriptor(
     "ai.allowedModels",
@@ -188,11 +201,15 @@ export function getEditableConfigField(path: string): EditableConfigFieldDescrip
   return editableConfigFieldMap.get(path);
 }
 
+export function isSensitiveConfigPath(path: string): boolean {
+  return getEditableConfigField(path)?.sensitive === true;
+}
+
 const configKeyOrderRegistry = new Map<string, readonly string[]>([
   ["", ["ui", "ai", "logging", "runtime", "protocol", "test"]],
   ["ui", ["popupActiveTab", "overlay"]],
   ["ui.overlay", ["activeTab", "visible", "width", "height", "left", "top"]],
-  ["ai", ["allowedModels", "chat", "compaction", "rateLimits"]],
+  ["ai", ["openAiApiKey", "allowedModels", "chat", "compaction", "rateLimits"]],
   ["ai.chat", ["model", "streamingEnabled", "instructions", "structuredOutput"]],
   ["ai.chat.structuredOutput", ["name", "description", "schema", "strict"]],
   ["ai.compaction", ["enabled", "streamingEnabled", "modelOverride", "instructions", "triggerPromptTokens", "preserveRecentTurns", "maxPassesPerPage"]],
@@ -327,6 +344,10 @@ export function getConfigFieldDisplayValue(path: string, value: unknown): string
     return JSON.stringify(value);
   }
 
+  if (descriptor.sensitive) {
+    return formatSensitiveConfigDisplayValue(path, value);
+  }
+
   if (descriptor.valueType === "boolean") {
     return value ? "true" : "false";
   }
@@ -356,6 +377,10 @@ export function getConfigFieldTooltipValue(path: string, value: unknown): string
     return JSON.stringify(value, null, 2);
   }
 
+  if (descriptor.sensitive) {
+    return formatSensitiveConfigTooltipValue(path, value);
+  }
+
   if (descriptor.valueType === "model-rule-array" || descriptor.valueType === "string-array") {
     return JSON.stringify(value ?? [], null, 2);
   }
@@ -377,4 +402,53 @@ export function getConfigFieldTooltipValue(path: string, value: unknown): string
 
 export function validateEffectiveConfig(config: unknown): ExtensionConfig {
   return ExtensionConfigSchema.parse(config);
+}
+
+export function redactSensitiveConfigData<T>(value: T, pathPrefix = ""): T {
+  if (isSensitiveConfigPath(pathPrefix)) {
+    return redactSensitiveLeafValue(value) as T;
+  }
+
+  if (Array.isArray(value) || value === null || typeof value !== "object") {
+    return value;
+  }
+
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, childValue]) => [
+      key,
+      redactSensitiveConfigData(childValue, pathPrefix ? `${pathPrefix}.${key}` : key)
+    ])
+  ) as T;
+}
+
+function redactSensitiveLeafValue(value: unknown): unknown {
+  if (typeof value === "string") {
+    return value.trim().length > 0 ? "[redacted]" : value;
+  }
+
+  return value === null || value === undefined ? value : "[redacted]";
+}
+
+function formatSensitiveConfigDisplayValue(path: string, value: unknown): string {
+  if (path === "ai.openAiApiKey") {
+    return typeof value === "string" && value.trim().length > 0 ? "[redacted]" : "";
+  }
+
+  return typeof value === "string" ? value : "";
+}
+
+function formatSensitiveConfigTooltipValue(path: string, value: unknown): string {
+  if (path !== "ai.openAiApiKey") {
+    return "[redacted]";
+  }
+
+  if (typeof value === "string" && value.trim().length > 0) {
+    return `Stored value is hidden. Open the editor to replace it. Save empty text to remove ${OPENAI_API_KEY_ENV_VAR_NAME}.`;
+  }
+
+  if (value === "") {
+    return `Save a non-empty value to create or update ${OPENAI_API_KEY_ENV_VAR_NAME}. Save empty text to remove it.`;
+  }
+
+  return `This field does not currently manage ${OPENAI_API_KEY_ENV_VAR_NAME}. Save a value to create or update it. Save empty text to remove it.`;
 }

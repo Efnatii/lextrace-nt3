@@ -15,15 +15,23 @@ const nativeHostManifest = {
 
 await writeJson(paths.nativeHostManifest, nativeHostManifest);
 
-await run("reg", [
-  "add",
+const registryKeys = [
   "HKCU\\Software\\Microsoft\\Edge\\NativeMessagingHosts\\com.lextrace.nt3.host",
-  "/ve",
-  "/t",
-  "REG_SZ",
-  "/d",
-  paths.nativeHostManifest,
-  "/f"
-]);
+  "HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.lextrace.nt3.host"
+];
+
+for (const registryKey of registryKeys) {
+  await run("reg", [
+    "add",
+    registryKey,
+    "/ve",
+    "/t",
+    "REG_SZ",
+    "/d",
+    paths.nativeHostManifest,
+    "/f"
+  ]);
+}
 
 console.log(`Registered native host manifest at ${paths.nativeHostManifest}`);
+console.log(`Registered browsers: Edge, Chrome`);

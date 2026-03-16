@@ -20,6 +20,7 @@ import {
   type OverlayErrorCode,
   type OverlayProbeResult
 } from "../shared/overlay";
+import { redactSensitiveConfigData } from "../shared/config-fields";
 import {
   createEnvelope,
   createErrorResponse,
@@ -94,12 +95,12 @@ class NativeHostBridge {
     return this.port !== null;
   }
 
-  async connect(): Promise<void> {
+  async connect(hostName = configCache.runtime.nativeHostName): Promise<void> {
     if (this.port) {
       return;
     }
 
-    this.port = chrome.runtime.connectNative(configCache.runtime.nativeHostName);
+    this.port = chrome.runtime.connectNative(hostName);
     this.manualDisconnect = false;
     this.port.onMessage.addListener((message) => {
       void this.handleMessage(message);
@@ -262,7 +263,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         summary: "Message handling failed.",
         details: {
           error: serializeError(error),
-          message
+          message: sanitizeRuntimeMessageForLogs(message)
         }
       });
       sendResponse(
@@ -1483,10 +1484,35 @@ async function patchConfig(input: {
     source: "config-store",
     event: "config.patch",
     summary: `Patched ${input.scope} config.`,
-    details: input.patch
+    details: {
+      scope: input.scope,
+      patch: redactSensitiveConfigData(input.patch)
+    }
   });
 }
 
+function sanitizeRuntimeMessageForLogs(message: unknown): unknown {
+  if (!message || typeof message !== "object") {
+    return message;
+  }
+
+  const envelope = structuredClone(message as Record<string, unknown>);
+  if (envelope.action !== COMMANDS.configPatch) {
+    return envelope;
+  }
+
+  const payload = envelope.payload;
+  if (!payload || typeof payload !== "object") {
+    return envelope;
+  }
+
+  const patchPayload = payload as Record<string, unknown>;
+  if ("patch" in patchPayload) {
+    patchPayload.patch = redactSensitiveConfigData(patchPayload.patch);
+  }
+
+  return envelope;
+}
 async function appendLog(input: unknown): Promise<void> {
   const entry = createLogEntry(LogEntryInputSchema.parse(input), configCache.logging.collapseThreshold);
   if (!isLogLevelEnabled(entry.level, configCache.logging.level)) {

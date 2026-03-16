@@ -75,6 +75,7 @@ export const ExtensionConfigSchema = z.object({
     testCommandsEnabled: z.boolean()
   }),
   ai: z.object({
+    openAiApiKey: z.string().nullable(),
     allowedModels: AllowedModelsSchema,
     chat: z.object({
       model: NullableModelSelectionSchema,
@@ -152,6 +153,7 @@ export const ExtensionConfigPatchSchema = z.object({
     .optional(),
   ai: z
     .object({
+      openAiApiKey: z.string().nullable().optional(),
       allowedModels: AllowedModelsSchema.optional(),
       chat: z
         .object({
@@ -233,6 +235,7 @@ export const defaultConfig: ExtensionConfig = {
     testCommandsEnabled: true
   },
   ai: {
+    openAiApiKey: null,
     allowedModels: [],
     chat: {
       model: null,

@@ -1,6 +1,7 @@
 export const EXTENSION_DISPLAY_NAME = "LexTrace NT3";
 export const PROTOCOL_VERSION = 1;
 export const NATIVE_HOST_NAME = "com.lextrace.nt3.host";
+export const OPENAI_API_KEY_ENV_VAR_NAME = "OPENAI_API_KEY";
 export const RUNTIME_STREAM_PORT = "lextrace-runtime-stream";
 export const RECONNECT_ALARM_NAME = "lextrace-native-reconnect";
 export const STORAGE_KEYS = {

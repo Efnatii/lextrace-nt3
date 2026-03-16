@@ -133,7 +133,7 @@ internal sealed class RuntimeEngine
         await _stateLock.WaitAsync(cancellationToken);
         try
         {
-            ApplyAiConfig(_journal, envelope.Payload);
+            ApplyAiConfig(_journal, _openAiClient, envelope.Payload);
             await _stateStore.SaveAsync(_journal, cancellationToken);
         }
         finally
@@ -425,7 +425,7 @@ internal sealed class RuntimeEngine
 
             if (!_openAiClient.HasApiKey)
             {
-                throw new InvalidOperationException("OPENAI_API_KEY environment variable is missing.");
+                throw new InvalidOperationException($"{OpenAiClient.ApiKeyEnvironmentVariableName} environment variable is missing.");
             }
 
             if (GetGlobalQueuedCountLocked() >= _journal.AiConfig.RateLimits.MaxQueuedGlobal)
@@ -1998,7 +1998,7 @@ internal sealed class RuntimeEngine
         return null;
     }
 
-    private static void ApplyAiConfig(HostJournal journal, JsonElement payload)
+    private static void ApplyAiConfig(HostJournal journal, OpenAiClient openAiClient, JsonElement payload)
     {
         if (payload.ValueKind != JsonValueKind.Object || !payload.TryGetProperty("config", out var configElement))
         {
@@ -2010,9 +2010,26 @@ internal sealed class RuntimeEngine
             return;
         }
 
+        if (aiElement.TryGetProperty("openAiApiKey", out var openAiApiKeyElement))
+        {
+            if (openAiApiKeyElement.ValueKind == JsonValueKind.String)
+            {
+                openAiClient.ConfigureManagedApiKey(openAiApiKeyElement.GetString());
+            }
+            else if (openAiApiKeyElement.ValueKind == JsonValueKind.Null)
+            {
+                openAiClient.ReloadApiKeyFromEnvironment();
+            }
+        }
+
         if (aiElement.TryGetProperty("chat", out var chatElement) && chatElement.ValueKind == JsonValueKind.Object)
         {
-            journal.AiConfig.Chat.Model = GetOptionalModelSelection(chatElement, "model") ?? journal.AiConfig.Chat.Model;
+            if (chatElement.TryGetProperty("model", out var chatModelElement))
+            {
+                journal.AiConfig.Chat.Model = chatModelElement.ValueKind == JsonValueKind.Null
+                    ? null
+                    : GetOptionalModelSelection(chatElement, "model") ?? journal.AiConfig.Chat.Model;
+            }
             journal.AiConfig.Chat.StreamingEnabled = GetOptionalBoolean(chatElement, "streamingEnabled") ?? journal.AiConfig.Chat.StreamingEnabled;
             journal.AiConfig.Chat.Instructions = GetOptionalString(chatElement, "instructions") ?? journal.AiConfig.Chat.Instructions;
             if (chatElement.TryGetProperty("structuredOutput", out var structuredOutputElement) && structuredOutputElement.ValueKind == JsonValueKind.Object)
@@ -2025,7 +2042,12 @@ internal sealed class RuntimeEngine
         }
         else
         {
-            journal.AiConfig.Chat.Model = GetOptionalModelSelection(aiElement, "model") ?? journal.AiConfig.Chat.Model;
+            if (aiElement.TryGetProperty("model", out var legacyChatModelElement))
+            {
+                journal.AiConfig.Chat.Model = legacyChatModelElement.ValueKind == JsonValueKind.Null
+                    ? null
+                    : GetOptionalModelSelection(aiElement, "model") ?? journal.AiConfig.Chat.Model;
+            }
             journal.AiConfig.Chat.StreamingEnabled = GetOptionalBoolean(aiElement, "streamingEnabled") ?? journal.AiConfig.Chat.StreamingEnabled;
             journal.AiConfig.Chat.Instructions = GetOptionalString(aiElement, "instructions") ?? journal.AiConfig.Chat.Instructions;
         }
@@ -2034,7 +2056,12 @@ internal sealed class RuntimeEngine
         {
             journal.AiConfig.Compaction.Enabled = GetOptionalBoolean(compactionElement, "enabled") ?? journal.AiConfig.Compaction.Enabled;
             journal.AiConfig.Compaction.StreamingEnabled = GetOptionalBoolean(compactionElement, "streamingEnabled") ?? journal.AiConfig.Compaction.StreamingEnabled;
-            journal.AiConfig.Compaction.ModelOverride = GetOptionalModelSelection(compactionElement, "modelOverride") ?? journal.AiConfig.Compaction.ModelOverride;
+            if (compactionElement.TryGetProperty("modelOverride", out var modelOverrideElement))
+            {
+                journal.AiConfig.Compaction.ModelOverride = modelOverrideElement.ValueKind == JsonValueKind.Null
+                    ? null
+                    : GetOptionalModelSelection(compactionElement, "modelOverride") ?? journal.AiConfig.Compaction.ModelOverride;
+            }
             journal.AiConfig.Compaction.Instructions = GetOptionalString(compactionElement, "instructions") ?? journal.AiConfig.Compaction.Instructions;
             journal.AiConfig.Compaction.TriggerPromptTokens = GetOptionalInt(compactionElement, "triggerPromptTokens") ?? journal.AiConfig.Compaction.TriggerPromptTokens;
             journal.AiConfig.Compaction.PreserveRecentTurns = GetOptionalInt(compactionElement, "preserveRecentTurns") ?? journal.AiConfig.Compaction.PreserveRecentTurns;
