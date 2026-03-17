@@ -26,6 +26,7 @@ internal sealed class RuntimeEngine
     public async Task InitializeAsync(CancellationToken cancellationToken)
     {
         _journal = await _stateStore.LoadAsync(cancellationToken);
+        NormalizeJournalState();
         _journal.NativeHostPid = Environment.ProcessId;
         await _stateStore.SaveAsync(_journal, cancellationToken);
 
@@ -72,6 +73,7 @@ internal sealed class RuntimeEngine
 
     public async Task<object?> HandleCommandAsync(ProtocolEnvelope envelope, CancellationToken cancellationToken)
     {
+        NormalizeJournalState();
         return envelope.Action switch
         {
             "config.sync" => await SyncConfigAsync(envelope, cancellationToken),
@@ -126,6 +128,75 @@ internal sealed class RuntimeEngine
                 // Normal during shutdown.
             }
         }
+    }
+
+    private void NormalizeJournalState()
+    {
+        _journal.AiConfig ??= AiRuntimeConfig.CreateDefault();
+        _journal.AiConfig.Chat ??= new AiChatConfig();
+        _journal.AiConfig.Chat.StructuredOutput ??= new AiStructuredOutputConfig();
+        _journal.AiConfig.Compaction ??= new AiCompactionConfig();
+        _journal.AiConfig.RateLimits ??= new AiRateLimitConfig();
+        _journal.ModelBudgets ??= [];
+        _journal.AiSessions ??= [];
+        _journal.AiSessions = _journal.AiSessions
+            .Where(session => session is not null && !string.IsNullOrWhiteSpace(session.PageKey))
+            .ToList();
+
+        foreach (var session in _journal.AiSessions)
+        {
+            NormalizeSessionState(session);
+        }
+    }
+
+    private static void NormalizeSessionState(AiPageSessionRecord session)
+    {
+        session.PageKey ??= string.Empty;
+        session.RequestState ??= "idle";
+        session.Messages ??= [];
+        session.PendingQueue ??= [];
+        session.CanonicalContextJsonItems ??= [];
+
+        foreach (var message in session.Messages)
+        {
+            NormalizeMessageState(message);
+        }
+
+        foreach (var item in session.PendingQueue)
+        {
+            NormalizeQueueItemState(item);
+        }
+
+        NormalizeQueueItemState(session.ActiveItem);
+        NormalizeQueueItemState(session.RetryableItem);
+    }
+
+    private static void NormalizeMessageState(AiChatMessageRecord message)
+    {
+        message.PageKey ??= string.Empty;
+        message.RequestId ??= string.Empty;
+        message.Origin ??= "system";
+        message.Role ??= "system";
+        message.Kind ??= "system";
+        message.Text ??= string.Empty;
+        message.State ??= "completed";
+        message.Ts ??= DateTimeOffset.UtcNow.ToString("O");
+    }
+
+    private static void NormalizeQueueItemState(AiQueueItemRecord? item)
+    {
+        if (item is null)
+        {
+            return;
+        }
+
+        item.RequestId ??= Guid.NewGuid().ToString("D");
+        item.PageKey ??= string.Empty;
+        item.Origin ??= "user";
+        item.Text ??= string.Empty;
+        item.CreatedAt ??= DateTimeOffset.UtcNow.ToString("O");
+        item.State ??= "queued";
+        item.UserMessageId ??= string.Empty;
     }
 
     private async Task<object> SyncConfigAsync(ProtocolEnvelope envelope, CancellationToken cancellationToken)
@@ -401,7 +472,7 @@ internal sealed class RuntimeEngine
 
         return new
         {
-            session = BuildAiSessionPayload(session)
+            session = await CaptureAiSessionPayloadAsync(pageKey, pageUrl, cancellationToken)
         };
     }
 
@@ -517,7 +588,7 @@ internal sealed class RuntimeEngine
 
         return new
         {
-            session = BuildAiSessionPayload(session)
+            session = await CaptureAiSessionPayloadAsync(pageKey, pageUrl, cancellationToken)
         };
     }
 
@@ -565,7 +636,7 @@ internal sealed class RuntimeEngine
 
         return new
         {
-            session = BuildAiSessionPayload(session)
+            session = await CaptureAiSessionPayloadAsync(pageKey, pageUrl: null, cancellationToken)
         };
     }
 
@@ -645,7 +716,7 @@ internal sealed class RuntimeEngine
 
         return new
         {
-            session = BuildAiSessionPayload(session)
+            session = await CaptureAiSessionPayloadAsync(pageKey, pageUrl, cancellationToken)
         };
     }
 
@@ -913,7 +984,19 @@ internal sealed class RuntimeEngine
             return;
         }
 
-        await MaybeCompactContextAsync(session, activeItem, cancellationToken);
+        try
+        {
+            await MaybeCompactContextAsync(session, activeItem, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception error)
+        {
+            await MarkRetryableAsync(pageKey, activeItem, error.Message, cancellationToken);
+            return;
+        }
         var executionModel = string.IsNullOrWhiteSpace(activeItem.ModelId)
             ? GetConfiguredModelId(_journal.AiConfig.Chat.Model)
             : activeItem.ModelId;
@@ -1317,6 +1400,13 @@ internal sealed class RuntimeEngine
             if (assistantMessage is not null && assistantMessage.State == "streaming")
             {
                 assistantMessage.State = "error";
+            }
+
+            var pendingCompactionMessage = session.Messages.LastOrDefault(message => message.Kind == "compaction" && message.State == "pending");
+            if (pendingCompactionMessage is not null)
+            {
+                pendingCompactionMessage.State = "error";
+                pendingCompactionMessage.Text = "Context compaction failed.";
             }
 
             session.Messages.Add(new AiChatMessageRecord
@@ -1765,6 +1855,7 @@ internal sealed class RuntimeEngine
         var session = FindPageSessionLocked(pageKey);
         if (session is not null)
         {
+            NormalizeSessionState(session);
             if (!string.IsNullOrWhiteSpace(pageUrl))
             {
                 session.PageUrlSample = pageUrl;
@@ -1777,6 +1868,7 @@ internal sealed class RuntimeEngine
             PageKey = pageKey,
             PageUrlSample = pageUrl
         };
+        NormalizeSessionState(session);
         _journal.AiSessions.Add(session);
         return session;
     }
@@ -2119,6 +2211,24 @@ internal sealed class RuntimeEngine
             queue = queue.Select(BuildAiQueuePayload).ToArray(),
             status
         };
+    }
+
+    private async Task<object> CaptureAiSessionPayloadAsync(
+        string pageKey,
+        string? pageUrl,
+        CancellationToken cancellationToken
+    )
+    {
+        await _stateLock.WaitAsync(cancellationToken);
+        try
+        {
+            var session = GetOrCreatePageSessionLocked(pageKey, pageUrl);
+            return BuildAiSessionPayload(session);
+        }
+        finally
+        {
+            _stateLock.Release();
+        }
     }
 
     private object BuildAiStatusPayload(AiPageSessionRecord session)

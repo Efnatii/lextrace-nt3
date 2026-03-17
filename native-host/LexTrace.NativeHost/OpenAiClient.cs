@@ -168,8 +168,7 @@ internal sealed class OpenAiClient
             {
                 model = selection.Model,
                 input = BuildInputArray(inputItemsJson),
-                instructions = string.IsNullOrWhiteSpace(instructions) ? null : instructions,
-                service_tier = MapServiceTier(selection.Tier)
+                instructions = string.IsNullOrWhiteSpace(instructions) ? null : instructions
             }
         );
         using var response = await SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken);

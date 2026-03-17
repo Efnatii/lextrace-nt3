@@ -24,6 +24,7 @@ export const COMMANDS = {
   workerStatus: "worker.status",
   configGet: "config.get",
   configPatch: "config.patch",
+  configReset: "config.reset",
   logList: "log.list",
   logSubscribe: "log.subscribe",
   logRecord: "log.record",

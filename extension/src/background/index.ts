@@ -65,6 +65,11 @@ type UiPortState = {
 
 const NATIVE_CONFIG_SYNC_ACTION = "config.sync";
 const AI_MODEL_CATALOG_CACHE_TTL_MS = 5 * 60 * 1000;
+const AI_SESSION_PERSISTENCE_PROFILES = [
+  { maxSessions: 48, maxMessages: 12, maxQueueItems: 6 },
+  { maxSessions: 16, maxMessages: 4, maxQueueItems: 2 },
+  { maxSessions: 0, maxMessages: 0, maxQueueItems: 0 }
+] as const;
 
 const bootId = crypto.randomUUID();
 let bootstrapPromise: Promise<void> | null = null;
@@ -160,9 +165,12 @@ class NativeHostBridge {
         if (responseResult.data.ok) {
           pending.resolve(responseResult.data.result);
         } else {
-          pending.reject(
-            new Error(responseResult.data.error?.message ?? "Native host command failed.")
-          );
+          const nativeError = new Error(responseResult.data.error?.message ?? "Native host command failed.");
+          Object.assign(nativeError, {
+            code: responseResult.data.error?.code ?? null,
+            details: responseResult.data.error?.details ?? null
+          });
+          pending.reject(nativeError);
         }
       }
       return;
@@ -481,6 +489,10 @@ async function handleRuntimeMessage(
 
     case COMMANDS.configPatch:
       await patchConfig(payload as { scope: "local" | "session"; patch: ExtensionConfigPatch });
+      return createOkResponse(envelope.id, getRuntimeSnapshot());
+
+    case COMMANDS.configReset:
+      await resetConfigScope(payload as { scope: "local" | "session" });
       return createOkResponse(envelope.id, getRuntimeSnapshot());
 
     case COMMANDS.logList:
@@ -934,7 +946,7 @@ async function handleAiListCommand(requestId: string): Promise<ProtocolResponse>
     await persistAiSessions();
 
     return createOkResponse(requestId, {
-      sessions: [...aiSessions.values()]
+      sessions: [...aiSessions.values()].sort((left, right) => left.pageKey.localeCompare(right.pageKey))
     });
   } catch (error) {
     return createErrorResponse(
@@ -1382,9 +1394,81 @@ function updateAiSessionCache(session: AiChatPageSession): void {
 }
 
 async function persistAiSessions(): Promise<void> {
-  await chrome.storage.session.set({
-    [STORAGE_KEYS.aiSessions]: [...aiSessions.values()]
-  });
+  let lastError: unknown = null;
+  for (const profile of AI_SESSION_PERSISTENCE_PROFILES) {
+    try {
+      await chrome.storage.session.set({
+        [STORAGE_KEYS.aiSessions]: buildPersistedAiSessions(profile)
+      });
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  console.warn("Failed to persist AI sessions to chrome.storage.session.", lastError);
+}
+
+function buildPersistedAiSessions(profile: {
+  maxSessions: number;
+  maxMessages: number;
+  maxQueueItems: number;
+}): AiChatPageSession[] {
+  if (profile.maxSessions <= 0) {
+    return [];
+  }
+
+  return [...aiSessions.values()]
+    .sort((left, right) => compareAiSessionPersistencePriority(left, right))
+    .slice(0, profile.maxSessions)
+    .map((session) => ({
+      ...session,
+      messages: profile.maxMessages > 0 ? session.messages.slice(-profile.maxMessages) : [],
+      queue: profile.maxQueueItems > 0 ? session.queue.slice(-profile.maxQueueItems) : []
+    }));
+}
+
+function compareAiSessionPersistencePriority(left: AiChatPageSession, right: AiChatPageSession): number {
+  const leftPriority = getAiSessionPersistencePriority(left);
+  const rightPriority = getAiSessionPersistencePriority(right);
+  if (leftPriority !== rightPriority) {
+    return rightPriority - leftPriority;
+  }
+
+  return getAiSessionRecency(right) - getAiSessionRecency(left);
+}
+
+function getAiSessionPersistencePriority(session: AiChatPageSession): number {
+  if (
+    session.status.requestState !== "idle" ||
+    session.recoverable ||
+    session.queue.length > 0 ||
+    session.activeRequestId !== null ||
+    session.openaiResponseId !== null
+  ) {
+    return 2;
+  }
+
+  if (session.attachedViewIds.length > 0) {
+    return 1;
+  }
+
+  return 0;
+}
+
+function getAiSessionRecency(session: AiChatPageSession): number {
+  const candidates = [
+    session.lastCheckpointAt,
+    session.messages.at(-1)?.ts ?? null
+  ].filter((value): value is string => typeof value === "string" && value.length > 0);
+  for (const value of candidates) {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  return 0;
 }
 
 function shouldKeepNativeConnection(): boolean {
@@ -1487,6 +1571,31 @@ async function patchConfig(input: {
     details: {
       scope: input.scope,
       patch: redactSensitiveConfigData(input.patch)
+    }
+  });
+}
+
+async function resetConfigScope(input: {
+  scope: "local" | "session";
+}): Promise<void> {
+  if (input.scope === "local") {
+    localConfigPatch = {};
+    await chrome.storage.local.remove(STORAGE_KEYS.localConfig);
+  } else {
+    sessionConfigPatch = {};
+    await chrome.storage.session.remove(STORAGE_KEYS.sessionConfig);
+  }
+
+  configCache = buildEffectiveConfig(localConfigPatch, sessionConfigPatch);
+  await syncConfigSideEffects({ ai: {}, logging: {}, protocol: {}, runtime: {}, test: {}, ui: {} });
+  await broadcastConfig();
+  await appendLog({
+    level: "info",
+    source: "config-store",
+    event: "config.reset",
+    summary: `Reset ${input.scope} config scope.`,
+    details: {
+      scope: input.scope
     }
   });
 }

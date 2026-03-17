@@ -14,6 +14,7 @@
     "test:unit": "vitest run",
     "test:edge": "node scripts/test-edge.mjs",
     "test:edge:ai": "node scripts/test-edge-ai.mjs",
+    "test:edge:ai:matrix": "node scripts/test-edge-ai-matrix.mjs",
     "typecheck": "tsc --noEmit"
   },
   "repository": {

@@ -77,10 +77,18 @@ export function isLogLevelEnabled(entryLevel: LogLevel, thresholdLevel: LogLevel
 
 export function serializeError(error: unknown): Record<string, unknown> {
   if (error instanceof Error) {
+    const extendedError = error as Error & {
+      code?: unknown;
+      details?: unknown;
+      cause?: unknown;
+    };
     return {
       name: error.name,
       message: error.message,
-      stack: error.stack ?? null
+      stack: error.stack ?? null,
+      ...(extendedError.code !== undefined ? { code: extendedError.code } : {}),
+      ...(extendedError.details !== undefined ? { details: extendedError.details } : {}),
+      ...(extendedError.cause !== undefined ? { cause: extendedError.cause } : {})
     };
   }
 

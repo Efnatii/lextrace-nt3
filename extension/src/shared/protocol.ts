@@ -37,6 +37,9 @@ export const ConfigPatchPayloadSchema = z.object({
   scope: z.enum(["local", "session"]).default("local"),
   patch: ExtensionConfigPatchSchema
 });
+export const ConfigResetPayloadSchema = z.object({
+  scope: z.enum(["local", "session"]).default("local")
+});
 
 const EmptyPayloadSchema = z.object({}).passthrough().optional().default({});
 const OverlayTargetPayloadSchema = z
@@ -67,6 +70,7 @@ export const CommandPayloadSchemas = {
   [COMMANDS.workerStatus]: EmptyPayloadSchema,
   [COMMANDS.configGet]: EmptyPayloadSchema,
   [COMMANDS.configPatch]: ConfigPatchPayloadSchema,
+  [COMMANDS.configReset]: ConfigResetPayloadSchema,
   [COMMANDS.logList]: z
     .object({
       limit: z.number().int().min(1).max(500).optional()
