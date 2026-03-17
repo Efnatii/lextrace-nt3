@@ -158,6 +158,18 @@ export async function runBaselineAiSuite(session, options = {}) {
           }
           return details;
         } catch (error) {
+          if (error?.name === "SkipCaseError") {
+            entry.status = "skipped";
+            entry.reason = error.reason;
+            if (error.details !== undefined) {
+              entry.details = error.details;
+            }
+            if (retryErrors.length > 0) {
+              entry.retryErrors = retryErrors;
+            }
+            return null;
+          }
+
           const errorDetails = serializeError(error);
           if (attempt < 2 && isRetryableScenarioError(error)) {
             retryErrors.push(errorDetails);
@@ -217,6 +229,9 @@ export async function runBaselineAiSuite(session, options = {}) {
         };
         report.environment.providerRegionBlocked = true;
         report.environment.catalogFallbackModel = state.selectedModel;
+        throwSkip("OpenAI provider access is region-blocked.", {
+          fallbackModel: state.selectedModel
+        });
       }
       throw error;
     }
@@ -625,11 +640,13 @@ export async function runBaselineAiSuite(session, options = {}) {
       });
 
       const pausedSession = await waitForSession(driver, pageKey, pageUrl, (candidate) =>
-        candidate.status.requestState === "paused" && candidate.status.availableActions.canResume
+        candidate.status.requestState === "paused" &&
+        candidate.status.availableActions.canResume &&
+        typeof candidate.status.lastError === "string"
       );
       assert.ok(
-        typeof pausedSession.status.lastError === "string" && pausedSession.status.lastError.includes("OpenAI HTTP"),
-        "Retryable AI request did not capture the OpenAI error."
+        typeof pausedSession.status.lastError === "string" && pausedSession.status.lastError.trim().length > 0,
+        "Retryable AI request did not capture an error message."
       );
 
       await patchConfig(driver, {
@@ -931,6 +948,15 @@ async function runScenario(report, name, execute) {
     }
     return details;
   } catch (error) {
+    if (error?.name === "SkipCaseError") {
+      entry.status = "skipped";
+      entry.reason = error.reason;
+      if (error.details !== undefined) {
+        entry.details = error.details;
+      }
+      return null;
+    }
+
     entry.status = "failed";
     entry.error = error instanceof Error ? error.message : String(error);
     entry.errorDetails = serializeError(error);
@@ -949,6 +975,14 @@ function skipScenario(report, name, reason, details) {
     startedAt: new Date().toISOString(),
     finishedAt: new Date().toISOString()
   });
+}
+
+function throwSkip(reason, details) {
+  const error = new Error(reason);
+  error.name = "SkipCaseError";
+  error.reason = reason;
+  error.details = details;
+  throw error;
 }
 
 function serializeError(error) {

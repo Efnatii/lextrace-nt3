@@ -70,6 +70,12 @@ const AI_SESSION_PERSISTENCE_PROFILES = [
   { maxSessions: 16, maxMessages: 4, maxQueueItems: 2 },
   { maxSessions: 0, maxMessages: 0, maxQueueItems: 0 }
 ] as const;
+const LOG_PERSISTENCE_MAX_ENTRIES = [250, 100, 25, 0] as const;
+const PERSISTED_MESSAGE_TEXT_MAX_LENGTH = 512;
+const PERSISTED_SUMMARY_MAX_LENGTH = 256;
+const PERSISTED_LAST_ERROR_MAX_LENGTH = 512;
+const PERSISTED_PAGE_URL_MAX_LENGTH = 512;
+const PERSISTED_QUEUE_TEXT_MAX_LENGTH = 256;
 
 const bootId = crypto.randomUUID();
 let bootstrapPromise: Promise<void> | null = null;
@@ -776,9 +782,7 @@ async function handleRuntimeStream(message: RuntimeStreamMessage): Promise<void>
   if (message.logEntry) {
     if (isLogLevelEnabled(message.logEntry.level, configCache.logging.level)) {
       logs = [...logs.slice(-(configCache.logging.maxEntries - 1)), message.logEntry];
-      await chrome.storage.session.set({
-        [STORAGE_KEYS.logs]: logs
-      });
+      await persistLogs();
     }
   }
 
@@ -1409,6 +1413,29 @@ async function persistAiSessions(): Promise<void> {
   console.warn("Failed to persist AI sessions to chrome.storage.session.", lastError);
 }
 
+async function persistLogs(): Promise<void> {
+  let lastError: unknown = null;
+  const entryLimits = Array.from(
+    new Set([
+      Math.max(0, Math.min(logs.length, configCache.logging.maxEntries)),
+      ...LOG_PERSISTENCE_MAX_ENTRIES
+    ])
+  );
+
+  for (const maxEntries of entryLimits) {
+    try {
+      await chrome.storage.session.set({
+        [STORAGE_KEYS.logs]: maxEntries > 0 ? logs.slice(-maxEntries) : []
+      });
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  console.warn("Failed to persist runtime logs to chrome.storage.session.", lastError);
+}
+
 function buildPersistedAiSessions(profile: {
   maxSessions: number;
   maxMessages: number;
@@ -1421,11 +1448,67 @@ function buildPersistedAiSessions(profile: {
   return [...aiSessions.values()]
     .sort((left, right) => compareAiSessionPersistencePriority(left, right))
     .slice(0, profile.maxSessions)
-    .map((session) => ({
-      ...session,
-      messages: profile.maxMessages > 0 ? session.messages.slice(-profile.maxMessages) : [],
-      queue: profile.maxQueueItems > 0 ? session.queue.slice(-profile.maxQueueItems) : []
-    }));
+    .map((session) => buildPersistedAiSession(session, profile));
+}
+
+function buildPersistedAiSession(
+  session: AiChatPageSession,
+  profile: {
+    maxMessages: number;
+    maxQueueItems: number;
+  }
+): AiChatPageSession {
+  return {
+    ...session,
+    pageUrlSample: trimPersistedNullableText(session.pageUrlSample, PERSISTED_PAGE_URL_MAX_LENGTH),
+    lastError: trimPersistedNullableText(session.lastError, PERSISTED_LAST_ERROR_MAX_LENGTH),
+    messages: profile.maxMessages > 0
+      ? session.messages.slice(-profile.maxMessages).map((message) => ({
+        ...message,
+        text: trimPersistedRequiredText(message.text, PERSISTED_MESSAGE_TEXT_MAX_LENGTH),
+        summary: trimPersistedOptionalText(message.summary, PERSISTED_SUMMARY_MAX_LENGTH),
+        meta: undefined
+      }))
+      : [],
+    queue: profile.maxQueueItems > 0
+      ? session.queue.slice(-profile.maxQueueItems).map((item) => ({
+        ...item,
+        text: trimPersistedRequiredText(item.text, PERSISTED_QUEUE_TEXT_MAX_LENGTH)
+      }))
+      : [],
+    status: {
+      ...session.status,
+      pageUrlSample: trimPersistedNullableText(session.status.pageUrlSample, PERSISTED_PAGE_URL_MAX_LENGTH),
+      lastError: trimPersistedNullableText(session.status.lastError, PERSISTED_LAST_ERROR_MAX_LENGTH),
+      rateLimits: undefined,
+      currentModelBudget: null,
+      modelBudgets: {}
+    }
+  };
+}
+
+function trimPersistedRequiredText(value: string, maxLength: number): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+
+  return `${value.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function trimPersistedNullableText(value: string | null, maxLength: number): string | null {
+  if (value === null) {
+    return value;
+  }
+
+  return trimPersistedRequiredText(value, maxLength);
+}
+
+function trimPersistedOptionalText(value: string | null | undefined, maxLength: number): string | null | undefined {
+  if (typeof value !== "string") {
+    return value;
+  }
+
+  return trimPersistedRequiredText(value, maxLength);
 }
 
 function compareAiSessionPersistencePriority(left: AiChatPageSession, right: AiChatPageSession): number {
@@ -1629,9 +1712,7 @@ async function appendLog(input: unknown): Promise<void> {
   }
 
   logs = [...logs.slice(-(configCache.logging.maxEntries - 1)), entry];
-  await chrome.storage.session.set({
-    [STORAGE_KEYS.logs]: logs
-  });
+  await persistLogs();
   broadcastStream({
     stream: "runtime",
     event: STREAM_EVENTS.log,
@@ -1647,9 +1728,7 @@ async function appendLog(input: unknown): Promise<void> {
 async function syncConfigSideEffects(patch: ExtensionConfigPatch): Promise<void> {
   if (logs.length > configCache.logging.maxEntries) {
     logs = logs.slice(-configCache.logging.maxEntries);
-    await chrome.storage.session.set({
-      [STORAGE_KEYS.logs]: logs
-    });
+    await persistLogs();
   }
 
   if (!nativeBridge.connected) {
