@@ -4,6 +4,8 @@ import path from "node:path";
 import { ensureDir, paths, writeJson } from "./lib/common.mjs";
 import {
   AI_UI_PATHS,
+  BASE_CHAT_INSTRUCTIONS,
+  BASE_COMPACTION_INSTRUCTIONS,
   COMMANDS,
   OPENAI_API_KEY_ENV_VAR_NAME,
   STRUCTURED_DESCRIPTION,
@@ -34,6 +36,7 @@ import {
   readPopupControlState,
   readValueAtPath,
   redactSensitiveValue,
+  resetConfigScope,
   resetAllSessions,
   restoreBaselineAiConfig,
   sessionHasAssistantJson,
@@ -65,8 +68,12 @@ const FULL_RUN_PHASE_GROUPS = [
   ["baseline_regression", "ui_roundtrip", "host_sync"],
   ["scope_precedence", "status_reflection", "session_management"],
   ["legacy_compat_extra", "popup_modal"],
+  ["invalid_patch_shapes_extra", "popup_inline_invalid_extra", "popup_modal_state_extra", "scope_reset_extra"],
   ["numeric_boundaries", "model_selection"],
-  ["transport_output", "compaction_matrix", "queue_rate_limits", "recovery_stability"]
+  ["transport_output"],
+  ["compaction_matrix"],
+  ["queue_rate_limits"],
+  ["recovery_stability"]
 ];
 
 async function main() {
@@ -883,6 +890,462 @@ function getPathCaseDefinitions() {
   ];
 }
 
+function getBaselineValueForPath(pathName, state) {
+  switch (pathName) {
+    case "ai.openAiApiKey":
+      return null;
+    case "ai.allowedModels":
+      return [state.selectedModel];
+    case "ai.chat.model":
+      return state.selectedModel;
+    case "ai.chat.streamingEnabled":
+      return true;
+    case "ai.chat.instructions":
+      return BASE_CHAT_INSTRUCTIONS;
+    case "ai.chat.structuredOutput.name":
+      return STRUCTURED_NAME;
+    case "ai.chat.structuredOutput.description":
+      return STRUCTURED_DESCRIPTION;
+    case "ai.chat.structuredOutput.schema":
+      return "";
+    case "ai.chat.structuredOutput.strict":
+      return true;
+    case "ai.compaction.enabled":
+      return true;
+    case "ai.compaction.streamingEnabled":
+      return true;
+    case "ai.compaction.modelOverride":
+      return state.selectedModel;
+    case "ai.compaction.instructions":
+      return BASE_COMPACTION_INSTRUCTIONS;
+    case "ai.compaction.triggerPromptTokens":
+      return 64;
+    case "ai.compaction.preserveRecentTurns":
+      return 1;
+    case "ai.compaction.maxPassesPerPage":
+      return 2;
+    case "ai.rateLimits.reserveOutputTokens":
+      return 512;
+    case "ai.rateLimits.maxQueuedPerPage":
+      return 2;
+    case "ai.rateLimits.maxQueuedGlobal":
+      return 3;
+    default:
+      throw new Error(`No baseline AI value is registered for ${pathName}.`);
+  }
+}
+
+async function readOpenModalTextareaValue(driver) {
+  const value = await driver.executeScript(`
+    const textarea = document.querySelector('.popup-modal-textarea');
+    return textarea instanceof HTMLTextAreaElement ? textarea.value : null;
+  `);
+  assert.equal(typeof value, "string", "Popup modal textarea is unavailable.");
+  return value;
+}
+
+async function seedModalValue(context, definition) {
+  const { driver } = context.session;
+  await patchConfig(driver, buildPatchFromPath(definition.path, definition.initialValue));
+
+  if (definition.usesEnv) {
+    await waitFor(async () => {
+      const currentValue = await getUserEnvironmentVariableAsync(OPENAI_API_KEY_ENV_VAR_NAME);
+      return currentValue === definition.initialValue;
+    }, 15000, `${definition.path} seed value did not reach the managed environment variable.`);
+  }
+}
+
+async function assertModalValuePersisted(context, definition, expectedValue) {
+  const { driver } = context.session;
+  if (definition.usesEnv) {
+    const currentValue = await getUserEnvironmentVariableAsync(OPENAI_API_KEY_ENV_VAR_NAME);
+    assert.equal(currentValue, expectedValue, `${definition.path} modal value did not persist in the managed environment variable.`);
+    return;
+  }
+
+  const snapshot = await getRuntimeSnapshot(driver);
+  const actualValue = readValueAtPath(snapshot.config, definition.path);
+  assertPathValueMatches(definition.path, actualValue, expectedValue, `${definition.path} modal value did not persist.`);
+}
+
+function createScopeResetExtraCases() {
+  const definitions = [
+    {
+      path: "ai.allowedModels",
+      requiresAlternateModel: true,
+      getValue: (state) => sortModelRules([state.selectedModel, state.alternateModel])
+    },
+    {
+      path: "ai.chat.model",
+      getValue: (state) => state.alternateModel ?? null
+    },
+    {
+      path: "ai.chat.streamingEnabled",
+      getValue: () => false
+    },
+    {
+      path: "ai.chat.instructions",
+      getValue: () => "Scope reset session chat instructions.\nSession override should disappear after reset."
+    },
+    {
+      path: "ai.chat.structuredOutput.name",
+      getValue: () => "scope_reset_structured_reply"
+    },
+    {
+      path: "ai.chat.structuredOutput.description",
+      getValue: () => "Scope reset structured description."
+    },
+    {
+      path: "ai.chat.structuredOutput.schema",
+      getValue: () => STRUCTURED_SCHEMA
+    },
+    {
+      path: "ai.chat.structuredOutput.strict",
+      getValue: () => false
+    },
+    {
+      path: "ai.compaction.enabled",
+      getValue: () => false
+    },
+    {
+      path: "ai.compaction.streamingEnabled",
+      getValue: () => false
+    },
+    {
+      path: "ai.compaction.modelOverride",
+      getValue: () => null
+    },
+    {
+      path: "ai.compaction.instructions",
+      getValue: () => "Scope reset compaction instructions.\nCollapse aggressively."
+    },
+    {
+      path: "ai.compaction.triggerPromptTokens",
+      getValue: () => 32
+    },
+    {
+      path: "ai.compaction.preserveRecentTurns",
+      getValue: () => 0
+    },
+    {
+      path: "ai.compaction.maxPassesPerPage",
+      getValue: () => 1
+    },
+    {
+      path: "ai.rateLimits.reserveOutputTokens",
+      getValue: () => 1
+    },
+    {
+      path: "ai.rateLimits.maxQueuedPerPage",
+      getValue: () => 1
+    },
+    {
+      path: "ai.rateLimits.maxQueuedGlobal",
+      getValue: () => 1
+    }
+  ];
+
+  return definitions.map((definition) => ({
+    caseId: `scope.reset.${definition.path.replace(/^ai\./, "").replace(/\./g, "-")}.session-reset-restores-baseline`,
+    group: "scope_reset_extra",
+    prepare: "baseline",
+    requiresSelectedModel: true,
+    requiresAlternateModel: Boolean(definition.requiresAlternateModel),
+    execute: async (context) => {
+      const { driver } = context.session;
+      const overrideValue = definition.getValue(context.state);
+      const baselineValue = getBaselineValueForPath(definition.path, context.state);
+      await patchConfigForScope(driver, "session", buildPatchFromPath(definition.path, overrideValue));
+
+      const overrideSnapshot = await getRuntimeSnapshot(driver);
+      assertPathValueMatches(
+        definition.path,
+        readValueAtPath(overrideSnapshot.config, definition.path),
+        overrideValue,
+        `${definition.path} session override did not apply before reset.`
+      );
+
+      await resetConfigScope(driver, "session");
+
+      const restoredSnapshot = await getRuntimeSnapshot(driver);
+      assertPathValueMatches(
+        definition.path,
+        readValueAtPath(restoredSnapshot.config, definition.path),
+        baselineValue,
+        `${definition.path} did not return to the baseline value after resetting the session scope.`
+      );
+
+      const buttonText =
+        definition.path === "ai.chat.structuredOutput.schema" && baselineValue === ""
+          ? await readButtonText(driver, definition.path)
+          : await assertButtonReflectsValue(driver, definition.path, baselineValue);
+
+      return {
+        configPath: definition.path,
+        configPatch: {
+          sessionOverride: buildPatchFromPath(definition.path, overrideValue)
+        },
+        assertions: [
+          "A divergent session-scope override was applied.",
+          "resetConfigScope(session) restored the baseline effective value.",
+          "Popup button text returned to the baseline state."
+        ],
+        artifacts: {
+          buttonText
+        }
+      };
+    }
+  }));
+}
+
+function createInvalidPatchShapeExtraCases() {
+  const definitions = [
+    { path: "ai.openAiApiKey", invalidValue: 123, requiresSelectedModel: false },
+    { path: "ai.allowedModels", invalidValue: 123, requiresSelectedModel: true },
+    { path: "ai.chat.model", invalidValue: 123, requiresSelectedModel: true },
+    { path: "ai.chat.streamingEnabled", invalidValue: 123, requiresSelectedModel: true },
+    { path: "ai.chat.instructions", invalidValue: 123, requiresSelectedModel: true },
+    { path: "ai.chat.structuredOutput.name", invalidValue: 123, requiresSelectedModel: true },
+    { path: "ai.chat.structuredOutput.description", invalidValue: 123, requiresSelectedModel: true },
+    { path: "ai.chat.structuredOutput.schema", invalidValue: 123, requiresSelectedModel: true },
+    { path: "ai.chat.structuredOutput.strict", invalidValue: 123, requiresSelectedModel: true },
+    { path: "ai.compaction.enabled", invalidValue: 123, requiresSelectedModel: true },
+    { path: "ai.compaction.streamingEnabled", invalidValue: 123, requiresSelectedModel: true },
+    { path: "ai.compaction.modelOverride", invalidValue: 123, requiresSelectedModel: true },
+    { path: "ai.compaction.instructions", invalidValue: 123, requiresSelectedModel: true },
+    { path: "ai.compaction.triggerPromptTokens", invalidValue: 32.5, requiresSelectedModel: true },
+    { path: "ai.compaction.preserveRecentTurns", invalidValue: 1.5, requiresSelectedModel: true },
+    { path: "ai.compaction.maxPassesPerPage", invalidValue: 1.5, requiresSelectedModel: true },
+    { path: "ai.rateLimits.reserveOutputTokens", invalidValue: 1.5, requiresSelectedModel: true },
+    { path: "ai.rateLimits.maxQueuedPerPage", invalidValue: 1.5, requiresSelectedModel: true },
+    { path: "ai.rateLimits.maxQueuedGlobal", invalidValue: 1.5, requiresSelectedModel: true }
+  ];
+
+  return definitions.map((definition) => ({
+    caseId: `patch.invalid-shape.${definition.path.replace(/^ai\./, "").replace(/\./g, "-")}.rejected`,
+    group: "invalid_patch_shapes_extra",
+    prepare: "baseline",
+    requiresSelectedModel: Boolean(definition.requiresSelectedModel),
+    execute: async (context) => {
+      const { driver } = context.session;
+      const snapshotBefore = await getRuntimeSnapshot(driver);
+      const previousValue = readValueAtPath(snapshotBefore.config, definition.path);
+      const invalidPatch = buildPatchFromPath(definition.path, definition.invalidValue);
+      const errorResult = await patchConfigExpectingError(driver, invalidPatch);
+      assert.ok(errorResult.message.length > 0, `${definition.path} invalid patch did not return an error message.`);
+
+      const snapshotAfter = await getRuntimeSnapshot(driver);
+      assertPathValueMatches(
+        definition.path,
+        readValueAtPath(snapshotAfter.config, definition.path),
+        previousValue,
+        `${definition.path} changed after an invalid-shape patch was rejected.`
+      );
+
+      return {
+        configPath: definition.path,
+        configPatch: {
+          invalid: invalidPatch
+        },
+        assertions: [
+          "config.patch rejected the invalid-shaped payload.",
+          "The previous effective value remained active after rejection."
+        ],
+        artifacts: {
+          errorCode: errorResult.code,
+          errorMessage: errorResult.message
+        }
+      };
+    }
+  }));
+}
+
+function createPopupModalStateExtraCases() {
+  const definitions = [
+    {
+      path: "ai.openAiApiKey",
+      initialValue: TEMP_MANAGED_API_KEY,
+      usesEnv: true
+    },
+    {
+      path: "ai.chat.instructions",
+      initialValue: "Popup modal chat instructions.\nPreserve this exact text."
+    },
+    {
+      path: "ai.chat.structuredOutput.description",
+      initialValue: "Popup modal structured description."
+    },
+    {
+      path: "ai.chat.structuredOutput.schema",
+      initialValue: STRUCTURED_SCHEMA
+    },
+    {
+      path: "ai.compaction.instructions",
+      initialValue: "Popup modal compaction instructions.\nPreserve this exact text."
+    }
+  ];
+
+  return [
+    ...definitions.map((definition) => ({
+      caseId: `popup.modal-state.${definition.path.replace(/^ai\./, "").replace(/\./g, "-")}.cancel-preserves-current`,
+      group: "popup_modal_state_extra",
+      prepare: "baseline",
+      requiresSelectedModel: !definition.usesEnv,
+      execute: async (context) => {
+        const { driver } = context.session;
+        await seedModalValue(context, definition);
+        await openConfigTab(driver);
+        await openConfigPanel(driver, definition.path);
+        await closePopupModal(driver);
+        await assertModalValuePersisted(context, definition, definition.initialValue);
+        return {
+          configPath: definition.path,
+          assertions: ["Closing the modal without saving preserved the existing value."]
+        };
+      }
+    })),
+    ...definitions.map((definition) => ({
+      caseId: `popup.modal-state.${definition.path.replace(/^ai\./, "").replace(/\./g, "-")}.reopen-shows-current`,
+      group: "popup_modal_state_extra",
+      prepare: "baseline",
+      requiresSelectedModel: !definition.usesEnv,
+      execute: async (context) => {
+        const { driver } = context.session;
+        await seedModalValue(context, definition);
+        await openConfigTab(driver);
+        await openConfigPanel(driver, definition.path);
+        const textareaValue = await readOpenModalTextareaValue(driver);
+        assert.equal(textareaValue, definition.initialValue, `${definition.path} modal did not reopen with the current saved value.`);
+        await closePopupModal(driver);
+        return {
+          configPath: definition.path,
+          assertions: ["Reopening the modal showed the current saved value."],
+          artifacts: {
+            textareaValue
+          }
+        };
+      }
+    })),
+    ...definitions
+      .filter((definition) => !definition.usesEnv)
+      .map((definition) => ({
+        caseId: `popup.modal-state.${definition.path.replace(/^ai\./, "").replace(/\./g, "-")}.clear-to-empty`,
+        group: "popup_modal_state_extra",
+        prepare: "baseline",
+        requiresSelectedModel: true,
+        execute: async (context) => {
+          const { driver } = context.session;
+          await seedModalValue(context, definition);
+          await openConfigTab(driver);
+          await setModalTextValue(driver, definition.path, "");
+          await assertModalValuePersisted(context, definition, "");
+          return {
+            configPath: definition.path,
+            assertions: ["Saving an empty modal value cleared the stored field."]
+          };
+        }
+      }))
+  ];
+}
+
+function createPopupInlineInvalidExtraCases() {
+  const definitions = [
+    {
+      path: "ai.compaction.triggerPromptTokens",
+      valid: 32,
+      invalidInputs: [
+        { suffix: "below-min", value: "31" },
+        { suffix: "fractional", value: "32.5" }
+      ]
+    },
+    {
+      path: "ai.compaction.preserveRecentTurns",
+      valid: 0,
+      invalidInputs: [
+        { suffix: "below-min", value: "-1" },
+        { suffix: "fractional", value: "1.5" }
+      ]
+    },
+    {
+      path: "ai.compaction.maxPassesPerPage",
+      valid: 1,
+      invalidInputs: [
+        { suffix: "below-min", value: "0" },
+        { suffix: "fractional", value: "1.5" }
+      ]
+    },
+    {
+      path: "ai.rateLimits.reserveOutputTokens",
+      valid: 1,
+      invalidInputs: [
+        { suffix: "below-min", value: "0" },
+        { suffix: "fractional", value: "1.5" }
+      ]
+    },
+    {
+      path: "ai.rateLimits.maxQueuedPerPage",
+      valid: 1,
+      invalidInputs: [
+        { suffix: "below-min", value: "0" },
+        { suffix: "fractional", value: "1.5" }
+      ]
+    },
+    {
+      path: "ai.rateLimits.maxQueuedGlobal",
+      valid: 1,
+      invalidInputs: [
+        { suffix: "below-min", value: "0" },
+        { suffix: "fractional", value: "1.5" }
+      ]
+    }
+  ];
+
+  return definitions.flatMap((definition) =>
+    definition.invalidInputs.map((invalidInput) => ({
+      caseId: `popup.inline-invalid.${definition.path.replace(/^ai\./, "").replace(/\./g, "-")}.${invalidInput.suffix}`,
+      group: "popup_inline_invalid_extra",
+      prepare: "baseline",
+      requiresSelectedModel: true,
+      execute: async (context) => {
+        const { driver } = context.session;
+        await patchConfig(driver, buildPatchFromPath(definition.path, definition.valid));
+        await openConfigTab(driver);
+        const beforeControlState = await readPopupControlState(driver);
+        await setInlineValue(driver, definition.path, invalidInput.value);
+        const afterControlState = await readPopupControlState(driver);
+        assert.ok(afterControlState.text.length > 0, `${definition.path} invalid inline edit did not produce a control message.`);
+        assert.ok(
+          afterControlState.text !== beforeControlState.text ||
+            afterControlState.tone !== beforeControlState.tone ||
+            afterControlState.tone.length > 0,
+          `${definition.path} invalid inline edit did not visibly change popup control state.`
+        );
+
+        const snapshot = await getRuntimeSnapshot(driver);
+        assertPathValueMatches(
+          definition.path,
+          readValueAtPath(snapshot.config, definition.path),
+          definition.valid,
+          `${definition.path} changed after an invalid inline edit.`
+        );
+        const buttonText = await assertButtonReflectsValue(driver, definition.path, definition.valid);
+        return {
+          configPath: definition.path,
+          assertions: [
+            "Popup inline editor surfaced a validation/control message for the invalid input.",
+            "The last valid numeric value remained active after the invalid edit."
+          ],
+          artifacts: {
+            controlState: afterControlState,
+            buttonText
+          }
+        };
+      }
+    }))
+  );
+}
+
 function createBalancedCases() {
   return [
     ...createUiRoundtripCases(),
@@ -892,6 +1355,10 @@ function createBalancedCases() {
     ...createSessionManagementCases(),
     ...createLegacyCompatExtraCases(),
     ...createPopupModalCases(),
+    ...createScopeResetExtraCases(),
+    ...createInvalidPatchShapeExtraCases(),
+    ...createPopupModalStateExtraCases(),
+    ...createPopupInlineInvalidExtraCases(),
     ...createNumericBoundaryCases(),
     ...createModelSelectionCases(),
     ...createTransportCases(),
