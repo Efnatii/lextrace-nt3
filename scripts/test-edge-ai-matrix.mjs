@@ -738,6 +738,8 @@ async function verifyHostValue(pathName, expected, state) {
     "ai.compaction.triggerPromptTokens": "aiConfig.compaction.triggerPromptTokens",
     "ai.compaction.preserveRecentTurns": "aiConfig.compaction.preserveRecentTurns",
     "ai.compaction.maxPassesPerPage": "aiConfig.compaction.maxPassesPerPage",
+    "ai.promptCaching.routing": "aiConfig.promptCaching.routing",
+    "ai.promptCaching.retention": "aiConfig.promptCaching.retention",
     "ai.rateLimits.reserveOutputTokens": "aiConfig.rateLimits.reserveOutputTokens",
     "ai.rateLimits.maxQueuedPerPage": "aiConfig.rateLimits.maxQueuedPerPage",
     "ai.rateLimits.maxQueuedGlobal": "aiConfig.rateLimits.maxQueuedGlobal"
@@ -870,6 +872,18 @@ function getPathCaseDefinitions() {
       getValue: () => 1
     },
     {
+      path: "ai.promptCaching.routing",
+      editor: "select",
+      requiresSelectedModel: true,
+      getValue: () => "provider_default"
+    },
+    {
+      path: "ai.promptCaching.retention",
+      editor: "select",
+      requiresSelectedModel: true,
+      getValue: () => "24h"
+    },
+    {
       path: "ai.rateLimits.reserveOutputTokens",
       editor: "inline",
       requiresSelectedModel: true,
@@ -924,6 +938,10 @@ function getBaselineValueForPath(pathName, state) {
       return 1;
     case "ai.compaction.maxPassesPerPage":
       return 2;
+    case "ai.promptCaching.routing":
+      return "stable_session_prefix";
+    case "ai.promptCaching.retention":
+      return "in_memory";
     case "ai.rateLimits.reserveOutputTokens":
       return 512;
     case "ai.rateLimits.maxQueuedPerPage":
@@ -1117,6 +1135,8 @@ function createInvalidPatchShapeExtraCases() {
     { path: "ai.compaction.triggerPromptTokens", invalidValue: 32.5, requiresSelectedModel: true },
     { path: "ai.compaction.preserveRecentTurns", invalidValue: 1.5, requiresSelectedModel: true },
     { path: "ai.compaction.maxPassesPerPage", invalidValue: 1.5, requiresSelectedModel: true },
+    { path: "ai.promptCaching.routing", invalidValue: 123, requiresSelectedModel: true },
+    { path: "ai.promptCaching.retention", invalidValue: 123, requiresSelectedModel: true },
     { path: "ai.rateLimits.reserveOutputTokens", invalidValue: 1.5, requiresSelectedModel: true },
     { path: "ai.rateLimits.maxQueuedPerPage", invalidValue: 1.5, requiresSelectedModel: true },
     { path: "ai.rateLimits.maxQueuedGlobal", invalidValue: 1.5, requiresSelectedModel: true }
@@ -2255,9 +2275,9 @@ function createSessionManagementCases() {
         await sendCommand(context.session.driver, COMMANDS.aiChatReset, { pageKey });
         const status = await getAiStatus(context.session.driver, pageUrl);
         assert.equal(status.status.requestState, "idle", "Reset idle session did not remain idle.");
-        assert.ok(status.messages.some((message) => message.kind === "reset"), "Reset idle session did not record a reset message.");
+        assert.equal(status.messages.length, 0, "Reset idle session did not clear the transcript.");
         return {
-          assertions: ["Resetting an idle session recorded a reset marker and left the page idle."]
+          assertions: ["Resetting an idle session cleared the transcript and left the page idle."]
         };
       }
     },
@@ -2272,9 +2292,9 @@ function createSessionManagementCases() {
         await sendCommand(context.session.driver, COMMANDS.aiChatReset, { pageKey });
         await sendCommand(context.session.driver, COMMANDS.aiChatReset, { pageKey });
         const status = await getAiStatus(context.session.driver, pageUrl);
-        assert.equal(status.messages.filter((message) => message.kind === "reset").length, 1, "Double reset produced duplicate reset markers.");
+        assert.equal(status.messages.length, 0, "Double reset did not preserve an empty transcript.");
         return {
-          assertions: ["Repeated reset preserved a single reset marker in the session."]
+          assertions: ["Repeated reset preserved an empty transcript."]
         };
       }
     },
@@ -2307,8 +2327,8 @@ function createSessionManagementCases() {
         await resetAllSessions(context.session.driver);
         const statusA = await getAiStatus(context.session.driver, pageUrlA);
         const statusB = await getAiStatus(context.session.driver, pageUrlB);
-        assert.ok(statusA.messages.some((message) => message.kind === "reset"), "resetAllSessions did not record a reset marker for page A.");
-        assert.ok(statusB.messages.some((message) => message.kind === "reset"), "resetAllSessions did not record a reset marker for page B.");
+        assert.equal(statusA.messages.length, 0, "resetAllSessions did not clear the transcript for page A.");
+        assert.equal(statusB.messages.length, 0, "resetAllSessions did not clear the transcript for page B.");
         return {
           assertions: ["resetAllSessions reset multiple idle page sessions."]
         };
@@ -2352,9 +2372,10 @@ function createSessionManagementCases() {
         const pageKey = normalizePageKey(pageUrl);
         await sendCommand(context.session.driver, COMMANDS.aiChatReset, { pageKey });
         const status = await getAiStatus(context.session.driver, pageUrl);
-        assert.ok(status.messages.some((message) => message.kind === "reset"), "Reset without prior status did not create a reset session.");
+        assert.equal(status.status.requestState, "idle", "Reset without prior status did not create an idle session.");
+        assert.equal(status.messages.length, 0, "Reset without prior status did not keep the transcript empty.");
         return {
-          assertions: ["ai.chat.reset created a reset marker even for a previously unseen page."]
+          assertions: ["ai.chat.reset created an idle empty session even for a previously unseen page."]
         };
       }
     },
@@ -2916,7 +2937,9 @@ function createCompactionCases() {
               sessionHasAssistantText(candidate, caseToken)
             );
 
-            const compactionMessages = sessionState.messages.filter((message) => message.kind === "compaction");
+            const compactionMessages = sessionState.messages.filter((message) =>
+              message.kind === "compaction-request" || message.kind === "compaction-result"
+            );
             if (enabled) {
               assert.ok(compactionMessages.length > 0, "Compaction was enabled but no compaction event was emitted.");
             } else {
@@ -3308,7 +3331,10 @@ function createRecoveryCases() {
           );
         }
         const sessionState = await getAiStatus(driver, pageUrl);
-        assert.ok(sessionState.messages.some((message) => message.kind === "compaction"), "Compaction loop case did not emit compaction messages.");
+        assert.ok(
+          sessionState.messages.some((message) => message.kind === "compaction-result"),
+          "Compaction loop case did not emit compaction result messages."
+        );
         return {
           pageUrl,
           pageKey,

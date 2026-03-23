@@ -2,6 +2,8 @@ import { z } from "zod";
 
 import {
   AiAllowedModelRuleSchema,
+  formatAiPromptCacheRetentionLabel,
+  formatAiPromptCacheRoutingLabel,
   type AiModelSelection,
   AiModelSelectionSchema,
   normalizeAiModelSelection,
@@ -67,6 +69,20 @@ function createSelectOptions(values: readonly string[]): ConfigFieldOption[] {
   }));
 }
 
+function createBooleanOptions(): ConfigFieldOption[] {
+  return [
+    { label: "включено", value: "true" },
+    { label: "выключено", value: "false" }
+  ];
+}
+
+function createNamedOptions(labelByValue: Record<string, string>): ConfigFieldOption[] {
+  return Object.entries(labelByValue).map(([value, label]) => ({
+    label,
+    value
+  }));
+}
+
 function createDescriptor(
   path: string,
   scope: ConfigFieldScope,
@@ -89,20 +105,49 @@ function createDescriptor(
 }
 
 export const editableConfigFields = [
-  createDescriptor("ui.popupActiveTab", "session", "enum", PopupTabSchema, createSelectOptions(PopupTabSchema.options)),
-  createDescriptor("ui.overlay.activeTab", "session", "enum", OverlayTabSchema, createSelectOptions(OverlayTabSchema.options)),
+  createDescriptor(
+    "ui.popupActiveTab",
+    "session",
+    "enum",
+    PopupTabSchema,
+    createNamedOptions({
+      control: "управление",
+      config: "настройки"
+    })
+  ),
+  createDescriptor(
+    "ui.overlay.activeTab",
+    "session",
+    "enum",
+    OverlayTabSchema,
+    createNamedOptions({
+      console: "консоль",
+      chat: "чат"
+    })
+  ),
   createDescriptor(
     "ui.overlay.visible",
     "session",
     "boolean",
     z.boolean(),
-    createSelectOptions(["true", "false"])
+    createBooleanOptions()
   ),
   createDescriptor("ui.overlay.width", "local", "number", OverlayWidthSchema),
   createDescriptor("ui.overlay.height", "local", "number", OverlayHeightSchema),
   createDescriptor("ui.overlay.left", "local", "number", NonNegativeIntegerSchema),
   createDescriptor("ui.overlay.top", "local", "number", NonNegativeIntegerSchema),
-  createDescriptor("logging.level", "local", "enum", LogLevelSchema, createSelectOptions(LogLevelSchema.options)),
+  createDescriptor(
+    "logging.level",
+    "local",
+    "enum",
+    LogLevelSchema,
+    createNamedOptions({
+      debug: "отладка",
+      info: "инфо",
+      warn: "предупреждение",
+      error: "ошибка"
+    })
+  ),
   createDescriptor("logging.maxEntries", "local", "number", MaxEntriesSchema),
   createDescriptor("logging.collapseThreshold", "local", "number", CollapseThresholdSchema),
   createDescriptor("runtime.nativeHostName", "local", "string", NonEmptyStringSchema),
@@ -116,7 +161,7 @@ export const editableConfigFields = [
     "local",
     "boolean",
     z.boolean(),
-    createSelectOptions(["true", "false"])
+    createBooleanOptions()
   ),
   createDescriptor(
     "ai.openAiApiKey",
@@ -141,7 +186,7 @@ export const editableConfigFields = [
     "local",
     "boolean",
     z.boolean(),
-      createSelectOptions(["true", "false"])
+    createBooleanOptions()
   ),
   createDescriptor("ai.chat.instructions", "local", "string", z.string(), undefined, "modal-text"),
   createDescriptor("ai.chat.structuredOutput.name", "local", "string", z.string()),
@@ -152,21 +197,21 @@ export const editableConfigFields = [
     "local",
     "boolean",
     z.boolean(),
-    createSelectOptions(["true", "false"])
+    createBooleanOptions()
   ),
   createDescriptor(
     "ai.compaction.enabled",
     "local",
     "boolean",
-      z.boolean(),
-      createSelectOptions(["true", "false"])
+    z.boolean(),
+    createBooleanOptions()
   ),
   createDescriptor(
     "ai.compaction.streamingEnabled",
     "local",
     "boolean",
-      z.boolean(),
-      createSelectOptions(["true", "false"])
+    z.boolean(),
+    createBooleanOptions()
   ),
   createDescriptor(
     "ai.compaction.modelOverride",
@@ -180,6 +225,26 @@ export const editableConfigFields = [
   createDescriptor("ai.compaction.triggerPromptTokens", "local", "number", AiTokenThresholdSchema),
   createDescriptor("ai.compaction.preserveRecentTurns", "local", "number", NonNegativeIntegerSchema),
   createDescriptor("ai.compaction.maxPassesPerPage", "local", "number", AiPositiveIntegerSchema),
+  createDescriptor(
+    "ai.promptCaching.routing",
+    "local",
+    "enum",
+    z.enum(["stable_session_prefix", "provider_default"]),
+    createNamedOptions({
+      stable_session_prefix: formatAiPromptCacheRoutingLabel("stable_session_prefix"),
+      provider_default: formatAiPromptCacheRoutingLabel("provider_default")
+    })
+  ),
+  createDescriptor(
+    "ai.promptCaching.retention",
+    "local",
+    "enum",
+    z.enum(["in_memory", "24h"]),
+    createNamedOptions({
+      in_memory: formatAiPromptCacheRetentionLabel("in_memory"),
+      "24h": formatAiPromptCacheRetentionLabel("24h")
+    })
+  ),
   createDescriptor("ai.rateLimits.reserveOutputTokens", "local", "number", AiPositiveIntegerSchema),
   createDescriptor("ai.rateLimits.maxQueuedPerPage", "local", "number", AiPositiveIntegerSchema),
   createDescriptor("ai.rateLimits.maxQueuedGlobal", "local", "number", AiPositiveIntegerSchema),
@@ -189,13 +254,31 @@ export const editableConfigFields = [
     "local",
     "boolean",
     z.boolean(),
-    createSelectOptions(["true", "false"])
+    createBooleanOptions()
   )
 ] as const satisfies readonly EditableConfigFieldDescriptor[];
 
 const editableConfigFieldMap = new Map<string, EditableConfigFieldDescriptor>(
   editableConfigFields.map((descriptor) => [descriptor.path, descriptor])
 );
+
+export function getEditableConfigPaths(options?: {
+  prefix?: string;
+  includeSensitive?: boolean;
+}): string[] {
+  const prefix = options?.prefix?.trim() ?? "";
+  const includeSensitive = options?.includeSensitive ?? true;
+
+  return editableConfigFields
+    .filter((descriptor) => {
+      if (!includeSensitive && descriptor.sensitive) {
+        return false;
+      }
+
+      return !prefix || descriptor.path.startsWith(prefix);
+    })
+    .map((descriptor) => descriptor.path);
+}
 
 export function getEditableConfigField(path: string): EditableConfigFieldDescriptor | undefined {
   return editableConfigFieldMap.get(path);
@@ -209,10 +292,11 @@ const configKeyOrderRegistry = new Map<string, readonly string[]>([
   ["", ["ui", "ai", "logging", "runtime", "protocol", "test"]],
   ["ui", ["popupActiveTab", "overlay"]],
   ["ui.overlay", ["activeTab", "visible", "width", "height", "left", "top"]],
-  ["ai", ["openAiApiKey", "allowedModels", "chat", "compaction", "rateLimits"]],
+  ["ai", ["openAiApiKey", "allowedModels", "chat", "compaction", "promptCaching", "rateLimits"]],
   ["ai.chat", ["model", "streamingEnabled", "instructions", "structuredOutput"]],
   ["ai.chat.structuredOutput", ["name", "description", "schema", "strict"]],
   ["ai.compaction", ["enabled", "streamingEnabled", "modelOverride", "instructions", "triggerPromptTokens", "preserveRecentTurns", "maxPassesPerPage"]],
+  ["ai.promptCaching", ["routing", "retention"]],
   ["ai.rateLimits", ["reserveOutputTokens", "maxQueuedPerPage", "maxQueuedGlobal"]],
   ["logging", ["level", "maxEntries", "collapseThreshold"]],
   ["runtime", ["nativeHostName", "reconnectPolicy", "heartbeatMs", "commandTimeoutMs"]],
@@ -268,7 +352,7 @@ export function readConfigValue(config: ExtensionConfig, path: string): unknown 
 export function buildConfigPatchFromPath(path: string, value: unknown): ExtensionConfigPatch {
   const descriptor = getEditableConfigField(path);
   if (!descriptor) {
-    throw new Error(`Unknown config field path: ${path}`);
+    throw new Error(`Неизвестный путь поля конфига: ${path}`);
   }
 
   const segments = path.split(".");
@@ -292,20 +376,20 @@ export function buildConfigPatchFromPath(path: string, value: unknown): Extensio
 export function parseConfigFieldDraft(path: string, rawValue: string): unknown {
   const descriptor = getEditableConfigField(path);
   if (!descriptor) {
-    throw new Error(`Unknown config field path: ${path}`);
+    throw new Error(`Неизвестный путь поля конфига: ${path}`);
   }
 
   const parsedValue = (() => {
     switch (descriptor.valueType) {
       case "boolean":
         if (rawValue !== "true" && rawValue !== "false") {
-          throw new Error("Value must be true or false.");
+          throw new Error("Значение должно быть true или false.");
         }
         return rawValue === "true";
       case "number": {
         const trimmed = rawValue.trim();
         if (!/^-?\d+$/.test(trimmed)) {
-          throw new Error("Value must be an integer.");
+          throw new Error("Значение должно быть целым числом.");
         }
         return Number(trimmed);
       }
@@ -315,7 +399,7 @@ export function parseConfigFieldDraft(path: string, rawValue: string): unknown {
       case "string-array": {
         const parsedArray = JSON.parse(rawValue);
         if (!Array.isArray(parsedArray) || parsedArray.some((item) => typeof item !== "string")) {
-          throw new Error("Value must be a JSON array of strings.");
+          throw new Error("Значение должно быть JSON-массивом строк.");
         }
         return parsedArray;
       }
@@ -326,7 +410,7 @@ export function parseConfigFieldDraft(path: string, rawValue: string): unknown {
       case "model-rule-array": {
         const parsedArray = JSON.parse(rawValue);
         if (!Array.isArray(parsedArray)) {
-          throw new Error("Value must be a JSON array of model rules.");
+          throw new Error("Значение должно быть JSON-массивом правил моделей.");
         }
         return normalizeAllowedModelRules(parsedArray as Array<AiAllowedModelRule | string>);
       }
@@ -368,6 +452,10 @@ export function getConfigFieldDisplayValue(path: string, value: unknown): string
     return Array.isArray(value) ? JSON.stringify(value) : "[]";
   }
 
+  if (descriptor.editorType === "modal-text" && (value === null || value === "")) {
+    return "null";
+  }
+
   return typeof value === "string" ? value.replace(/\r?\n/g, "\\n") : "";
 }
 
@@ -397,11 +485,36 @@ export function getConfigFieldTooltipValue(path: string, value: unknown): string
     return typeof value === "number" ? String(value) : "";
   }
 
+  if (descriptor.editorType === "modal-text" && (value === null || value === "")) {
+    return "null";
+  }
+
   return typeof value === "string" ? value : "";
 }
 
 export function validateEffectiveConfig(config: unknown): ExtensionConfig {
   return ExtensionConfigSchema.parse(config);
+}
+
+export function omitSensitiveConfigData<T>(value: T, pathPrefix = ""): T {
+  if (isSensitiveConfigPath(pathPrefix)) {
+    return undefined as T;
+  }
+
+  if (Array.isArray(value) || value === null || typeof value !== "object") {
+    return value;
+  }
+
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).flatMap(([key, childValue]) => {
+      const nextPath = pathPrefix ? `${pathPrefix}.${key}` : key;
+      if (isSensitiveConfigPath(nextPath)) {
+        return [];
+      }
+
+      return [[key, omitSensitiveConfigData(childValue, nextPath)]];
+    })
+  ) as T;
 }
 
 export function redactSensitiveConfigData<T>(value: T, pathPrefix = ""): T {
@@ -423,15 +536,15 @@ export function redactSensitiveConfigData<T>(value: T, pathPrefix = ""): T {
 
 function redactSensitiveLeafValue(value: unknown): unknown {
   if (typeof value === "string") {
-    return value.trim().length > 0 ? "[redacted]" : value;
+    return value.trim().length > 0 ? "[скрыто]" : value;
   }
 
-  return value === null || value === undefined ? value : "[redacted]";
+  return value === null || value === undefined ? value : "[скрыто]";
 }
 
 function formatSensitiveConfigDisplayValue(path: string, value: unknown): string {
   if (path === "ai.openAiApiKey") {
-    return typeof value === "string" && value.trim().length > 0 ? "[redacted]" : "";
+    return typeof value === "string" && value.trim().length > 0 ? "[скрыто]" : "null";
   }
 
   return typeof value === "string" ? value : "";
@@ -439,16 +552,16 @@ function formatSensitiveConfigDisplayValue(path: string, value: unknown): string
 
 function formatSensitiveConfigTooltipValue(path: string, value: unknown): string {
   if (path !== "ai.openAiApiKey") {
-    return "[redacted]";
+    return "[скрыто]";
   }
 
   if (typeof value === "string" && value.trim().length > 0) {
-    return `Stored value is hidden. Open the editor to replace it. Save empty text to remove ${OPENAI_API_KEY_ENV_VAR_NAME}.`;
+    return `Сохранённое значение скрыто. Откройте редактор, чтобы заменить его. Сохраните пустой текст, чтобы удалить ${OPENAI_API_KEY_ENV_VAR_NAME}.`;
   }
 
   if (value === "") {
-    return `Save a non-empty value to create or update ${OPENAI_API_KEY_ENV_VAR_NAME}. Save empty text to remove it.`;
+    return `Сохраните непустое значение, чтобы создать или обновить ${OPENAI_API_KEY_ENV_VAR_NAME}. Сохраните пустой текст, чтобы удалить переменную.`;
   }
 
-  return `This field does not currently manage ${OPENAI_API_KEY_ENV_VAR_NAME}. Save a value to create or update it. Save empty text to remove it.`;
+  return `Это поле сейчас не управляет ${OPENAI_API_KEY_ENV_VAR_NAME}. Сохраните значение, чтобы создать или обновить переменную. Сохраните пустой текст, чтобы удалить её.`;
 }

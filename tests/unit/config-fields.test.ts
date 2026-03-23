@@ -2,9 +2,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildConfigPatchFromPath,
+  getConfigFieldDisplayValue,
   getConfigFieldTooltipValue,
   getEditableConfigField,
+  getEditableConfigPaths,
   getOrderedConfigEntries,
+  omitSensitiveConfigData,
   parseConfigFieldDraft,
   redactSensitiveConfigData
 } from "../../extension/src/shared/config-fields";
@@ -83,6 +86,18 @@ describe("editable config fields", () => {
       valueType: "boolean",
       editorType: "select"
     });
+
+    expect(getEditableConfigField("ai.promptCaching.routing")).toMatchObject({
+      scope: "local",
+      valueType: "enum",
+      editorType: "select"
+    });
+
+    expect(getEditableConfigField("ai.promptCaching.retention")).toMatchObject({
+      scope: "local",
+      valueType: "enum",
+      editorType: "select"
+    });
   });
 
   it("builds nested config patches from field paths", () => {
@@ -100,6 +115,7 @@ describe("editable config fields", () => {
     );
     expect(parseConfigFieldDraft("ai.openAiApiKey", "sk-test")).toBe("sk-test");
     expect(parseConfigFieldDraft("protocol.testCommandsEnabled", "true")).toBe(true);
+    expect(parseConfigFieldDraft("ai.promptCaching.retention", "24h")).toBe("24h");
     expect(parseConfigFieldDraft("ai.chat.model", '{"model":"gpt-5","tier":"priority"}')).toEqual({
       model: "gpt-5",
       tier: "priority"
@@ -123,8 +139,8 @@ describe("editable config fields", () => {
       { model: "gpt-4.1", tier: "standard" },
       { model: "gpt-5", tier: "standard" }
     ]);
-    expect(() => parseConfigFieldDraft("logging.maxEntries", "8.5")).toThrow(/integer/i);
-    expect(() => parseConfigFieldDraft("ai.chat.structuredOutput.schema", "[]")).toThrow(/JSON object/i);
+    expect(() => parseConfigFieldDraft("logging.maxEntries", "8.5")).toThrow(/целым числом/i);
+    expect(() => parseConfigFieldDraft("ai.chat.structuredOutput.schema", "[]")).toThrow(/JSON-объектом/i);
   });
 
   it("orders config groups and nested keys by the explicit viewer registry", () => {
@@ -174,15 +190,26 @@ describe("editable config fields", () => {
     expect(
       getOrderedConfigEntries(
         {
+          retention: "in_memory",
+          routing: "stable_session_prefix"
+        },
+        "ai.promptCaching"
+      ).map(([key]) => key)
+    ).toEqual(["routing", "retention"]);
+
+    expect(
+      getOrderedConfigEntries(
+        {
           allowedModels: [],
           chat: {},
           openAiApiKey: null,
           compaction: {},
+          promptCaching: {},
           rateLimits: {}
         },
         "ai"
       ).map(([key]) => key)
-    ).toEqual(["openAiApiKey", "allowedModels", "chat", "compaction", "rateLimits"]);
+    ).toEqual(["openAiApiKey", "allowedModels", "chat", "compaction", "promptCaching", "rateLimits"]);
 
     expect(
       getOrderedConfigEntries(
@@ -209,6 +236,14 @@ describe("editable config fields", () => {
     expect(getConfigFieldTooltipValue("ai.openAiApiKey", "sk-secret-value")).not.toContain("sk-secret-value");
   });
 
+  it("renders empty modal-text config values as null without changing inline strings", () => {
+    expect(getConfigFieldDisplayValue("ai.chat.instructions", "")).toBe("null");
+    expect(getConfigFieldDisplayValue("ai.chat.structuredOutput.description", "")).toBe("null");
+    expect(getConfigFieldDisplayValue("ai.openAiApiKey", null)).toBe("null");
+    expect(getConfigFieldDisplayValue("runtime.nativeHostName", "")).toBe("");
+    expect(getConfigFieldTooltipValue("ai.chat.instructions", "")).toBe("null");
+  });
+
   it("redacts sensitive config values before they hit logs", () => {
     expect(
       redactSensitiveConfigData({
@@ -221,10 +256,42 @@ describe("editable config fields", () => {
       })
     ).toEqual({
       ai: {
-        openAiApiKey: "[redacted]",
+        openAiApiKey: "[скрыто]",
         chat: {
           instructions: "keep me"
         }
+      }
+    });
+  });
+
+  it("lists only non-sensitive editable paths for terminal config shell", () => {
+    expect(getEditableConfigPaths({ includeSensitive: false })).not.toContain("ai.openAiApiKey");
+    expect(getEditableConfigPaths({ prefix: "ai.", includeSensitive: false })).toContain("ai.chat.streamingEnabled");
+    expect(getEditableConfigPaths({ prefix: "ai.", includeSensitive: false })).toContain("ai.compaction.enabled");
+    expect(getEditableConfigPaths({ prefix: "ai.", includeSensitive: false })).not.toContain("ai.openAiApiKey");
+  });
+
+  it("omits sensitive config values entirely when exporting safe config snapshots", () => {
+    expect(
+      omitSensitiveConfigData({
+        ai: {
+          openAiApiKey: "sk-secret-value",
+          chat: {
+            instructions: "keep me"
+          }
+        },
+        runtime: {
+          nativeHostName: "com.lextrace.nt3.host"
+        }
+      })
+    ).toEqual({
+      ai: {
+        chat: {
+          instructions: "keep me"
+        }
+      },
+      runtime: {
+        nativeHostName: "com.lextrace.nt3.host"
       }
     });
   });

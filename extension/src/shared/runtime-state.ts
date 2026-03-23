@@ -34,6 +34,39 @@ export type NativeHostStatus = z.infer<typeof NativeHostStatusSchema>;
 export type DesiredRuntimeState = z.infer<typeof DesiredRuntimeStateSchema>;
 export type PersistedRuntimeState = z.infer<typeof PersistedRuntimeStateSchema>;
 
+export function parseWorkerStatusLike(input: unknown, fallbackBootId?: string | null): WorkerStatus {
+  const directResult = WorkerStatusSchema.safeParse(input);
+  if (directResult.success) {
+    return directResult.data;
+  }
+
+  if (fallbackBootId) {
+    const nativeResult = NativeHostStatusSchema.safeParse(input);
+    if (nativeResult.success) {
+      return {
+        ...nativeResult.data,
+        bootId: fallbackBootId
+      };
+    }
+  }
+
+  return WorkerStatusSchema.parse(input);
+}
+
+export function parseRuntimeWorkerStatus(input: unknown, fallbackBootId?: string | null): WorkerStatus {
+  if (input && typeof input === "object") {
+    const record = input as Record<string, unknown>;
+    if ("workerStatus" in record && record.workerStatus !== undefined) {
+      return parseWorkerStatusLike(record.workerStatus, fallbackBootId);
+    }
+    if ("status" in record && record.status !== undefined) {
+      return parseWorkerStatusLike(record.status, fallbackBootId);
+    }
+  }
+
+  return parseWorkerStatusLike(input, fallbackBootId);
+}
+
 export function createInitialWorkerStatus(bootId: string): WorkerStatus {
   return {
     running: false,

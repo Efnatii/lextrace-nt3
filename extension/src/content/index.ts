@@ -1,8 +1,40 @@
-import { AiChatPageSessionSchema, createDefaultAiStatus, type AiChatPageSession, type AiStreamMessage } from "../shared/ai";
+﻿import {
+  AiChatCompactResultSchema,
+  AiModelCatalogResultSchema,
+  AiChatPageSessionSchema,
+  buildAiChatTranscriptItems,
+  buildAiChatStatusFragments,
+  createDefaultAiStatus,
+  formatAiEventKindLabel,
+  formatAiMessageOriginLabel,
+  normalizeAllowedModelRules,
+  type AiAllowedModelRule,
+  type AiChatMessage,
+  type AiChatPageSession,
+  type AiChatTranscriptItem,
+  type AiModelCatalogItem,
+  type AiServiceTier,
+  type AiStreamMessage
+} from "../shared/ai";
+import { isAiModelTierAvailable } from "../shared/ai-model-catalog";
+import { parseAiQueueImportJson } from "../shared/ai-queue-import";
 import { COMMANDS } from "../shared/constants";
-import { connectRuntimeStream, recordLog, sendCommand } from "../shared/client";
-import { ExtensionConfigSchema, type ExtensionConfig, type OverlayTab } from "../shared/config";
+import { connectRuntimeStream, formatUserFacingCommandError, recordLog, sendCommand } from "../shared/client";
+import {
+  buildConfigPatchFromPath,
+  getEditableConfigField,
+  getEditableConfigPaths,
+  omitSensitiveConfigData,
+  parseConfigFieldDraft,
+  readConfigValue
+} from "../shared/config-fields";
+import { defaultConfig, ExtensionConfigSchema, type ExtensionConfig, type ExtensionConfigPatch, type OverlayTab, type PopupTab } from "../shared/config";
 import { LogEntrySchema, serializeLogDetails, type LogEntry } from "../shared/logging";
+import {
+  buildChatLogExportPayload,
+  buildConsoleLogExportPayload,
+  formatLogExportFileName
+} from "../shared/log-export";
 import {
   buildOverlayActivityFeed,
   type OverlayConsoleEntry,
@@ -16,14 +48,144 @@ import {
   type RuntimeStreamMessage
 } from "../shared/protocol";
 import { normalizePageKey, shortenPageKey } from "../shared/page";
-import { WorkerStatusSchema, type WorkerStatus } from "../shared/runtime-state";
-import { getTerminalHelpLines, getTerminalSuggestions, parseTerminalCommand, type TerminalCatalogOptions } from "../shared/terminal";
+import { parseRuntimeWorkerStatus, type WorkerStatus } from "../shared/runtime-state";
+import {
+  buildStatusChipDescriptors,
+  type StatusChipDescriptor,
+  type StatusChipIcon
+} from "../shared/status-chips";
+import {
+  getTerminalHelpLines,
+  getTerminalSuggestions,
+  parseTerminalCommand,
+  type ParsedTerminalCommand,
+  type TerminalCatalogOptions
+} from "../shared/terminal";
+import type { TerminalChatTarget, TerminalOverlayTarget } from "../shared/terminal-alias";
 
 type RuntimeSnapshot = {
   config: ExtensionConfig;
   status: WorkerStatus;
   logs: LogEntry[];
 };
+
+type RuntimeSnapshotResponse = {
+  config: ExtensionConfig;
+  workerStatus: WorkerStatus;
+  logs: LogEntry[];
+};
+
+type TerminalExecutionResult = {
+  output: unknown;
+  logDetails?: unknown;
+  postAction?:
+    | {
+        type: "close-overlay";
+      }
+    | {
+        type: "switch-overlay-tab";
+        tab: OverlayTab;
+      };
+};
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+const STATUS_DOWNLOAD_ICON: StatusChipIcon = {
+  viewBox: "0 0 16 16",
+  paths: [
+    { d: "M8 3.25v6.5" },
+    { d: "m5.5 7.75 2.5 2.5 2.5-2.5" },
+    { d: "M3.5 11.75h9" }
+  ]
+};
+
+function createStatusChipIcon(icon: StatusChipIcon): SVGSVGElement {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", icon.viewBox);
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("focusable", "false");
+
+  for (const pathDefinition of icon.paths) {
+    const path = document.createElementNS(SVG_NS, "path");
+    path.setAttribute("d", pathDefinition.d);
+    if (pathDefinition.fill) {
+      path.setAttribute("fill", pathDefinition.fill);
+    }
+    if (pathDefinition.stroke) {
+      path.setAttribute("stroke", pathDefinition.stroke);
+    }
+    svg.append(path);
+  }
+
+  return svg;
+}
+
+function createStatusChip(descriptor: StatusChipDescriptor): HTMLSpanElement {
+  const chip = document.createElement("span");
+  chip.className = "status-chip";
+  chip.dataset.statusKey = descriptor.key;
+  if (descriptor.width !== "default") {
+    chip.classList.add(`status-chip--${descriptor.width}`);
+  }
+
+  const tooltip = `${descriptor.tooltipLabel}: ${descriptor.fullValue}`;
+  chip.tabIndex = 0;
+  chip.setAttribute("data-tooltip", tooltip);
+  chip.setAttribute("aria-label", tooltip);
+
+  const icon = document.createElement("span");
+  icon.className = "status-chip-icon";
+  icon.append(createStatusChipIcon(descriptor.icon));
+
+  const value = document.createElement("span");
+  value.className = "status-chip-value";
+  value.textContent = descriptor.value;
+
+  chip.append(icon, value);
+  return chip;
+}
+
+function createStatusActionButton(options: {
+  tooltip: string;
+  icon?: StatusChipIcon;
+  dataRole?: string;
+  disabled?: boolean;
+  onClick: () => void;
+}): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "status-action";
+  button.tabIndex = 0;
+  button.disabled = options.disabled ?? false;
+  button.setAttribute("data-tooltip", options.tooltip);
+  button.setAttribute("aria-label", options.tooltip);
+  if (options.dataRole) {
+    button.dataset.role = options.dataRole;
+  }
+
+  button.append(createStatusChipIcon(options.icon ?? STATUS_DOWNLOAD_ICON));
+  button.addEventListener("click", options.onClick);
+  return button;
+}
+
+function createStatusRowShell(
+  descriptors: readonly StatusChipDescriptor[],
+  actions: readonly HTMLButtonElement[] = []
+): DocumentFragment {
+  const fragment = document.createDocumentFragment();
+  const chipList = document.createElement("div");
+  chipList.className = "status-chip-list";
+  chipList.append(...descriptors.map((descriptor) => createStatusChip(descriptor)));
+  fragment.append(chipList);
+
+  if (actions.length > 0) {
+    const actionList = document.createElement("div");
+    actionList.className = "status-row-actions";
+    actionList.append(...actions);
+    fragment.append(actionList);
+  }
+
+  return fragment;
+}
 
 class OverlayTerminalController {
   private host: HTMLDivElement | null = null;
@@ -42,6 +204,8 @@ class OverlayTerminalController {
   private chatFeed: HTMLElement | null = null;
   private chatInput: HTMLInputElement | null = null;
   private chatForm: HTMLFormElement | null = null;
+  private chatQueueFileInput: HTMLInputElement | null = null;
+  private chatImportQueueButton: HTMLButtonElement | null = null;
   private chatSendButton: HTMLButtonElement | null = null;
   private chatResumeButton: HTMLButtonElement | null = null;
   private chatResetButton: HTMLButtonElement | null = null;
@@ -62,6 +226,7 @@ class OverlayTerminalController {
   private selectedSuggestionIndex = -1;
   private nextActivitySequence = 0;
   private activeTab: OverlayTab = "console";
+  private chatQueueImportInProgress = false;
   private readonly pageViewId = crypto.randomUUID();
   private visible = false;
   private dragState:
@@ -119,7 +284,7 @@ class OverlayTerminalController {
     return createErrorResponse(
       envelope.id,
       "unsupported_action",
-      `Unsupported content action: ${envelope.action}`
+      `Неподдерживаемое действие контент-скрипта: ${envelope.action}`
     );
   }
 
@@ -127,7 +292,7 @@ class OverlayTerminalController {
     this.ensureDom();
     this.visible = true;
     this.host?.style.setProperty("display", "block");
-    this.pushConsole("system", "Overlay terminal opened. Type help for commands.");
+    this.pushConsole("system", "Оверлейный терминал открыт. Введите help, чтобы увидеть команды.");
     await this.patchOverlaySessionConfig({
       visible: true
     });
@@ -136,7 +301,7 @@ class OverlayTerminalController {
     await this.loadAiSnapshot();
     this.centerPanelInViewport();
     this.focusPreferredOverlayElement();
-    await recordLog("content", "overlay.open", "Overlay terminal opened.");
+    await recordLog("content", "overlay.open", "Оверлейный терминал открыт.");
   }
 
   async close(recordClose = true): Promise<void> {
@@ -147,7 +312,7 @@ class OverlayTerminalController {
       visible: false
     });
     if (recordClose) {
-      await recordLog("content", "overlay.close", "Overlay terminal closed.");
+      await recordLog("content", "overlay.close", "Оверлейный терминал закрыт.");
     }
   }
 
@@ -177,10 +342,10 @@ class OverlayTerminalController {
       <div class="panel-shell">
         <header class="panel-header">
           <div>
-            <p class="panel-kicker">Page overlay</p>
-            <h1>LexTrace Terminal</h1>
+            <p class="panel-kicker">Оверлей страницы</p>
+            <h1>Терминал LexTrace</h1>
           </div>
-          <button type="button" class="close-button" data-close="true">Close</button>
+          <button type="button" class="close-button" data-close="true">Закрыть</button>
         </header>
         <nav class="overlay-tab-strip" data-role="overlay-tabs">
           <button type="button" class="overlay-tab-button is-active" data-tab="console">Консоль</button>
@@ -200,18 +365,71 @@ class OverlayTerminalController {
             </form>
           </section>
         </div>
-        <div class="tab-surface" data-panel="chat">
+        <div class="tab-surface chat-surface" data-panel="chat">
           <div class="status-row" data-role="chat-status-row"></div>
-          <div class="tool-row" data-role="chat-tool-row">
-            <button type="button" class="tool-icon" data-role="chat-send" title="Отправить">Отправить</button>
-            <button type="button" class="tool-icon" data-role="chat-resume" title="Продолжить">Продолжить</button>
-            <button type="button" class="tool-icon" data-role="chat-reset" title="Сбросить">Сбросить</button>
-          </div>
           <section class="panel-body chat-body">
             <div class="chat-feed" data-role="chat-feed"></div>
             <form class="chat-form" data-role="chat-form">
               <span class="prompt-label">AI&gt;</span>
-              <input class="chat-input" data-role="chat-input" spellcheck="false" autocomplete="off" />
+              <div class="chat-input-shell">
+                <input class="chat-input" data-role="chat-input" spellcheck="false" autocomplete="off" />
+              </div>
+              <input
+                type="file"
+                class="chat-queue-file-input"
+                data-role="chat-queue-file"
+                accept=".json,application/json"
+              />
+              <div class="tool-row chat-tool-row" data-role="chat-tool-row">
+                <button
+                  type="button"
+                  class="tool-icon"
+                  data-role="chat-import-queue"
+                  data-tooltip="Загрузить очередь JSON"
+                  aria-label="Загрузить очередь JSON"
+                >
+                  <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                    <path d="M8 3.25v6.5" />
+                    <path d="m5.5 7.75 2.5 2.5 2.5-2.5" />
+                    <path d="M3.5 11.75h9" />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  class="tool-icon"
+                  data-role="chat-send"
+                  data-tooltip="Отправить"
+                  aria-label="Отправить"
+                >
+                  <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                    <path d="M2.5 8h9" />
+                    <path d="m8.75 4.25 3.75 3.75-3.75 3.75" />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  class="tool-icon"
+                  data-role="chat-resume"
+                  data-tooltip="Продолжить"
+                  aria-label="Продолжить"
+                >
+                  <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                    <path d="M5.25 3.5v9l6-4.5-6-4.5Z" fill="currentColor" stroke="none" />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  class="tool-icon"
+                  data-role="chat-reset"
+                  data-tooltip="Сбросить"
+                  aria-label="Сбросить"
+                >
+                  <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                    <path d="M5 3.75H2.5v2.5" />
+                    <path d="M2.75 6.25A5.25 5.25 0 1 0 4.5 3.9" />
+                  </svg>
+                </button>
+              </div>
             </form>
           </section>
         </div>
@@ -235,6 +453,8 @@ class OverlayTerminalController {
     this.terminalInput = wrapper.querySelector<HTMLInputElement>("[data-role='terminal-input']");
     this.chatInput = wrapper.querySelector<HTMLInputElement>("[data-role='chat-input']");
     this.chatForm = wrapper.querySelector<HTMLFormElement>("[data-role='chat-form']");
+    this.chatQueueFileInput = wrapper.querySelector<HTMLInputElement>("[data-role='chat-queue-file']");
+    this.chatImportQueueButton = wrapper.querySelector<HTMLButtonElement>("[data-role='chat-import-queue']");
     this.chatSendButton = wrapper.querySelector<HTMLButtonElement>("[data-role='chat-send']");
     this.chatResumeButton = wrapper.querySelector<HTMLButtonElement>("[data-role='chat-resume']");
     this.chatResetButton = wrapper.querySelector<HTMLButtonElement>("[data-role='chat-reset']");
@@ -294,6 +514,12 @@ class OverlayTerminalController {
     this.chatSendButton?.addEventListener("click", () => {
       void this.sendChatMessage();
     });
+    this.chatImportQueueButton?.addEventListener("click", () => {
+      this.openChatQueueImportPicker();
+    });
+    this.chatQueueFileInput?.addEventListener("change", () => {
+      void this.handleChatQueueFileSelection();
+    });
     this.chatResumeButton?.addEventListener("click", () => {
       void this.resumeChat();
     });
@@ -331,7 +557,11 @@ class OverlayTerminalController {
     }
 
     this.streamPort = connectRuntimeStream((message) => {
-      void this.handleStreamMessage(message as ExtensionStreamMessage & Record<string, unknown>);
+      void this.handleStreamMessage(message as ExtensionStreamMessage & Record<string, unknown>).catch((error) => {
+        void recordLog("content", "overlay.stream.invalid", "Некорректное stream-сообщение проигнорировано.", {
+          error
+        }, "warn");
+      });
     });
     this.subscribeCurrentPageToStream();
     this.startStreamKeepAlive();
@@ -342,7 +572,7 @@ class OverlayTerminalController {
       if (!this.visible) {
         return;
       }
-      this.pushConsole("error", "Runtime stream disconnected. Retrying…");
+      this.pushConsole("error", "Поток среды выполнения отключён. Повторное подключение…");
       if (this.reconnectTimer) {
         window.clearTimeout(this.reconnectTimer);
       }
@@ -396,7 +626,7 @@ class OverlayTerminalController {
 
     this.applySnapshot({
       config: ExtensionConfigSchema.parse(snapshot.config),
-      status: WorkerStatusSchema.parse(snapshot.workerStatus),
+      status: parseRuntimeWorkerStatus(snapshot),
       logs: snapshot.logs.map((entry) => LogEntrySchema.parse(entry))
     });
   }
@@ -422,6 +652,7 @@ class OverlayTerminalController {
       this.aiSession = AiChatPageSessionSchema.parse(snapshot.session);
       this.render();
     } catch (error) {
+      const message = formatUserFacingCommandError(error, "Не удалось загрузить состояние AI-чата.");
       this.aiSession = {
         pageKey: pageContext.pageKey,
         pageUrlSample: pageContext.pageUrl,
@@ -433,13 +664,13 @@ class OverlayTerminalController {
         queuedCount: 0,
         recoverable: false,
         lastCheckpointAt: null,
-        lastError: error instanceof Error ? error.message : String(error),
+        lastError: message,
         messages: [],
         queue: [],
         status: {
           ...createDefaultAiStatus(pageContext.pageKey, pageContext.pageUrl, false),
           requestState: "error",
-          lastError: error instanceof Error ? error.message : String(error)
+          lastError: message
         }
       };
       this.render();
@@ -455,7 +686,7 @@ class OverlayTerminalController {
     if (message.event === "runtime.snapshot") {
       this.applySnapshot({
         config: ExtensionConfigSchema.parse(message.config),
-        status: WorkerStatusSchema.parse(message.status),
+        status: parseRuntimeWorkerStatus(message),
         logs: Array.isArray(message.logs)
           ? message.logs.map((entry) => LogEntrySchema.parse(entry))
           : this.runtimeLogs
@@ -463,8 +694,8 @@ class OverlayTerminalController {
       return;
     }
 
-    if (message.event === "runtime.status" && message.status) {
-      this.currentStatus = WorkerStatusSchema.parse(message.status);
+    if (message.event === "runtime.status") {
+      this.currentStatus = parseRuntimeWorkerStatus(message);
       this.renderConsoleStatus();
       return;
     }
@@ -538,22 +769,44 @@ class OverlayTerminalController {
       return;
     }
 
-    const fragments = [
-      ["state", this.currentStatus.running ? "running" : "stopped"],
-      ["host", this.currentStatus.hostConnected ? "connected" : "disconnected"],
-      ["boot", this.currentStatus.bootId.slice(0, 8)],
-      ["session", this.currentStatus.sessionId ?? "-"],
-      ["task", this.currentStatus.taskId ?? "-"],
-      ["heartbeat", this.currentStatus.lastHeartbeatAt ?? "-"]
-    ];
+    const descriptors = buildStatusChipDescriptors("console", [
+      {
+        key: "состояние",
+        value: this.currentStatus.running ? "в работе" : "остановлен"
+      },
+      {
+        key: "хост",
+        value: this.currentStatus.hostConnected ? "подключён" : "отключён"
+      },
+      {
+        key: "запуск",
+        value: this.currentStatus.bootId.slice(0, 8),
+        fullValue: this.currentStatus.bootId
+      },
+      {
+        key: "сессия",
+        value: this.currentStatus.sessionId ?? "-"
+      },
+      {
+        key: "задача",
+        value: this.currentStatus.taskId ?? "-"
+      },
+      {
+        key: "пульс",
+        value: this.currentStatus.lastHeartbeatAt ?? "-"
+      }
+    ]);
 
     this.consoleStatusRow.replaceChildren(
-      ...fragments.map(([label, value]) => {
-        const item = document.createElement("span");
-        item.className = "status-chip";
-        item.textContent = `${label}: ${value}`;
-        return item;
-      })
+      createStatusRowShell(descriptors, [
+        createStatusActionButton({
+          tooltip: "Скачать лог консоли",
+          dataRole: "console-export-log",
+          onClick: () => {
+            void this.downloadConsoleLog();
+          }
+        })
+      ])
     );
   }
 
@@ -585,49 +838,100 @@ class OverlayTerminalController {
       return;
     }
 
-    const budget = status.currentModelBudget ?? status.rateLimits ?? null;
-    const rpmText =
-      budget && budget.serverRemainingRequests !== null && budget.serverLimitRequests !== null
-        ? `${budget.serverRemainingRequests}/${budget.serverLimitRequests}`
-        : "-";
-    const tpmText =
-      budget && budget.serverRemainingTokens !== null && budget.serverLimitTokens !== null
-        ? `${budget.serverRemainingTokens}/${budget.serverLimitTokens}`
-        : "-";
-    const resetText = budget?.serverResetRequests ?? budget?.serverResetTokens ?? "-";
-    const configuredModelText = status.model
-      ? `${status.model.model} [${status.model.tier}]`
-      : "не задана";
-    const formatText = status.structuredOutputEnabled
-      ? `${status.structuredOutputName ?? "json_schema"}${status.structuredOutputStrict ? " strict" : ""}`
-      : "text";
-
-    const fragments = [
-      ["provider", status.provider],
-      ["key", status.apiKeyPresent ? "обнаружен" : "нет"],
-      ["model", configuredModelText],
-      ["rpm", rpmText],
-      ["tpm", tpmText],
-      ["reset", resetText],
-      ["format", formatText],
-      ["stream", status.streamingEnabled ? "вкл" : "выкл"],
-      ["state", status.requestState],
-      ["page", shortenPageKey(status.pageKey)],
-      ["queue", String(status.queueCount)]
-    ];
-
-    if (status.resolvedServiceTier) {
-      fragments.splice(6, 0, ["served", status.resolvedServiceTier]);
-    }
+    const descriptors = buildStatusChipDescriptors(
+      "chat",
+      buildAiChatStatusFragments(status).map(([key, value]) => ({
+        key,
+        value: key === "page" ? shortenPageKey(value) : value,
+        fullValue: value
+      }))
+    );
 
     this.chatStatusRow.replaceChildren(
-      ...fragments.map(([label, value]) => {
-        const item = document.createElement("span");
-        item.className = "status-chip";
-        item.textContent = `${label}: ${value}`;
-        return item;
-      })
+      createStatusRowShell(descriptors, [
+        createStatusActionButton({
+          tooltip: "Скачать лог чата",
+          dataRole: "chat-export-log",
+          onClick: () => {
+            void this.downloadChatLog();
+          }
+        })
+      ])
     );
+  }
+
+  private async downloadConsoleLog(): Promise<void> {
+    try {
+      const exportedAt = new Date().toISOString();
+      const pageContext = this.getCurrentPageContext();
+      const payload = buildConsoleLogExportPayload({
+        exportedAt,
+        pageContext,
+        workerStatus: this.currentStatus,
+        currentConfig: this.currentConfig,
+        consoleEntries: this.consoleEntries,
+        runtimeLogs: this.runtimeLogs,
+        runtimeLogSequences: this.runtimeLogSequences,
+        visibleActivitySequenceFloor: this.visibleActivitySequenceFloor
+      });
+      const fileName = formatLogExportFileName("console", exportedAt, pageContext?.pageKey ?? null);
+      this.downloadJsonFile(fileName, payload);
+      await recordLog("content", "console.log.export", "Лог консоли выгружен.", {
+        fileName,
+        consoleEntryCount: payload.consoleEntries.length,
+        runtimeLogCount: payload.runtimeLogs.length,
+        visibleActivityCount: payload.visibleActivityFeed.length
+      });
+    } catch (error) {
+      this.pushConsole("error", formatUserFacingCommandError(error, "Не удалось выгрузить лог консоли."));
+      await recordLog("content", "console.log.export.failed", "Не удалось выгрузить лог консоли.", serializeLogDetails(error), "error");
+    }
+  }
+
+  private async downloadChatLog(): Promise<void> {
+    try {
+      const exportedAt = new Date().toISOString();
+      const pageContext = this.getCurrentPageContext();
+      const payload = buildChatLogExportPayload({
+        exportedAt,
+        pageContext,
+        currentConfig: this.currentConfig,
+        session: this.aiSession
+      });
+      const fileName = formatLogExportFileName(
+        "chat",
+        exportedAt,
+        this.aiSession?.pageKey ?? pageContext?.pageKey ?? null
+      );
+      this.downloadJsonFile(fileName, payload);
+      await recordLog("content", "chat.log.export", "Лог чата выгружен.", {
+        fileName,
+        pageKey: this.aiSession?.pageKey ?? pageContext?.pageKey ?? null,
+        messageCount: this.aiSession?.messages.length ?? 0,
+        transcriptItemCount: payload.transcriptItems.length
+      });
+    } catch (error) {
+      this.pushConsole("error", formatUserFacingCommandError(error, "Не удалось выгрузить лог чата."));
+      await recordLog("content", "chat.log.export.failed", "Не удалось выгрузить лог чата.", serializeLogDetails(error), "error");
+    }
+  }
+
+  private downloadJsonFile(fileName: string, payload: unknown): void {
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json;charset=utf-8"
+    });
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = fileName;
+    link.rel = "noopener";
+    link.style.display = "none";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => {
+      URL.revokeObjectURL(objectUrl);
+    }, 0);
   }
 
   private renderChatToolRow(): void {
@@ -635,6 +939,15 @@ class OverlayTerminalController {
     const chatInputValue = this.chatInput?.value.trim() ?? "";
     const configuredModel = status?.model?.model ?? this.currentConfig?.ai.chat.model?.model ?? "";
     const canSendFromInput = configuredModel.trim().length > 0 && chatInputValue.length > 0;
+    const canImportQueue = Boolean(this.getCurrentPageContext());
+
+    if (this.chatImportQueueButton) {
+      this.chatImportQueueButton.hidden = !canImportQueue;
+      this.chatImportQueueButton.disabled = this.chatQueueImportInProgress;
+      const tooltip = this.chatQueueImportInProgress ? "Импорт очереди JSON…" : "Загрузить очередь JSON";
+      this.chatImportQueueButton.dataset.tooltip = tooltip;
+      this.chatImportQueueButton.setAttribute("aria-label", tooltip);
+    }
 
     if (this.chatSendButton) {
       this.chatSendButton.hidden = !canSendFromInput;
@@ -648,6 +961,7 @@ class OverlayTerminalController {
 
     if (this.chatToolRow) {
       const hasVisibleActions = [
+        this.chatImportQueueButton,
         this.chatSendButton,
         this.chatResumeButton,
         this.chatResetButton
@@ -661,31 +975,140 @@ class OverlayTerminalController {
       return;
     }
 
-    const messages = this.aiSession?.messages ?? [];
+    const transcriptItems = buildAiChatTranscriptItems(
+      this.aiSession?.messages ?? [],
+      this.currentConfig?.ai.chat.instructions ?? ""
+    );
     this.chatFeed.replaceChildren(
-      ...messages.map((message) => this.createChatMessageElement(message))
+      ...transcriptItems.map((item) => this.createChatTranscriptElement(item))
     );
     this.chatFeed.scrollTop = this.chatFeed.scrollHeight;
   }
 
-  private createChatMessageElement(message: AiChatPageSession["messages"][number]): HTMLElement {
+  private createChatTranscriptElement(item: AiChatTranscriptItem): HTMLElement {
+    switch (item.type) {
+      case "system-prompt":
+        return this.createChatSystemPromptElement(item);
+      case "compacted-range":
+        return this.createChatCompactedRangeElement(item);
+      case "compaction-request":
+        return this.createChatCompactionEventElement(
+          item.message,
+          "Запрос сжатия",
+          `Сжимаются ${item.meta?.affectedMessageIds.length ?? 0} сообщений`,
+          item.meta?.instructionsText ?? ""
+        );
+      case "compaction-result":
+        return this.createChatCompactionEventElement(
+          item.message,
+          "Результат сжатия",
+          `Сжато в ${item.meta?.compactedItemCount ?? 0} элементов, сохранён хвост ${item.meta?.preservedTailCount ?? 0}`,
+          item.meta?.resultPreviewText ?? ""
+        );
+      case "message":
+      default:
+        return this.createChatMessageElement(item.message, item.dimmed);
+    }
+  }
+
+  private createChatSystemPromptElement(item: Extract<AiChatTranscriptItem, { type: "system-prompt" }>): HTMLElement {
+    const card = this.createChatEntryShell("system-prompt", "промпт", "Системный промпт");
+    const note = document.createElement("div");
+    note.className = "chat-entry-note";
+    note.textContent = "Текущие инструкции";
+
+    const bodyText = document.createElement("div");
+    bodyText.className = `chat-entry-content${item.isEmpty ? " is-placeholder" : ""}`;
+    bodyText.textContent = item.isEmpty ? "Пусто" : item.promptText;
+
+    card.querySelector(".chat-entry-body")?.append(note, bodyText);
+    return card;
+  }
+
+  private createChatCompactedRangeElement(
+    item: Extract<AiChatTranscriptItem, { type: "compacted-range" }>
+  ): HTMLElement {
+    const details = document.createElement("details");
+    details.className = "chat-range";
+
+    const summary = document.createElement("summary");
+    summary.className = "chat-range-summary";
+
+    const badge = document.createElement("span");
+    badge.className = "chat-range-badge";
+    badge.textContent = "архив";
+
+    const title = document.createElement("span");
+    title.className = "chat-range-title";
+    title.textContent = `Сжатый фрагмент · ${item.messages.length} сообщений`;
+
+    summary.append(badge, title);
+
+    const body = document.createElement("div");
+    body.className = "chat-range-body";
+    body.append(...item.messages.map((message) => this.createChatMessageElement(message, true)));
+
+    details.append(summary, body);
+    return details;
+  }
+
+  private createChatCompactionEventElement(
+    message: AiChatMessage,
+    titleText: string,
+    summaryText: string,
+    bodyTextValue: string
+  ): HTMLElement {
+    const card = this.createChatEntryShell("compaction", "сжатие", `${titleText} • ${new Date(message.ts).toLocaleTimeString()}`);
+    card.classList.add(`state-${message.state}`);
+
+    const note = document.createElement("div");
+    note.className = "chat-entry-note";
+    note.textContent = summaryText;
+
+    const bodyText = document.createElement("div");
+    const text = bodyTextValue.trim();
+    bodyText.className = `chat-entry-content${text ? "" : " is-placeholder"}`;
+    bodyText.textContent = text || "Пусто";
+
+    card.querySelector(".chat-entry-body")?.append(note, bodyText);
+    return card;
+  }
+
+  private createChatMessageElement(message: AiChatMessage, dimmed = false): HTMLElement {
+    const baseCard = this.createChatEntryShell(
+      message.kind,
+      formatAiEventKindLabel(message.kind),
+      `${formatAiMessageOriginLabel(message.origin)} • ${new Date(message.ts).toLocaleTimeString()}`
+    );
+    baseCard.classList.add(`state-${message.state}`);
+    if (dimmed) {
+      baseCard.classList.add("is-dimmed");
+    }
+
+    const bodyText = document.createElement("div");
+    bodyText.className = "chat-entry-content";
+    bodyText.textContent = message.text || (message.state === "streaming" ? "…" : "");
+    baseCard.querySelector(".chat-entry-body")?.append(bodyText);
+    return baseCard;
+  }
+
+  private createChatEntryShell(kindClass: string, badgeText: string, metaText: string): HTMLElement {
     const card = document.createElement("article");
-    card.className = `chat-entry kind-${message.kind} state-${message.state}`;
+    card.className = `chat-entry kind-${kindClass}`;
 
     const header = document.createElement("div");
     header.className = "chat-entry-header";
 
     const badge = document.createElement("span");
     badge.className = "chat-entry-badge";
-    badge.textContent = message.kind.toUpperCase();
+    badge.textContent = badgeText;
 
     const meta = document.createElement("span");
     meta.className = "chat-entry-meta";
-    meta.textContent = `${message.origin} • ${new Date(message.ts).toLocaleTimeString()}`;
+    meta.textContent = metaText;
 
     const body = document.createElement("div");
     body.className = "chat-entry-body";
-    body.textContent = message.text || (message.state === "streaming" ? "…" : "");
 
     header.append(badge, meta);
     card.append(header, body);
@@ -741,6 +1164,366 @@ class OverlayTerminalController {
     };
   }
 
+  private requireCurrentPageContext(commandLabel: string): { pageKey: string; pageUrl: string } {
+    const pageContext = this.getCurrentPageContext();
+    if (!pageContext) {
+      throw new Error(`${commandLabel} доступна только на обычной вкладке страницы.`);
+    }
+
+    return pageContext;
+  }
+
+  private async ensureRuntimeSnapshotLoaded(): Promise<void> {
+    if (this.currentConfig && this.currentStatus) {
+      return;
+    }
+
+    await this.loadSnapshot();
+  }
+
+  private cloneDefaultConfigValue(path: string): unknown {
+    const defaultValue = readConfigValue(defaultConfig, path);
+    return defaultValue && typeof defaultValue === "object"
+      ? structuredClone(defaultValue)
+      : defaultValue;
+  }
+
+  private requireEditableTerminalConfigField(path: string) {
+    const descriptor = getEditableConfigField(path);
+    if (!descriptor) {
+      throw new Error(`Поле конфига недоступно для терминала: ${path}`);
+    }
+    if (descriptor.sensitive) {
+      throw new Error(`Поле ${path} недоступно в консоли.`);
+    }
+
+    return descriptor;
+  }
+
+  private parseTerminalConfigValue(path: string, valueText: string): unknown {
+    const descriptor = this.requireEditableTerminalConfigField(path);
+    const trimmedValue = valueText.trim();
+
+    if (
+      (descriptor.valueType === "string" || descriptor.valueType === "enum") &&
+      trimmedValue.startsWith("\"") &&
+      trimmedValue.endsWith("\"")
+    ) {
+      const parsedString = JSON.parse(trimmedValue);
+      if (typeof parsedString !== "string") {
+        throw new Error("Строковое значение должно быть JSON-строкой.");
+      }
+      return descriptor.schema.parse(parsedString);
+    }
+
+    if (descriptor.valueType === "string" && trimmedValue === "\"\"") {
+      return descriptor.schema.parse("");
+    }
+
+    return parseConfigFieldDraft(path, valueText);
+  }
+
+  private getAllowedModelRules(): AiAllowedModelRule[] {
+    const config = this.currentConfig ?? defaultConfig;
+    const value = readConfigValue(config, "ai.allowedModels");
+    return normalizeAllowedModelRules(Array.isArray(value) ? value : []);
+  }
+
+  private async fetchModelCatalog(): Promise<{
+    fetchedAt: string;
+    models: AiModelCatalogItem[];
+    warning?: string | null;
+  }> {
+    return AiModelCatalogResultSchema.parse(
+      await sendCommand(COMMANDS.aiModelsCatalog, "overlay", "background")
+    );
+  }
+
+  private findCatalogModel(
+    models: readonly AiModelCatalogItem[],
+    modelId: string
+  ): AiModelCatalogItem | null {
+    const exactMatch = models.find((item) => item.id === modelId);
+    if (exactMatch) {
+      return exactMatch;
+    }
+
+    const normalizedModelId = modelId.toLowerCase();
+    return models.find((item) => item.id.toLowerCase() === normalizedModelId) ?? null;
+  }
+
+  private buildTerminalStatusSnapshot(): Record<string, unknown> {
+    const pageContext = this.getCurrentPageContext();
+    const apiKeyPresent =
+      typeof this.currentConfig?.ai.openAiApiKey === "string" &&
+      this.currentConfig.ai.openAiApiKey.trim().length > 0;
+    const chatStatus =
+      this.aiSession?.status ??
+      (pageContext ? createDefaultAiStatus(pageContext.pageKey, pageContext.pageUrl, apiKeyPresent) : null);
+
+    return {
+      worker: this.currentStatus
+        ? {
+            running: this.currentStatus.running,
+            hostConnected: this.currentStatus.hostConnected,
+            bootId: this.currentStatus.bootId,
+            sessionId: this.currentStatus.sessionId,
+            taskId: this.currentStatus.taskId,
+            startedAt: this.currentStatus.startedAt,
+            lastHeartbeatAt: this.currentStatus.lastHeartbeatAt,
+            reconnectAttempt: this.currentStatus.reconnectAttempt,
+            nativeHostPid: this.currentStatus.nativeHostPid
+          }
+        : null,
+      page: pageContext
+        ? {
+            supported: true,
+            pageKey: pageContext.pageKey,
+            pageUrl: pageContext.pageUrl
+          }
+        : {
+            supported: false,
+            pageUrl: window.location.href
+          },
+      overlay: {
+        visible: this.visible,
+        activeTab: this.activeTab
+      },
+      chat: chatStatus
+        ? {
+            requestState: chatStatus.requestState,
+            pageKey: chatStatus.pageKey,
+            pageUrlSample: chatStatus.pageUrlSample,
+            activeRequestId: chatStatus.activeRequestId,
+            queueCount: chatStatus.queueCount,
+            lastError: chatStatus.lastError,
+            availableActions: chatStatus.availableActions
+          }
+        : null
+    };
+  }
+
+  private buildOverlayTargetPayload(target: TerminalOverlayTarget): { tabId?: number; expectedUrl?: string } {
+    switch (target.type) {
+      case "tab":
+        return {
+          tabId: target.tabId
+        };
+      case "url":
+        return {
+          expectedUrl: target.url
+        };
+      case "current":
+      default:
+        return {};
+    }
+  }
+
+  private resolveChatTarget(
+    target: TerminalChatTarget,
+    commandLabel: string
+  ): { pageKey: string; pageUrl?: string; isCurrentPage: boolean } {
+    if (target.type === "current") {
+      const pageContext = this.requireCurrentPageContext(commandLabel);
+      return {
+        pageKey: pageContext.pageKey,
+        pageUrl: pageContext.pageUrl,
+        isCurrentPage: true
+      };
+    }
+
+    const currentPageContext = this.getCurrentPageContext();
+    if (target.type === "url") {
+      const pageKey = normalizePageKey(target.url);
+      if (!pageKey) {
+        throw new Error(`${commandLabel} требует обычный http(s) URL страницы.`);
+      }
+      return {
+        pageKey,
+        pageUrl: target.url,
+        isCurrentPage: currentPageContext?.pageKey === pageKey
+      };
+    }
+
+    return {
+      pageKey: target.pageKey,
+      pageUrl: target.pageUrl ?? undefined,
+      isCurrentPage: currentPageContext?.pageKey === target.pageKey
+    };
+  }
+
+  private applyAiSessionResult(session: AiChatPageSession, isCurrentPage: boolean): AiChatPageSession {
+    if (isCurrentPage) {
+      this.aiSession = session;
+      this.renderChat();
+    }
+    return session;
+  }
+
+  private parseTerminalSecretValue(valueText: string, commandLabel: string): string {
+    const trimmed = valueText.trim();
+    if (!trimmed.length) {
+      throw new Error(`${commandLabel} требует значение.`);
+    }
+
+    if (trimmed.startsWith("\"") && trimmed.endsWith("\"")) {
+      const parsedValue = JSON.parse(trimmed);
+      if (typeof parsedValue !== "string") {
+        throw new Error(`${commandLabel} принимает строку.`);
+      }
+      return parsedValue;
+    }
+
+    return valueText;
+  }
+
+  private async getAiKeyStatusResult(): Promise<Record<string, unknown>> {
+    const managedKey =
+      typeof this.currentConfig?.ai.openAiApiKey === "string" ? this.currentConfig.ai.openAiApiKey.trim() : "";
+    const currentPageStatus = this.aiSession?.status?.apiKeyPresent ?? null;
+    let sessionApiKeyPresent = currentPageStatus;
+
+    if (sessionApiKeyPresent === null) {
+      const pageContext = this.getCurrentPageContext();
+      if (pageContext) {
+        const response = await sendCommand<{ session: AiChatPageSession }>(
+          COMMANDS.aiChatStatus,
+          "overlay",
+          "background",
+          {
+            pageKey: pageContext.pageKey,
+            pageUrl: pageContext.pageUrl
+          }
+        );
+        const session = AiChatPageSessionSchema.parse(response.session);
+        sessionApiKeyPresent = session.status.apiKeyPresent;
+        this.applyAiSessionResult(session, true);
+      }
+    }
+
+    if (sessionApiKeyPresent === null) {
+      const listResult = await sendCommand<{ sessions: AiChatPageSession[] }>(COMMANDS.aiChatList, "overlay", "background");
+      sessionApiKeyPresent = listResult.sessions.some((session) => session.status.apiKeyPresent);
+    }
+
+    const mode = managedKey.length > 0 ? "managed" : sessionApiKeyPresent ? "environment" : "missing";
+    return {
+      mode,
+      apiKeyPresent: managedKey.length > 0 || sessionApiKeyPresent === true,
+      managed: managedKey.length > 0
+    };
+  }
+
+  private async sendAiChatToTarget(
+    target: TerminalChatTarget,
+    origin: "user" | "code",
+    text: string
+  ): Promise<AiChatPageSession> {
+    const resolvedTarget = this.resolveChatTarget(target, origin === "code" ? "chat.code" : "chat.send");
+    const response = await sendCommand<{ session: AiChatPageSession }>(
+      COMMANDS.aiChatSend,
+      "overlay",
+      "background",
+      {
+        pageKey: resolvedTarget.pageKey,
+        pageUrl: resolvedTarget.pageUrl ?? resolvedTarget.pageKey,
+        origin,
+        text
+      }
+    );
+    const session = AiChatPageSessionSchema.parse(response.session);
+    return this.applyAiSessionResult(session, resolvedTarget.isCurrentPage);
+  }
+
+  private async sendAiChat(origin: "user" | "code", text: string): Promise<AiChatPageSession> {
+    return this.sendAiChatToTarget({ type: "current" }, origin, text);
+  }
+
+  private async resumeAiChatSessionForTarget(target: TerminalChatTarget): Promise<AiChatPageSession> {
+    const resolvedTarget = this.resolveChatTarget(target, "chat.resume");
+    const response = await sendCommand<{ session: AiChatPageSession }>(
+      COMMANDS.aiChatResume,
+      "overlay",
+      "background",
+      {
+        pageKey: resolvedTarget.pageKey
+      }
+    );
+    const session = AiChatPageSessionSchema.parse(response.session);
+    return this.applyAiSessionResult(session, resolvedTarget.isCurrentPage);
+  }
+
+  private async resumeAiChatSession(): Promise<AiChatPageSession> {
+    return this.resumeAiChatSessionForTarget({ type: "current" });
+  }
+
+  private async resetAiChatSessionForTarget(target: TerminalChatTarget): Promise<AiChatPageSession> {
+    const resolvedTarget = this.resolveChatTarget(target, "chat.reset");
+    const response = await sendCommand<{ session: AiChatPageSession }>(
+      COMMANDS.aiChatReset,
+      "overlay",
+      "background",
+      {
+        pageKey: resolvedTarget.pageKey
+      }
+    );
+    const session = AiChatPageSessionSchema.parse(response.session);
+    return this.applyAiSessionResult(session, resolvedTarget.isCurrentPage);
+  }
+
+  private async resetAiChatSession(): Promise<AiChatPageSession> {
+    return this.resetAiChatSessionForTarget({ type: "current" });
+  }
+
+  private async refreshAiChatStatusSessionForTarget(target: TerminalChatTarget): Promise<AiChatPageSession> {
+    const resolvedTarget = this.resolveChatTarget(target, "chat.status");
+    const response = await sendCommand<{ session: AiChatPageSession }>(
+      COMMANDS.aiChatStatus,
+      "overlay",
+      "background",
+      {
+        pageKey: resolvedTarget.pageKey,
+        pageUrl: resolvedTarget.pageUrl
+      }
+    );
+    const session = AiChatPageSessionSchema.parse(response.session);
+    return this.applyAiSessionResult(session, resolvedTarget.isCurrentPage);
+  }
+
+  private async refreshAiChatStatusSession(): Promise<AiChatPageSession> {
+    return this.refreshAiChatStatusSessionForTarget({ type: "current" });
+  }
+
+  private async compactAiChatSessionForTarget(
+    target: TerminalChatTarget,
+    mode: "safe" | "force"
+  ): Promise<{
+    session: AiChatPageSession;
+    triggered: boolean;
+    mode: "safe" | "force";
+    compactionId?: string | null;
+    reason?: string | null;
+    affectedMessageCount?: number;
+    compactedItemCount?: number;
+    preservedTailCount?: number;
+  }> {
+    const resolvedTarget = this.resolveChatTarget(target, mode === "force" ? "chat.compact.force" : "chat.compact");
+    const response = AiChatCompactResultSchema.parse(
+      await sendCommand(
+        COMMANDS.aiChatCompact,
+        "overlay",
+        "background",
+        {
+          pageKey: resolvedTarget.pageKey,
+          pageUrl: resolvedTarget.pageUrl,
+          mode
+        }
+      )
+    );
+    this.applyAiSessionResult(response.session, resolvedTarget.isCurrentPage);
+    return response;
+  }
+
   private subscribeCurrentPageToStream(): void {
     const pageContext = this.getCurrentPageContext();
     if (!pageContext) {
@@ -760,9 +1543,8 @@ class OverlayTerminalController {
   }
 
   private async sendChatMessage(): Promise<void> {
-    const pageContext = this.getCurrentPageContext();
     const text = this.chatInput?.value.trim() ?? "";
-    if (!pageContext || !text) {
+    if (!text) {
       this.renderChatToolRow();
       return;
     }
@@ -770,59 +1552,131 @@ class OverlayTerminalController {
     try {
       this.chatInput!.value = "";
       this.renderChatToolRow();
-      const response = await sendCommand<{ session: AiChatPageSession }>(
-        COMMANDS.aiChatSend,
-        "overlay",
-        "background",
+      await this.sendAiChat("user", text);
+    } catch (error) {
+      this.pushConsole("error", formatUserFacingCommandError(error, "Не удалось отправить сообщение в AI-чат."));
+      await recordLog("content", "chat.send.failed", "Не удалось отправить сообщение в AI-чат.", serializeLogDetails(error), "error");
+    }
+  }
+
+  private openChatQueueImportPicker(): void {
+    if (this.chatQueueImportInProgress || !this.chatQueueFileInput) {
+      return;
+    }
+
+    this.chatQueueFileInput.value = "";
+    this.chatQueueFileInput.click();
+  }
+
+  private async handleChatQueueFileSelection(): Promise<void> {
+    const input = this.chatQueueFileInput;
+    const file = input?.files?.[0] ?? null;
+    if (!file) {
+      return;
+    }
+
+    try {
+      await this.importChatQueueFromFile(file);
+    } catch (error) {
+      const details = serializeLogDetails(error);
+      this.pushConsole(
+        "error",
+        formatUserFacingCommandError(error, `Не удалось загрузить очередь AI-запросов из ${file.name}.`)
+      );
+      await recordLog(
+        "content",
+        "chat.queue-import.failed",
+        "Не удалось загрузить очередь AI-запросов из JSON.",
         {
-          pageKey: pageContext.pageKey,
-          pageUrl: pageContext.pageUrl,
-          origin: "user",
-          text
+          fileName: file.name,
+          ...((details && typeof details === "object" && !Array.isArray(details)) ? details : { error: details })
+        },
+        "error"
+      );
+    } finally {
+      if (input) {
+        input.value = "";
+      }
+    }
+  }
+
+  private async importChatQueueFromFile(file: File): Promise<void> {
+    this.chatQueueImportInProgress = true;
+    this.renderChatToolRow();
+
+    let importedCount = 0;
+    try {
+      const pageContext = this.requireCurrentPageContext("Импорт очереди AI");
+      const target: TerminalChatTarget = {
+        type: "key",
+        pageKey: pageContext.pageKey,
+        pageUrl: pageContext.pageUrl
+      };
+      const parsedRequests = parseAiQueueImportJson(await file.text());
+      this.pushConsole(
+        "system",
+        `Импорт очереди AI из ${file.name} начат: ${parsedRequests.length} ${parsedRequests.length === 1 ? "запрос" : parsedRequests.length < 5 ? "запроса" : "запросов"}.`
+      );
+      await recordLog(
+        "content",
+        "chat.queue-import.started",
+        "Импорт очереди AI из JSON начат.",
+        {
+          fileName: file.name,
+          requestCount: parsedRequests.length
         }
       );
-      this.aiSession = AiChatPageSessionSchema.parse(response.session);
-      this.renderChat();
-    } catch (error) {
-      this.pushConsole("error", error instanceof Error ? error.message : String(error));
-      await recordLog("content", "chat.send.failed", "AI chat send failed.", serializeLogDetails(error), "error");
+
+      for (const [index, request] of parsedRequests.entries()) {
+        try {
+          await this.sendAiChatToTarget(target, request.origin, request.text);
+          importedCount += 1;
+        } catch (error) {
+          throw new Error(
+            `Импорт очереди остановлен на элементе ${index + 1}/${parsedRequests.length}: ${formatUserFacingCommandError(
+              error,
+              "Не удалось поставить AI-запрос в очередь."
+            )}`
+          );
+        }
+      }
+
+      this.pushConsole(
+        "result",
+        `Очередь AI из ${file.name} загружена: ${importedCount}/${parsedRequests.length} ${parsedRequests.length === 1 ? "запрос" : parsedRequests.length < 5 ? "запроса" : "запросов"}.`
+      );
+      await recordLog(
+        "content",
+        "chat.queue-import.completed",
+        "Импорт очереди AI из JSON завершён.",
+        {
+          fileName: file.name,
+          requestCount: parsedRequests.length,
+          importedCount
+        }
+      );
+    } finally {
+      this.chatQueueImportInProgress = false;
+      this.renderChatToolRow();
     }
   }
 
   private async resumeChat(): Promise<void> {
-    const pageContext = this.getCurrentPageContext();
-    if (!pageContext) {
-      return;
+    try {
+      await this.resumeAiChatSession();
+    } catch (error) {
+      this.pushConsole("error", formatUserFacingCommandError(error, "Не удалось возобновить AI-чат."));
+      await recordLog("content", "chat.resume.failed", "Не удалось возобновить AI-чат.", serializeLogDetails(error), "error");
     }
-
-    const response = await sendCommand<{ session: AiChatPageSession }>(
-      COMMANDS.aiChatResume,
-      "overlay",
-      "background",
-      {
-        pageKey: pageContext.pageKey
-      }
-    );
-    this.aiSession = AiChatPageSessionSchema.parse(response.session);
-    this.renderChat();
   }
 
   private async resetChat(): Promise<void> {
-    const pageContext = this.getCurrentPageContext();
-    if (!pageContext) {
-      return;
+    try {
+      await this.resetAiChatSession();
+    } catch (error) {
+      this.pushConsole("error", formatUserFacingCommandError(error, "Не удалось сбросить AI-чат."));
+      await recordLog("content", "chat.reset.failed", "Не удалось сбросить AI-чат.", serializeLogDetails(error), "error");
     }
-
-    const response = await sendCommand<{ session: AiChatPageSession }>(
-      COMMANDS.aiChatReset,
-      "overlay",
-      "background",
-      {
-        pageKey: pageContext.pageKey
-      }
-    );
-    this.aiSession = AiChatPageSessionSchema.parse(response.session);
-    this.renderChat();
   }
 
   private renderActivityFeed(forceScrollToEnd = false): void {
@@ -944,7 +1798,7 @@ class OverlayTerminalController {
 
     const level = document.createElement("span");
     level.className = `log-level level-${entry.level}`;
-    level.textContent = entry.level;
+    level.textContent = formatOverlayLogLevel(entry.level);
 
     const headingBlock = document.createElement("span");
     headingBlock.className = "log-heading-block";
@@ -966,7 +1820,7 @@ class OverlayTerminalController {
 
     const body = document.createElement("pre");
     body.className = "log-body";
-    body.textContent = serializeLogDetails(entry.details) || "No details";
+    body.textContent = serializeLogDetails(entry.details) || "Подробности отсутствуют";
 
     details.append(summary, meta, body);
     return details;
@@ -975,28 +1829,28 @@ class OverlayTerminalController {
   private getTerminalActivityBadgeLabel(kind: OverlayConsoleEntryKind): string {
     switch (kind) {
       case "command":
-        return "CMD";
+        return "КОМ";
       case "result":
-        return "OK";
+        return "ОК";
       case "error":
-        return "ERR";
+        return "ОШ";
       case "system":
       default:
-        return "SYS";
+        return "СИС";
     }
   }
 
   private getTerminalActivityTitle(kind: OverlayConsoleEntryKind): string {
     switch (kind) {
       case "command":
-        return "Terminal command";
+        return "Команда терминала";
       case "result":
-        return "Terminal response";
+        return "Ответ терминала";
       case "error":
-        return "Terminal error";
+        return "Ошибка терминала";
       case "system":
       default:
-        return "Overlay event";
+        return "Событие оверлея";
     }
   }
 
@@ -1117,6 +1971,501 @@ class OverlayTerminalController {
     this.closeTerminalSuggestions();
   }
 
+  private formatTerminalOutput(output: unknown): string {
+    if (typeof output === "string") {
+      return output;
+    }
+
+    const serialized = JSON.stringify(output, null, 2);
+    if (typeof serialized === "string") {
+      return serialized;
+    }
+
+    return String(output);
+  }
+
+  private async applyTerminalPostAction(
+    postAction: TerminalExecutionResult["postAction"] | undefined
+  ): Promise<void> {
+    if (!postAction) {
+      return;
+    }
+
+    if (postAction.type === "close-overlay") {
+      await this.close();
+      return;
+    }
+
+    this.setActiveTab(postAction.tab, true, false);
+  }
+
+  private async applyConfigValueCommand(path: string, value: unknown): Promise<TerminalExecutionResult> {
+    const descriptor = this.requireEditableTerminalConfigField(path);
+
+    if (path === "ui.overlay.visible" && value === false) {
+      return {
+        output: {
+          path,
+          scope: descriptor.scope,
+          value,
+          hidden: true
+        },
+        logDetails: {
+          path,
+          scope: descriptor.scope,
+          value
+        },
+        postAction: {
+          type: "close-overlay"
+        }
+      };
+    }
+
+    await this.sendConfigPatch(descriptor.scope, buildConfigPatchFromPath(path, value));
+    return {
+      output: {
+        path,
+        scope: descriptor.scope,
+        value
+      },
+      logDetails: {
+        path,
+        scope: descriptor.scope,
+        value
+      },
+      postAction:
+        path === "ui.overlay.activeTab"
+          ? {
+              type: "switch-overlay-tab",
+              tab: value as OverlayTab
+            }
+          : undefined
+    };
+  }
+
+  private async resetConfigFieldCommand(path: string): Promise<TerminalExecutionResult> {
+    const defaultValue = this.cloneDefaultConfigValue(path);
+    return this.applyConfigValueCommand(path, defaultValue);
+  }
+
+  private async executeLocalTerminalCommand(
+    parsed: Extract<ParsedTerminalCommand, { kind: "local" }>
+  ): Promise<TerminalExecutionResult | null> {
+    if (parsed.action === "clear") {
+      this.consoleEntries = [];
+      this.activityOpenState.clear();
+      this.visibleActivitySequenceFloor = this.nextActivitySequence;
+      this.renderActivityFeed(true);
+      return null;
+    }
+
+    if (parsed.action === "help") {
+      return {
+        output: getTerminalHelpLines(this.getTerminalCatalogOptions(), parsed.topic).join("\n")
+      };
+    }
+
+    await this.ensureRuntimeSnapshotLoaded();
+    return {
+      output: this.buildTerminalStatusSnapshot()
+    };
+  }
+
+  private async executeAliasCommand(
+    parsed: Extract<ParsedTerminalCommand, { kind: "alias" }>
+  ): Promise<TerminalExecutionResult> {
+    await this.ensureRuntimeSnapshotLoaded();
+
+    switch (parsed.namespace) {
+      case "config":
+        switch (parsed.action) {
+          case "paths":
+            return {
+              output: {
+                prefix: parsed.prefix,
+                paths: getEditableConfigPaths({
+                  prefix: parsed.prefix ?? undefined,
+                  includeSensitive: false
+                })
+              },
+              logDetails: {
+                prefix: parsed.prefix
+              }
+            };
+          case "get":
+            if (!parsed.path) {
+              return {
+                output: omitSensitiveConfigData(structuredClone(this.currentConfig ?? defaultConfig))
+              };
+            }
+
+            return {
+              output: {
+                path: parsed.path,
+                scope: this.requireEditableTerminalConfigField(parsed.path).scope,
+                value: readConfigValue(this.currentConfig ?? defaultConfig, parsed.path)
+              },
+              logDetails: {
+                path: parsed.path
+              }
+            };
+          case "set":
+            return this.applyConfigValueCommand(parsed.path, this.parseTerminalConfigValue(parsed.path, parsed.valueText));
+          case "reset-field":
+            return this.resetConfigFieldCommand(parsed.path);
+          case "reset": {
+            const snapshot = await this.sendConfigReset(parsed.scope);
+            const sanitizedConfig = omitSensitiveConfigData(structuredClone(snapshot.config));
+            return {
+              output: {
+                scope: parsed.scope,
+                config: sanitizedConfig,
+                workerStatus: snapshot.workerStatus,
+                logCount: snapshot.logs.length
+              },
+              logDetails: {
+                scope: parsed.scope
+              },
+              postAction:
+                parsed.scope === "session" && snapshot.config.ui.overlay.visible === false
+                  ? {
+                      type: "close-overlay"
+                    }
+                  : undefined
+            };
+          }
+        }
+        break;
+      case "ai-key":
+        switch (parsed.action) {
+          case "status":
+            return {
+              output: await this.getAiKeyStatusResult()
+            };
+          case "set": {
+            const nextValue = this.parseTerminalSecretValue(parsed.valueText, "ai.key.set");
+            await this.sendConfigPatch("local", buildConfigPatchFromPath("ai.openAiApiKey", nextValue));
+            return {
+              output: {
+                mode: "managed",
+                apiKeyPresent: nextValue.trim().length > 0
+              },
+              logDetails: {
+                path: "ai.openAiApiKey",
+                action: "set",
+                redacted: true
+              }
+            };
+          }
+          case "clear":
+            await this.sendConfigPatch("local", buildConfigPatchFromPath("ai.openAiApiKey", ""));
+            return {
+              output: {
+                mode: "missing",
+                apiKeyPresent: false
+              },
+              logDetails: {
+                path: "ai.openAiApiKey",
+                action: "clear",
+                redacted: true
+              }
+            };
+          case "unmanage":
+            await this.sendConfigPatch("local", buildConfigPatchFromPath("ai.openAiApiKey", null));
+            return {
+              output: {
+                mode: "environment",
+                managed: false
+              },
+              logDetails: {
+                path: "ai.openAiApiKey",
+                action: "unmanage",
+                redacted: true
+              }
+            };
+        }
+        break;
+      case "chat":
+        switch (parsed.action) {
+          case "status":
+            return {
+              output: {
+                session: await this.refreshAiChatStatusSessionForTarget(parsed.target)
+              }
+            };
+          case "send":
+            return {
+              output: {
+                session: await this.sendAiChatToTarget(parsed.target, "user", parsed.text)
+              },
+              logDetails: {
+                target: parsed.target,
+                origin: "user",
+                text: parsed.text
+              }
+            };
+          case "code":
+            return {
+              output: {
+                session: await this.sendAiChatToTarget(parsed.target, "code", parsed.text)
+              },
+              logDetails: {
+                target: parsed.target,
+                origin: "code",
+                text: parsed.text
+              }
+            };
+          case "resume":
+            return {
+              output: {
+                session: await this.resumeAiChatSessionForTarget(parsed.target)
+              }
+            };
+          case "reset":
+            return {
+              output: {
+                session: await this.resetAiChatSessionForTarget(parsed.target)
+              }
+            };
+          case "list":
+            return {
+              output: await sendCommand(COMMANDS.aiChatList, "overlay", "background")
+            };
+          case "compact":
+            return {
+              output: await this.compactAiChatSessionForTarget(parsed.target, parsed.mode),
+              logDetails: {
+                target: parsed.target,
+                mode: parsed.mode
+              }
+            };
+        }
+        break;
+      case "models":
+        switch (parsed.action) {
+          case "list":
+            return {
+              output: await this.fetchModelCatalog()
+            };
+          case "allow-list":
+            return {
+              output: {
+                allowedModels: this.getAllowedModelRules()
+              }
+            };
+          case "allow-clear": {
+            const nextRules: AiAllowedModelRule[] = [];
+            await this.sendConfigPatch("local", buildConfigPatchFromPath("ai.allowedModels", nextRules));
+            return {
+              output: {
+                allowedModels: nextRules
+              },
+              logDetails: {
+                path: "ai.allowedModels",
+                value: nextRules
+              }
+            };
+          }
+          case "allow-add": {
+            const catalog = await this.fetchModelCatalog();
+            const catalogModel = this.findCatalogModel(catalog.models, parsed.model);
+            if (!catalogModel) {
+              throw new Error(`Модель ${parsed.model} не найдена в каталоге.`);
+            }
+            if (!isAiModelTierAvailable(catalogModel, parsed.tier)) {
+              throw new Error(`Модель ${catalogModel.id} недоступна в тарифе ${parsed.tier}.`);
+            }
+
+            const nextRules = normalizeAllowedModelRules([
+              ...this.getAllowedModelRules(),
+              {
+                model: catalogModel.id,
+                tier: parsed.tier
+              }
+            ]);
+            await this.sendConfigPatch("local", buildConfigPatchFromPath("ai.allowedModels", nextRules));
+            return {
+              output: {
+                allowedModels: nextRules
+              },
+              logDetails: {
+                path: "ai.allowedModels",
+                value: nextRules
+              }
+            };
+          }
+          case "allow-remove": {
+            const targetModel = parsed.model.toLowerCase();
+            const nextRules = this.getAllowedModelRules().filter(
+              (rule) => !(rule.model.toLowerCase() === targetModel && rule.tier === parsed.tier)
+            );
+            await this.sendConfigPatch("local", buildConfigPatchFromPath("ai.allowedModels", nextRules));
+            return {
+              output: {
+                allowedModels: nextRules
+              },
+              logDetails: {
+                path: "ai.allowedModels",
+                value: nextRules
+              }
+            };
+          }
+          case "select": {
+            const catalog = await this.fetchModelCatalog();
+            const catalogModel = this.findCatalogModel(catalog.models, parsed.model);
+            if (!catalogModel) {
+              throw new Error(`Модель ${parsed.model} не найдена в каталоге.`);
+            }
+            if (!isAiModelTierAvailable(catalogModel, parsed.tier)) {
+              throw new Error(`Модель ${catalogModel.id} недоступна в тарифе ${parsed.tier}.`);
+            }
+
+            const nextSelection = {
+              model: catalogModel.id,
+              tier: parsed.tier as AiServiceTier
+            };
+            const isAllowed = this.getAllowedModelRules().some(
+              (rule) => rule.model === nextSelection.model && rule.tier === nextSelection.tier
+            );
+            if (!isAllowed) {
+              throw new Error("Сначала добавьте модель через models.allow add.");
+            }
+
+            const path = parsed.target === "chat" ? "ai.chat.model" : "ai.compaction.modelOverride";
+            return this.applyConfigValueCommand(path, nextSelection);
+          }
+        }
+        break;
+      case "logs":
+        switch (parsed.action) {
+          case "tail":
+            return {
+              output: await sendCommand(COMMANDS.logList, "overlay", "background", {
+                limit: parsed.limit
+              }),
+              logDetails: {
+                limit: parsed.limit
+              }
+            };
+          case "subscribe":
+            return {
+              output: await sendCommand(COMMANDS.logSubscribe, "overlay", "background", {
+                since: parsed.since
+              }),
+              logDetails: {
+                since: parsed.since
+              }
+            };
+          case "note":
+            return {
+              output: await sendCommand(COMMANDS.logRecord, "overlay", "background", {
+                level: "info",
+                source: "overlay",
+                event: "manual.note",
+                summary: parsed.summary
+              }),
+              logDetails: {
+                summary: parsed.summary
+              }
+            };
+        }
+        break;
+      case "overlay":
+        switch (parsed.action) {
+          case "probe":
+            return {
+              output: await sendCommand(COMMANDS.overlayProbe, "overlay", "background", this.buildOverlayTargetPayload(parsed.target)),
+              logDetails: this.buildOverlayTargetPayload(parsed.target)
+            };
+          case "open":
+            return {
+              output: await sendCommand(COMMANDS.overlayOpen, "overlay", "background", this.buildOverlayTargetPayload(parsed.target)),
+              logDetails: this.buildOverlayTargetPayload(parsed.target)
+            };
+          case "close":
+            if (parsed.target.type === "current") {
+              return {
+                output: {
+                  closed: true,
+                  current: true
+                },
+                postAction: {
+                  type: "close-overlay"
+                }
+              };
+            }
+            return {
+              output: await sendCommand(COMMANDS.overlayClose, "overlay", "background", this.buildOverlayTargetPayload(parsed.target)),
+              logDetails: this.buildOverlayTargetPayload(parsed.target)
+            };
+          case "tab":
+            return this.applyConfigValueCommand("ui.overlay.activeTab", parsed.tab);
+          case "hide":
+            return {
+              output: {
+                hidden: true
+              },
+              postAction: {
+                type: "close-overlay"
+              }
+            };
+        }
+        break;
+      case "popup":
+        switch (parsed.action) {
+          case "tab":
+            return this.applyConfigValueCommand("ui.popupActiveTab", parsed.tab as PopupTab);
+        }
+        break;
+      case "host":
+        switch (parsed.action) {
+          case "connect":
+            return { output: await sendCommand(COMMANDS.hostConnect, "overlay", "background") };
+          case "disconnect":
+            return { output: await sendCommand(COMMANDS.hostDisconnect, "overlay", "background") };
+          case "status":
+            return { output: await sendCommand(COMMANDS.hostStatus, "overlay", "background") };
+          case "restart":
+            return { output: await sendCommand(COMMANDS.hostRestart, "overlay", "background") };
+          case "crash":
+            return { output: await sendCommand(COMMANDS.testHostCrash, "overlay", "background") };
+        }
+        break;
+      case "worker":
+        switch (parsed.action) {
+          case "start":
+            return { output: await sendCommand(COMMANDS.workerStart, "overlay", "background") };
+          case "stop":
+            return { output: await sendCommand(COMMANDS.workerStop, "overlay", "background") };
+          case "status":
+            return { output: await sendCommand(COMMANDS.workerStatus, "overlay", "background") };
+        }
+        break;
+      case "demo":
+        switch (parsed.action) {
+          case "start":
+            return {
+              output: await sendCommand(
+                COMMANDS.taskDemoStart,
+                "overlay",
+                "background",
+                parsed.taskId ? { taskId: parsed.taskId } : undefined
+              ),
+              logDetails: {
+                taskId: parsed.taskId
+              }
+            };
+          case "stop":
+            return {
+              output: await sendCommand(COMMANDS.taskDemoStop, "overlay", "background")
+            };
+        }
+        break;
+    }
+
+    throw new Error("Неподдерживаемая alias-команда.");
+  }
+
   private async executeCommand(): Promise<void> {
     const rawInput = this.terminalInput?.value ?? "";
     this.terminalInput?.focus();
@@ -1131,37 +2480,39 @@ class OverlayTerminalController {
 
       this.pushConsole("command", `NT3> ${parsed.raw}`);
 
+      let result: TerminalExecutionResult | null;
       if (parsed.kind === "local") {
-        if (parsed.action === "clear") {
-          this.consoleEntries = [];
-          this.activityOpenState.clear();
-          this.visibleActivitySequenceFloor = this.nextActivitySequence;
-          this.renderActivityFeed(true);
-          return;
-        }
+        result = await this.executeLocalTerminalCommand(parsed);
+      } else if (parsed.kind === "alias") {
+        result = await this.executeAliasCommand(parsed);
+      } else {
+        result = {
+          output: await sendCommand(parsed.action, "overlay", "background", parsed.payload),
+          logDetails: parsed.payload
+        };
+      }
 
-        this.pushConsole("result", getTerminalHelpLines(this.getTerminalCatalogOptions()).join("\n"));
+      if (!result) {
         return;
       }
 
-      const result = await sendCommand(
-        parsed.action,
-        "overlay",
-        "background",
-        parsed.payload
+      this.pushConsole("result", this.formatTerminalOutput(result.output));
+      await recordLog(
+        "content",
+        "overlay.command",
+        `Выполнена команда ${parsed.raw}.`,
+        result.logDetails ?? (parsed.kind === "protocol" ? parsed.payload : { raw: parsed.raw })
       );
-
-      this.pushConsole("result", JSON.stringify(result, null, 2));
-      await recordLog("content", "overlay.command", `Executed ${parsed.action}.`, parsed.payload);
+      await this.applyTerminalPostAction(result.postAction);
     } catch (error) {
       this.pushConsole(
         "error",
-        error instanceof Error ? error.message : String(error)
+        formatUserFacingCommandError(error, "Не удалось выполнить команду терминала.")
       );
       await recordLog(
         "content",
         "overlay.command.failed",
-        "Overlay terminal command failed.",
+        "Не удалось выполнить команду оверлейного терминала.",
         { message: error instanceof Error ? error.message : String(error) },
         "error"
       );
@@ -1182,26 +2533,43 @@ class OverlayTerminalController {
     this.renderActivityFeed(true);
   }
 
+  private applyRuntimeCommandResult(result: RuntimeSnapshotResponse): RuntimeSnapshotResponse {
+    const parsedConfig = ExtensionConfigSchema.parse(result.config);
+    const parsedLogs = result.logs.map((entry) => LogEntrySchema.parse(entry));
+    this.currentConfig = parsedConfig;
+    this.currentStatus = parseRuntimeWorkerStatus(result);
+    this.setRuntimeLogs(parsedLogs);
+    this.applyGeometry(parsedConfig);
+    this.render(true);
+    return {
+      config: parsedConfig,
+      workerStatus: this.currentStatus,
+      logs: parsedLogs
+    };
+  }
+
+  private async sendConfigPatch(scope: "local" | "session", patch: ExtensionConfigPatch): Promise<RuntimeSnapshotResponse> {
+    const result = await sendCommand<RuntimeSnapshotResponse>(COMMANDS.configPatch, "content", "background", {
+      scope,
+      patch
+    });
+    return this.applyRuntimeCommandResult(result);
+  }
+
+  private async sendConfigReset(scope: "local" | "session"): Promise<RuntimeSnapshotResponse> {
+    const result = await sendCommand<RuntimeSnapshotResponse>(COMMANDS.configReset, "content", "background", {
+      scope
+    });
+    return this.applyRuntimeCommandResult(result);
+  }
+
   private async patchOverlaySessionConfig(patch: Partial<ExtensionConfig["ui"]["overlay"]>): Promise<void> {
     try {
-      const result = await sendCommand<{
-        config: ExtensionConfig;
-        workerStatus: WorkerStatus;
-        logs: LogEntry[];
-      }>(COMMANDS.configPatch, "content", "background", {
-        scope: "session",
-        patch: {
-          ui: {
-            overlay: patch
-          }
+      await this.sendConfigPatch("session", {
+        ui: {
+          overlay: patch
         }
       });
-
-      this.currentConfig = ExtensionConfigSchema.parse(result.config);
-      this.currentStatus = WorkerStatusSchema.parse(result.workerStatus);
-      this.setRuntimeLogs(result.logs.map((entry) => LogEntrySchema.parse(entry)));
-      this.applyGeometry(this.currentConfig);
-      this.render(true);
     } catch {
       // Ignore config patch failures during teardown paths.
     }
@@ -1209,24 +2577,11 @@ class OverlayTerminalController {
 
   private async patchOverlayLocalConfig(patch: Partial<ExtensionConfig["ui"]["overlay"]>): Promise<void> {
     try {
-      const result = await sendCommand<{
-        config: ExtensionConfig;
-        workerStatus: WorkerStatus;
-        logs: LogEntry[];
-      }>(COMMANDS.configPatch, "content", "background", {
-        scope: "local",
-        patch: {
-          ui: {
-            overlay: patch
-          }
+      await this.sendConfigPatch("local", {
+        ui: {
+          overlay: patch
         }
       });
-
-      this.currentConfig = ExtensionConfigSchema.parse(result.config);
-      this.currentStatus = WorkerStatusSchema.parse(result.workerStatus);
-      this.setRuntimeLogs(result.logs.map((entry) => LogEntrySchema.parse(entry)));
-      this.applyGeometry(this.currentConfig);
-      this.render(true);
     } catch {
       // Ignore drag persistence failures. The window already moved locally.
     }
@@ -1328,7 +2683,7 @@ class OverlayTerminalController {
       left,
       top
     });
-    await recordLog("content", "overlay.drag", "Overlay terminal moved.", {
+    await recordLog("content", "overlay.drag", "Оверлейный терминал перемещён.", {
       left,
       top
     });
@@ -1586,7 +2941,21 @@ const contentGlobals = globalThis as typeof globalThis & {
 if (!contentGlobals.__lextraceNt3ContentBootstrapped) {
   contentGlobals.__lextraceNt3OverlayController = new OverlayTerminalController();
   contentGlobals.__lextraceNt3ContentBootstrapped = true;
-  void recordLog("content", "content.bootstrap", "Content script bootstrapped.");
+  void recordLog("content", "content.bootstrap", "Контент-скрипт инициализирован.");
+}
+
+function formatOverlayLogLevel(level: LogEntry["level"]): string {
+  switch (level) {
+    case "debug":
+      return "отладка";
+    case "info":
+      return "инфо";
+    case "warn":
+      return "предупр.";
+    case "error":
+    default:
+      return "ошибка";
+  }
 }
 
 const overlayStyles = `
@@ -1745,12 +3114,31 @@ const overlayStyles = `
     display: grid;
   }
 
+  .tab-surface.chat-surface {
+    grid-template-rows: auto 1fr;
+  }
+
   .status-row {
-    display: flex;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
     gap: 0;
     border-bottom: 1px solid #111111;
     background: #ffffff;
+  }
+
+  .status-chip-list {
+    display: grid;
+    min-width: 0;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 108px), 1fr));
+    gap: 0;
+  }
+
+  .status-row-actions {
+    display: flex;
+    align-items: stretch;
+    min-height: 100%;
+    border-left: 1px solid #111111;
+    background: #fafafa;
   }
 
   .tool-row {
@@ -1771,29 +3159,259 @@ const overlayStyles = `
   }
 
   .status-chip {
+    position: relative;
+    display: inline-flex;
+    width: 100%;
+    box-sizing: border-box;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    max-width: 100%;
+    min-height: 24px;
+    border-right: 1px solid #111111;
+    padding: 3px 5px;
+    background: #ffffff;
+    color: #111111;
+    font-size: 10px;
+    letter-spacing: 0.03em;
+    line-height: 1;
+    cursor: default;
+    transition: background 120ms ease, color 120ms ease;
+  }
+
+  .status-chip-icon {
     display: inline-flex;
     align-items: center;
-    min-height: 28px;
-    border-right: 1px solid #111111;
-    padding: 4px 8px;
-    font-size: 11px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
+    justify-content: center;
+    width: 12px;
+    height: 12px;
+    flex: 0 0 auto;
+  }
+
+  .status-chip-icon svg {
+    width: 11px;
+    height: 11px;
+    stroke: currentColor;
+    stroke-width: 1.35;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    fill: none;
+  }
+
+  .status-chip-value {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .status-chip--short .status-chip-value {
+    max-width: 56px;
+  }
+
+  .status-chip--wide .status-chip-value {
+    max-width: 100%;
+  }
+
+  .status-chip--page .status-chip-value {
+    max-width: 100%;
+  }
+
+  .status-chip:hover,
+  .status-chip:focus-visible {
+    background: #f3f3f3;
+    outline: none;
+  }
+
+  .status-chip:focus-visible {
+    box-shadow: inset 0 0 0 2px #111111;
+    z-index: 2;
+  }
+
+  .status-action {
+    appearance: none;
+    border: 0;
+    border-left: 1px solid #111111;
+    background: transparent;
+    color: #111111;
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 28px;
+    min-height: 24px;
+    padding: 0 6px;
+    cursor: pointer;
+    transition: background 120ms ease, color 120ms ease;
+  }
+
+  .status-row-actions .status-action:first-child {
+    border-left: 0;
+  }
+
+  .status-action svg {
+    width: 12px;
+    height: 12px;
+    stroke: currentColor;
+    stroke-width: 1.35;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    fill: none;
+  }
+
+  .status-action:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
 
   .tool-icon {
     appearance: none;
     border: 0;
-    border-right: 1px solid #111111;
+    border-left: 1px solid #111111;
     background: transparent;
     color: #111111;
-    min-height: 32px;
-    padding: 0 10px;
-    font: inherit;
-    font-size: 11px;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 34px;
+    min-height: 34px;
+    padding: 0;
     cursor: pointer;
+    transition: background 120ms ease, color 120ms ease;
+  }
+
+  .tool-icon svg {
+    width: 14px;
+    height: 14px;
+    stroke: currentColor;
+    stroke-width: 1.45;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    fill: none;
+  }
+
+  .tool-icon:disabled {
+    opacity: 0.5;
+    cursor: progress;
+  }
+
+  .tool-icon::before,
+  .tool-icon::after,
+  .status-chip::before,
+  .status-chip::after,
+  .status-action::before,
+  .status-action::after {
+    position: absolute;
+    left: 50%;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transition:
+      opacity 120ms ease,
+      visibility 120ms ease,
+      transform 120ms ease;
+  }
+
+  .tool-icon::before,
+  .status-chip::before,
+  .status-action::before {
+    content: "";
+    bottom: calc(100% + 3px);
+    width: 8px;
+    height: 8px;
+    border-left: 1px solid #111111;
+    border-top: 1px solid #111111;
+    background: #f3f3f3;
+    transform: translateX(-50%) rotate(45deg);
+  }
+
+  .tool-icon::after,
+  .status-chip::after,
+  .status-action::after {
+    content: attr(data-tooltip);
+    display: block;
+    bottom: calc(100% + 8px);
+    padding: 3px 6px;
+    border: 1px solid #111111;
+    background: #f3f3f3;
+    color: #111111;
+    font-family: "Bahnschrift", "Segoe UI Variable Text", "Segoe UI", sans-serif;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    box-shadow: 2px 2px 0 rgba(17, 17, 17, 0.08);
+    transform: translate(-50%, 4px);
+    z-index: 1;
+  }
+
+  .tool-icon::after,
+  .status-action::after {
+    white-space: nowrap;
+  }
+
+  .status-chip::after {
+    width: max-content;
+    max-width: min(320px, calc(100vw - 32px));
+    white-space: normal;
+    overflow-wrap: break-word;
+    word-break: normal;
+    line-height: 1.35;
+    text-align: left;
+    text-transform: none;
+  }
+
+  .tool-icon:hover,
+  .tool-icon:focus-visible {
+    background: #111111;
+    color: #ffffff;
+    outline: none;
+  }
+
+  .tool-icon:focus-visible {
+    box-shadow: inset 0 0 0 2px #ffffff;
+  }
+
+  .status-action:hover,
+  .status-action:focus-visible {
+    background: #111111;
+    color: #ffffff;
+    outline: none;
+  }
+
+  .status-action:focus-visible {
+    box-shadow: inset 0 0 0 2px #ffffff;
+  }
+
+  .tool-icon:hover::before,
+  .tool-icon:hover::after,
+  .tool-icon:focus-visible::before,
+  .tool-icon:focus-visible::after,
+  .status-action:hover::before,
+  .status-action:hover::after,
+  .status-action:focus-visible::before,
+  .status-action:focus-visible::after,
+  .status-chip:hover::before,
+  .status-chip:hover::after,
+  .status-chip:focus-visible::before,
+  .status-chip:focus-visible::after {
+    opacity: 1;
+    visibility: visible;
+  }
+
+  .tool-icon:hover::after,
+  .tool-icon:focus-visible::after,
+  .status-action:hover::after,
+  .status-action:focus-visible::after,
+  .status-chip:hover::after,
+  .status-chip:focus-visible::after {
+    transform: translate(-50%, 0);
+  }
+
+  .tool-icon:active {
+    background: #2f2f2f;
+    color: #ffffff;
   }
 
   .panel-body {
@@ -1931,13 +3549,19 @@ const overlayStyles = `
 
   .chat-form {
     display: grid;
-    grid-template-columns: auto 1fr;
-    gap: 8px;
-    align-items: center;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 0;
+    align-items: stretch;
     border-top: 1px solid #111111;
     background: #ffffff;
-    padding: 0 10px;
+    padding: 0 0 0 10px;
     min-height: 40px;
+  }
+
+  .chat-form .prompt-label {
+    display: inline-flex;
+    align-items: center;
+    margin-right: 8px;
   }
 
   .prompt-label {
@@ -1971,6 +3595,34 @@ const overlayStyles = `
     font-size: 13px;
     color: #111111;
     outline: none;
+  }
+
+  .chat-input-shell {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+  }
+
+  .chat-queue-file-input {
+    display: none;
+  }
+
+  .chat-tool-row {
+    align-self: stretch;
+    flex-shrink: 0;
+    align-items: stretch;
+    min-height: 100%;
+    border-bottom: 0;
+    border-left: 1px solid #111111;
+    background: #f6f6f6;
+  }
+
+  .chat-tool-row .tool-icon:first-child {
+    border-left: 0;
+  }
+
+  .chat-tool-row.is-collapsed {
+    display: none;
   }
 
   .terminal-suggestion-list {
@@ -2121,11 +3773,86 @@ const overlayStyles = `
 
   .chat-entry-body {
     padding: 0 10px 10px;
+    display: grid;
+    gap: 6px;
     font-size: 12px;
     line-height: 1.55;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
     overflow-x: hidden;
+  }
+
+  .chat-entry-note {
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #5b5b5b;
+  }
+
+  .chat-entry-content {
+    min-width: 0;
+  }
+
+  .chat-entry-content.is-placeholder {
+    color: #7a7a7a;
+  }
+
+  .chat-entry.is-dimmed {
+    background: #f6f6f6;
+    opacity: 0.56;
+  }
+
+  .chat-entry.kind-system-prompt {
+    background: #f7f7f7;
+  }
+
+  .chat-entry.kind-system-prompt .chat-entry-badge,
+  .chat-entry.kind-compaction .chat-entry-badge {
+    color: #4b5563;
+  }
+
+  .chat-range {
+    border-bottom: 1px solid rgba(17, 17, 17, 0.14);
+    background: #fafafa;
+  }
+
+  .chat-range-summary {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 8px;
+    align-items: center;
+    min-height: 30px;
+    padding: 5px 8px;
+    cursor: pointer;
+    list-style: none;
+  }
+
+  .chat-range-summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .chat-range-badge {
+    display: inline-flex;
+    justify-content: center;
+    min-width: 52px;
+    border: 1px solid #4b5563;
+    color: #4b5563;
+    padding: 2px 6px;
+    font-size: 10px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+  }
+
+  .chat-range-title {
+    min-width: 0;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #5b5b5b;
+  }
+
+  .chat-range-body {
+    display: grid;
   }
 
   .chat-entry.kind-assistant .chat-entry-badge {
@@ -2137,15 +3864,9 @@ const overlayStyles = `
     color: #1d4ed8;
   }
 
-  .chat-entry.kind-compaction .chat-entry-badge,
-  .chat-entry.kind-rate-limit .chat-entry-badge,
-  .chat-entry.kind-queue .chat-entry-badge,
-  .chat-entry.kind-resume .chat-entry-badge,
-  .chat-entry.kind-reset .chat-entry-badge {
-    color: #4b5563;
-  }
-
   .chat-entry.kind-error .chat-entry-badge {
     color: #b91c1c;
   }
 `;
+
+

@@ -21,6 +21,6 @@ describe("overlay target support", () => {
     expect(result.eligible).toBe(true);
     expect(result.ready).toBe(false);
     expect(result.reason).toBe("content_not_ready");
-    expect(getOverlayUserMessage(result)).toMatch(/reload/i);
+    expect(getOverlayUserMessage(result)).toMatch(/перезагруз/i);
   });
 });

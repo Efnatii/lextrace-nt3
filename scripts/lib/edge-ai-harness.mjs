@@ -49,6 +49,8 @@ export const AI_UI_PATHS = [
   "ai.compaction.triggerPromptTokens",
   "ai.compaction.preserveRecentTurns",
   "ai.compaction.maxPassesPerPage",
+  "ai.promptCaching.routing",
+  "ai.promptCaching.retention",
   "ai.rateLimits.reserveOutputTokens",
   "ai.rateLimits.maxQueuedPerPage",
   "ai.rateLimits.maxQueuedGlobal"
@@ -442,13 +444,19 @@ export async function setAllowedModel(driver, modelId, tier) {
   await waitFor(async () => {
     return driver.executeScript(
       `
+        const tierAliases = {
+          standard: ['standard', 'стандарт'],
+          flex: ['flex'],
+          priority: ['priority', 'приоритет']
+        };
+        const expectedTitles = tierAliases[String(arguments[1] ?? '').toLowerCase()] ?? [String(arguments[1] ?? '').toLowerCase()];
         const button = document.querySelector("button[data-config-path='ai.allowedModels']");
         const panel = document.querySelector('.popup-modal-root .json-model-panel');
         if (!(panel instanceof HTMLElement)) {
           button?.click();
         }
         const sections = [...document.querySelectorAll('.popup-modal-root .json-model-section')];
-        const section = sections.find((element) => element.querySelector('.json-model-section-title')?.textContent?.trim() === arguments[1]);
+        const section = sections.find((element) => expectedTitles.includes((element.querySelector('.json-model-section-title')?.textContent?.trim() ?? '').toLowerCase()));
         return [...(section?.querySelectorAll('.json-model-option') ?? [])].some(
           (element) => element.querySelector('.json-model-name')?.textContent?.trim() === arguments[0]
         );
@@ -460,8 +468,14 @@ export async function setAllowedModel(driver, modelId, tier) {
 
   await driver.executeScript(
     `
+      const tierAliases = {
+        standard: ['standard', 'стандарт'],
+        flex: ['flex'],
+        priority: ['priority', 'приоритет']
+      };
+      const expectedTitles = tierAliases[String(arguments[1] ?? '').toLowerCase()] ?? [String(arguments[1] ?? '').toLowerCase()];
       const sections = [...document.querySelectorAll('.popup-modal-root .json-model-section')];
-      const section = sections.find((element) => element.querySelector('.json-model-section-title')?.textContent?.trim() === arguments[1]);
+      const section = sections.find((element) => expectedTitles.includes((element.querySelector('.json-model-section-title')?.textContent?.trim() ?? '').toLowerCase()));
       const option = [...(section?.querySelectorAll('.json-model-option') ?? [])].find(
         (element) => element.querySelector('.json-model-name')?.textContent?.trim() === arguments[0]
       );
@@ -487,6 +501,12 @@ export async function setModelPanelValue(driver, configPath, modelId, tier) {
   await waitFor(async () => {
     return driver.executeScript(
       `
+        const tierAliases = {
+          standard: ['standard', 'стандарт'],
+          flex: ['flex'],
+          priority: ['priority', 'приоритет']
+        };
+        const expectedTitles = tierAliases[String(arguments[2] ?? '').toLowerCase()] ?? [String(arguments[2] ?? '').toLowerCase()];
         const button = document.querySelector("button[data-config-path='" + arguments[0] + "']");
         let panel = document.querySelector('.popup-modal-root .json-model-panel.is-single-select');
         if (!(panel instanceof HTMLElement)) {
@@ -494,7 +514,7 @@ export async function setModelPanelValue(driver, configPath, modelId, tier) {
           panel = document.querySelector('.popup-modal-root .json-model-panel.is-single-select');
         }
         const sections = [...(panel?.querySelectorAll('.json-model-section') ?? [])];
-        const section = sections.find((element) => element.querySelector('.json-model-section-title')?.textContent?.trim() === arguments[2]);
+        const section = sections.find((element) => expectedTitles.includes((element.querySelector('.json-model-section-title')?.textContent?.trim() ?? '').toLowerCase()));
         return [...(section?.querySelectorAll('.json-model-option.is-single-select') ?? [])].some(
           (element) => element.querySelector('.json-model-name')?.textContent?.trim() === arguments[1]
         );
@@ -507,12 +527,18 @@ export async function setModelPanelValue(driver, configPath, modelId, tier) {
 
   await driver.executeScript(
     `
+      const tierAliases = {
+        standard: ['standard', 'стандарт'],
+        flex: ['flex'],
+        priority: ['priority', 'приоритет']
+      };
+      const expectedTitles = tierAliases[String(arguments[2] ?? '').toLowerCase()] ?? [String(arguments[2] ?? '').toLowerCase()];
       const panel = document.querySelector('.popup-modal-root .json-model-panel.is-single-select');
       if (!(panel instanceof HTMLElement)) {
         throw new Error("Model panel is unavailable for " + arguments[0]);
       }
       const sections = [...panel.querySelectorAll('.json-model-section')];
-      const section = sections.find((element) => element.querySelector('.json-model-section-title')?.textContent?.trim() === arguments[2]);
+      const section = sections.find((element) => expectedTitles.includes((element.querySelector('.json-model-section-title')?.textContent?.trim() ?? '').toLowerCase()));
       const option = [...(section?.querySelectorAll('.json-model-option.is-single-select') ?? [])].find(
         (element) => element.querySelector('.json-model-name')?.textContent?.trim() === arguments[1]
       );
@@ -687,6 +713,56 @@ export async function getOverlayChatStatusText(driver) {
   return typeof text === "string" ? text : "";
 }
 
+export async function getOverlayChatStatusSnapshot(driver) {
+  return driver.executeScript(`
+    const root = document.querySelector('#lextrace-overlay-root')?.shadowRoot;
+    const row = root?.querySelector('[data-role="chat-status-row"]');
+    const chips = [...(row?.querySelectorAll('.status-chip') ?? [])].map((chip) => ({
+      key: chip.getAttribute('data-status-key'),
+      text: chip.textContent?.trim() ?? '',
+      tooltip: chip.getAttribute('data-tooltip'),
+      hiddenByCss: getComputedStyle(chip).display === 'none' || getComputedStyle(chip).visibility === 'hidden'
+    }));
+    return {
+      rootFound: !!root,
+      rowFound: row instanceof HTMLElement,
+      chipCount: chips.length,
+      chipKeys: chips.map((chip) => chip.key),
+      chips
+    };
+  `);
+}
+
+export async function clickOverlayChatReset(driver) {
+  await driver.executeScript(`
+    const root = document.querySelector('#lextrace-overlay-root')?.shadowRoot;
+    const button = root?.querySelector('[data-role="chat-reset"]');
+    if (!(button instanceof HTMLButtonElement)) {
+      throw new Error("Overlay chat reset button is unavailable.");
+    }
+    button.click();
+  `);
+}
+
+export async function importOverlayChatQueue(driver, queuePayload, fileName = "queue.json") {
+  const jsonText = typeof queuePayload === "string" ? queuePayload : JSON.stringify(queuePayload);
+  await driver.executeScript(
+    `
+      const root = document.querySelector('#lextrace-overlay-root')?.shadowRoot;
+      const input = root?.querySelector('[data-role="chat-queue-file"]');
+      if (!(input instanceof HTMLInputElement)) {
+        throw new Error("Overlay chat queue file input is unavailable.");
+      }
+      const transfer = new DataTransfer();
+      transfer.items.add(new File([arguments[0]], arguments[1], { type: 'application/json' }));
+      input.files = transfer.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    `,
+    jsonText,
+    fileName
+  );
+}
+
 export async function getTabIdByUrl(driver, targetUrl) {
   await ensurePopupContext(driver);
   const targetPageKey = normalizePageKey(targetUrl);
@@ -839,6 +915,10 @@ export function buildBaselineAiPatch(selectedModel) {
         triggerPromptTokens: 64,
         preserveRecentTurns: 1,
         maxPassesPerPage: 2
+      },
+      promptCaching: {
+        routing: "stable_session_prefix",
+        retention: "in_memory"
       },
       rateLimits: {
         reserveOutputTokens: 512,

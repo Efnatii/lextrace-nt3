@@ -13,6 +13,7 @@ import {
   AiChatListResultSchema,
   AiChatPageSessionSchema,
   AiModelCatalogResultSchema,
+  formatAiServiceTierLabel,
   type AiModelCatalogItem,
   type AiAllowedModelRule,
   type AiModelSelection,
@@ -34,16 +35,23 @@ import {
 } from "../shared/config-fields";
 import { COMMANDS, OPENAI_API_KEY_ENV_VAR_NAME } from "../shared/constants";
 import { defaultConfig, mergeConfig, type ExtensionConfig, type ExtensionConfigPatch, type PopupTab } from "../shared/config";
-import { ProtocolCommandError, connectRuntimeStream, recordLog, sendCommand } from "../shared/client";
+import { connectRuntimeStream, formatUserFacingCommandError, recordLog, sendCommand } from "../shared/client";
 import { LogEntrySchema, type LogEntry } from "../shared/logging";
 import { OverlayProbeResultSchema, getOverlayUserMessage, type OverlayProbeResult } from "../shared/overlay";
-import { WorkerStatusSchema, type WorkerStatus } from "../shared/runtime-state";
+import { parseRuntimeWorkerStatus, type WorkerStatus } from "../shared/runtime-state";
 
 type RuntimeSnapshot = {
   config: ExtensionConfig;
   workerStatus: WorkerStatus;
   desired: unknown;
   logs: LogEntry[];
+};
+
+type RuntimeSnapshotLike = Partial<RuntimeSnapshot> & {
+  config: unknown;
+  status?: unknown;
+  workerStatus?: unknown;
+  logs?: unknown;
 };
 
 type AllowedModelsPanelState = {
@@ -75,7 +83,7 @@ type ModalTextState = {
 function getRequiredElement<T extends HTMLElement>(selector: string): T {
   const element = document.querySelector<T>(selector);
   if (!element) {
-    throw new Error(`Popup DOM is incomplete. Missing ${selector}.`);
+    throw new Error(`DOM popup неполный. Не найден элемент ${selector}.`);
   }
   return element;
 }
@@ -105,6 +113,7 @@ let currentModelCatalog: AiModelCatalogItem[] = [];
 let currentModelBudgets: AiModelBudgetMap = {};
 let currentModelCatalogFetchedAt: string | null = null;
 let currentModelCatalogError: string | null = null;
+let currentModelCatalogWarning: string | null = null;
 let currentConfigPanelState: ConfigPanelState | null = null;
 let currentModalTextState: ModalTextState | null = null;
 let pendingEditorFocusPath: string | null = null;
@@ -116,40 +125,46 @@ const POPUP_TOOLTIP_ID = "popup-config-tooltip";
 const MODAL_ROOT_ID = "popup-modal-root";
 
 const streamPort = connectRuntimeStream((message) => {
-  const event = (message as { event?: string }).event;
-  if (event === "runtime.snapshot") {
-    applySnapshot(message as Partial<RuntimeSnapshot> & { config: unknown; status: unknown; logs?: unknown });
-    return;
-  }
+  try {
+    const event = (message as { event?: string }).event;
+    if (event === "runtime.snapshot") {
+      applySnapshot(message as RuntimeSnapshotLike);
+      return;
+    }
 
-  if (event === "runtime.status" && "status" in message) {
-    currentStatus = WorkerStatusSchema.parse((message as { status: unknown }).status);
-    renderShell();
-    return;
-  }
+    if (event === "runtime.status") {
+      currentStatus = parseRuntimeWorkerStatus(message);
+      renderShell();
+      return;
+    }
 
-  if (event === "runtime.config" && "config" in message) {
-    currentConfig = validateEffectiveConfig((message as { config: unknown }).config);
-    renderShell();
-    renderConfigViewer();
-    return;
-  }
+    if (event === "runtime.config" && "config" in message) {
+      currentConfig = validateEffectiveConfig((message as { config: unknown }).config);
+      renderShell();
+      renderConfigViewer();
+      return;
+    }
 
-  if (event === "runtime.log" && "logEntry" in message) {
-    const logEntry = LogEntrySchema.parse((message as { logEntry: unknown }).logEntry);
-    currentLogs = [...currentLogs.slice(-399), logEntry];
-    renderShell();
-    return;
-  }
+    if (event === "runtime.log" && "logEntry" in message) {
+      const logEntry = LogEntrySchema.parse((message as { logEntry: unknown }).logEntry);
+      currentLogs = [...currentLogs.slice(-399), logEntry];
+      renderShell();
+      return;
+    }
 
-  if (typeof event === "string" && event.startsWith("ai.chat.") && "session" in message) {
-    hydrateModelBudgetsFromSessions([message]);
-    renderConfigViewer();
+    if (typeof event === "string" && event.startsWith("ai.chat.") && "session" in message) {
+      hydrateModelBudgetsFromSessions([message]);
+      renderConfigViewer();
+    }
+  } catch (error) {
+    void recordLog("popup", "popup.stream.invalid", "Некорректное stream-сообщение проигнорировано.", {
+      error
+    }, "warn");
   }
 });
 
 streamPort.onDisconnect.addListener(() => {
-  void recordLog("popup", "stream.disconnect", "Popup stream disconnected.", null, "warn");
+  void recordLog("popup", "stream.disconnect", "Поток popup отключён.", null, "warn");
 });
 
 void bootstrap();
@@ -170,7 +185,7 @@ async function bootstrap(): Promise<void> {
 
   const snapshot = await sendCommand<RuntimeSnapshot>(COMMANDS.configGet, "popup", "background");
   currentConfig = validateEffectiveConfig(snapshot.config);
-  currentStatus = WorkerStatusSchema.parse(snapshot.workerStatus);
+  currentStatus = parseRuntimeWorkerStatus(snapshot);
   currentLogs = snapshot.logs.map((entry) => LogEntrySchema.parse(entry));
   renderShell();
   renderConfigViewer();
@@ -178,7 +193,7 @@ async function bootstrap(): Promise<void> {
   await refreshModelCatalog();
   await refreshOverlayAvailability();
 
-  await recordLog("popup", "popup.bootstrap", "Popup bootstrapped.");
+  await recordLog("popup", "popup.bootstrap", "Popup инициализирован.");
 }
 
 async function switchTab(tab: PopupTab): Promise<void> {
@@ -195,14 +210,14 @@ async function switchTab(tab: PopupTab): Promise<void> {
     await applyConfigValue("ui.popupActiveTab", tab, false);
   } catch (error) {
     currentConfig = previousConfig;
-    setControlMessage(getUserFacingError(error, "Failed to switch popup tab."), "error");
+    setControlMessage(getUserFacingError(error, "Не удалось переключить вкладку popup."), "error");
     renderShell();
     renderConfigViewer();
-    await recordLog("popup", "popup.tab-switch.failed", "Failed to switch popup tab.", { tab, error }, "error");
+    await recordLog("popup", "popup.tab-switch.failed", "Не удалось переключить вкладку popup.", { tab, error }, "error");
     return;
   }
 
-  await recordLog("popup", "popup.tab-switch", `Switched popup tab to ${tab}.`, { tab });
+  await recordLog("popup", "popup.tab-switch", `Вкладка popup переключена: ${tab}.`, { tab });
 }
 
 async function openTerminal(): Promise<void> {
@@ -230,7 +245,7 @@ async function openTerminal(): Promise<void> {
       buildOverlayTargetPayload(tabId)
     );
     setControlMessage(`Терминал открыт на вкладке ${result.tabId ?? "-"}.`, "ok");
-    await recordLog("popup", "popup.open-terminal", "Requested overlay terminal open.");
+    await recordLog("popup", "popup.open-terminal", "Запрошено открытие оверлейного терминала.");
     await refreshOverlayAvailability();
     renderShell();
   } catch (error) {
@@ -308,9 +323,9 @@ function buildOverlayTargetPayload(tabId: number | null): { tabId?: number; expe
   };
 }
 
-function applySnapshot(snapshot: Partial<RuntimeSnapshot> & { config: unknown; status: unknown; logs?: unknown }): void {
+function applySnapshot(snapshot: RuntimeSnapshotLike): void {
   currentConfig = validateEffectiveConfig(snapshot.config);
-  currentStatus = WorkerStatusSchema.parse(snapshot.status);
+  currentStatus = parseRuntimeWorkerStatus(snapshot);
   currentLogs = Array.isArray(snapshot.logs)
     ? snapshot.logs.map((entry) => LogEntrySchema.parse(entry))
     : currentLogs;
@@ -320,7 +335,7 @@ function applySnapshot(snapshot: Partial<RuntimeSnapshot> & { config: unknown; s
 
 function applyRuntimeSnapshot(snapshot: RuntimeSnapshot): void {
   currentConfig = validateEffectiveConfig(snapshot.config);
-  currentStatus = WorkerStatusSchema.parse(snapshot.workerStatus);
+  currentStatus = parseRuntimeWorkerStatus(snapshot);
   currentLogs = snapshot.logs.map((entry) => LogEntrySchema.parse(entry));
   renderShell();
   renderConfigViewer();
@@ -336,12 +351,12 @@ function renderShell(): void {
     panel.classList.toggle("is-active", panel.dataset.panel === popupTab);
   });
 
-  workerRunning.textContent = currentStatus?.running ? "running" : "stopped";
+  workerRunning.textContent = currentStatus?.running ? "в работе" : "остановлен";
   workerBoot.textContent = currentStatus?.bootId ?? "-";
   workerSession.textContent = currentStatus?.sessionId ?? "-";
   workerTask.textContent = currentStatus?.taskId ?? "-";
 
-  statusBadge.textContent = currentStatus?.hostConnected ? "running" : currentStatus?.running ? "waiting" : "offline";
+  statusBadge.textContent = currentStatus?.hostConnected ? "подключён" : currentStatus?.running ? "ожидание" : "офлайн";
   statusBadge.dataset.state = currentStatus?.hostConnected ? "running" : currentStatus?.running ? "waiting" : "error";
 
   const probeMessage = overlayProbe ? getOverlayUserMessage(overlayProbe) : "Проверка текущей страницы…";
@@ -366,7 +381,7 @@ function renderConfigViewer(): void {
   configViewer.replaceChildren();
 
   if (!currentConfig) {
-    configViewer.textContent = "Загрузка конфига…";
+    configViewer.textContent = "Загрузка настроек…";
     configViewport.scrollTop = previousScrollTop;
     return;
   }
@@ -540,7 +555,8 @@ function appendEditableValue(
     options.forceTooltip && getConfigFieldTooltipValue(path, value).trim().length > 0 ? "always" : "overflow"
   );
 
-  if (valueType === "string" || valueType === "enum") {
+  const rendersNullLiteral = descriptor.editorType === "modal-text" && (value === null || value === "");
+  if ((valueType === "string" || valueType === "enum") && !rendersNullLiteral) {
     appendToken(line, "\"", "json-punctuation");
     line.append(button);
     appendToken(line, "\"", "json-punctuation");
@@ -673,9 +689,9 @@ function createAllowedModelsPanel(currentValue: unknown[]): HTMLDivElement {
   const sortOptions: Array<{ label: string; value: ModelCatalogSort }> = [
     { label: "Имя А-Я", value: "name-asc" },
     { label: "Имя Я-А", value: "name-desc" },
-    { label: "Сначала с ценой", value: "availability" },
-    { label: "Σ дешевле", value: "price-asc" },
-    { label: "Σ дороже", value: "price-desc" },
+    { label: "Сначала доступные", value: "availability" },
+    { label: "Цена ниже", value: "price-asc" },
+    { label: "Цена выше", value: "price-desc" },
     { label: "Вход дешевле", value: "input-asc" },
     { label: "Вход дороже", value: "input-desc" },
     { label: "Выход дешевле", value: "output-asc" },
@@ -707,6 +723,13 @@ function createAllowedModelsPanel(currentValue: unknown[]): HTMLDivElement {
   toolbar.append(count, sortSelect);
   panel.append(toolbar);
 
+  if (currentModelCatalogWarning) {
+    const warning = document.createElement("div");
+    warning.className = "json-model-empty";
+    warning.textContent = currentModelCatalogWarning;
+    panel.append(warning);
+  }
+
   if (currentModelCatalogError) {
     const error = document.createElement("div");
     error.className = "json-model-empty is-error";
@@ -715,7 +738,9 @@ function createAllowedModelsPanel(currentValue: unknown[]): HTMLDivElement {
   } else if (currentModelCatalog.length === 0) {
     const placeholder = document.createElement("div");
     placeholder.className = "json-model-empty";
-    placeholder.textContent = "Загружается каталог моделей OpenAI…";
+    placeholder.textContent = currentModelCatalogFetchedAt
+      ? "Каталог моделей пуст."
+      : "Загружается каталог моделей OpenAI…";
     panel.append(placeholder);
   } else {
     const list = document.createElement("div");
@@ -728,7 +753,7 @@ function createAllowedModelsPanel(currentValue: unknown[]): HTMLDivElement {
 
       const heading = document.createElement("div");
       heading.className = "json-model-section-title";
-      heading.textContent = tier;
+      heading.textContent = formatAiServiceTierLabel(tier);
       section.append(heading);
 
       const sectionList = document.createElement("div");
@@ -740,7 +765,7 @@ function createAllowedModelsPanel(currentValue: unknown[]): HTMLDivElement {
       if (sortedModels.length === 0) {
         const empty = document.createElement("div");
         empty.className = "json-model-empty";
-        empty.textContent = "Нет моделей для этого tier.";
+        empty.textContent = "Для этого тарифа моделей нет.";
         sectionList.append(empty);
       }
 
@@ -808,10 +833,17 @@ function createModelSelectPanel(path: ModelSelectPanelPath): HTMLDivElement {
 
   const meta = document.createElement("span");
   meta.className = "json-model-count";
-  meta.textContent = "Один выбор";
+  meta.textContent = "Один вариант";
 
   toolbar.append(count, meta);
   panel.append(toolbar);
+
+  if (currentModelCatalogWarning) {
+    const warning = document.createElement("div");
+    warning.className = "json-model-empty";
+    warning.textContent = currentModelCatalogWarning;
+    panel.append(warning);
+  }
 
   if (currentModelCatalogError) {
     const error = document.createElement("div");
@@ -843,7 +875,7 @@ function createModelSelectPanel(path: ModelSelectPanelPath): HTMLDivElement {
 
       const heading = document.createElement("div");
       heading.className = "json-model-section-title";
-      heading.textContent = tier;
+      heading.textContent = formatAiServiceTierLabel(tier);
       section.append(heading);
 
       const sectionList = document.createElement("div");
@@ -1020,10 +1052,10 @@ async function toggleAllowedModel(modelId: string, tier: AiServiceTier): Promise
   try {
     await applyConfigValue("ai.allowedModels", nextSelectedRules, false);
     currentConfigFieldError = null;
-    setControlMessage("Конфиг обновлён: ai.allowedModels", "ok");
+    setControlMessage("Настройки обновлены: ai.allowedModels", "ok");
     renderShell();
     renderConfigViewer();
-    await recordLog("popup", "popup.config-edit.commit", "Updated ai.allowedModels.", {
+    await recordLog("popup", "popup.config-edit.commit", "Обновлён список разрешённых моделей.", {
       path: "ai.allowedModels",
       scope: "local",
       value: nextSelectedRules
@@ -1049,10 +1081,10 @@ async function applySingleModelValue(path: ModelSelectPanelPath, selection: AiMo
     await applyConfigValue(path, selection, false);
     currentConfigFieldError = null;
     currentConfigPanelState = null;
-    setControlMessage(`Конфиг обновлён: ${path}`, "ok");
+    setControlMessage(`Настройки обновлены: ${path}`, "ok");
     renderShell();
     renderConfigViewer();
-    await recordLog("popup", "popup.config-edit.commit", `Updated ${path}.`, {
+    await recordLog("popup", "popup.config-edit.commit", `Обновлено значение ${path}.`, {
       path,
       scope: "local",
       value: selection
@@ -1092,10 +1124,10 @@ async function resetConfigFieldToDefault(path: string): Promise<void> {
       await applyConfigValue(path, defaultValue, false);
     }
 
-    setControlMessage(`Сброшено к значению по умолчанию: ${path}`, "ok");
+    setControlMessage(`Сброшено значение по умолчанию: ${path}`, "ok");
     renderShell();
     renderConfigViewer();
-    await recordLog("popup", "popup.config-reset.commit", `Reset ${path} to default value.`, {
+    await recordLog("popup", "popup.config-reset.commit", `Поле ${path} сброшено к значению по умолчанию.`, {
       path,
       scope: descriptor.scope,
       value: defaultValue
@@ -1146,17 +1178,17 @@ async function commitEditing(path: string): Promise<void> {
     currentEditState = null;
     currentConfigFieldError = null;
     if (result.path !== "ui.overlay.visible") {
-      setControlMessage(`Конфиг обновлён: ${result.path}`, "ok");
+      setControlMessage(`Настройки обновлены: ${result.path}`, "ok");
     }
     renderShell();
     renderConfigViewer();
-    await recordLog("popup", "popup.config-edit.commit", `Updated ${result.path}.`, {
+    await recordLog("popup", "popup.config-edit.commit", `Обновлено значение ${result.path}.`, {
       path: result.path,
       scope: result.scope,
       value: result.value
     });
   } catch (error) {
-    const failedMessage = getUserFacingError(error, "Config update failed.");
+    const failedMessage = getUserFacingError(error, "Не удалось обновить настройки.");
     currentEditState = null;
     currentConfigFieldError = {
       path,
@@ -1175,7 +1207,7 @@ async function commitEditing(path: string): Promise<void> {
 async function applyConfigValue(path: string, value: unknown, refreshViewer = true): Promise<void> {
   const descriptor = getEditableConfigField(path);
   if (!descriptor) {
-    throw new Error(`Config field is not editable: ${path}`);
+    throw new Error(`Поле конфига недоступно для редактирования: ${path}`);
   }
 
   await applyConfigPatch(descriptor.scope, buildConfigPatchFromPath(path, value));
@@ -1192,7 +1224,7 @@ async function applyConfigPatch(scope: "local" | "session", patch: ExtensionConf
   });
 
   currentConfig = validateEffectiveConfig(snapshot.config);
-  currentStatus = WorkerStatusSchema.parse(snapshot.workerStatus);
+  currentStatus = parseRuntimeWorkerStatus(snapshot);
   currentLogs = snapshot.logs.map((entry) => LogEntrySchema.parse(entry));
   await refreshAiSessionBudgets();
 }
@@ -1257,11 +1289,13 @@ async function refreshModelCatalog(): Promise<void> {
     );
     currentModelCatalog = result.models;
     currentModelCatalogFetchedAt = result.fetchedAt;
+    currentModelCatalogWarning = result.warning ?? null;
     currentModelCatalogError = null;
     renderConfigViewer();
   } catch (error) {
     currentModelCatalog = [];
     currentModelCatalogFetchedAt = null;
+    currentModelCatalogWarning = null;
     currentModelCatalogError = getUserFacingError(error, "Каталог моделей OpenAI недоступен.");
     renderConfigViewer();
     await recordLog("popup", "popup.model-catalog.failed", currentModelCatalogError, {
@@ -1278,7 +1312,7 @@ async function refreshAiSessionBudgets(): Promise<void> {
     hydrateModelBudgetsFromSessions(result.sessions);
   } catch (error) {
     currentModelBudgets = {};
-    await recordLog("popup", "popup.ai-budgets.failed", "Не удалось загрузить AI budget telemetry.", {
+    await recordLog("popup", "popup.ai-budgets.failed", "Не удалось загрузить телеметрию лимитов AI.", {
       error
     }, "warn");
   }
@@ -1538,7 +1572,7 @@ function createModalFrame(titleText: string, bodyContent: HTMLElement): HTMLDivE
   const closeButton = document.createElement("button");
   closeButton.type = "button";
   closeButton.className = "popup-modal-button";
-  closeButton.textContent = "Close";
+  closeButton.textContent = "Закрыть";
   closeButton.addEventListener("click", closePopupModal);
 
   actions.append(closeButton);
@@ -1569,13 +1603,13 @@ function createModalTextEditorContent(): HTMLDivElement {
   const cancelButton = document.createElement("button");
   cancelButton.type = "button";
   cancelButton.className = "popup-modal-button";
-  cancelButton.textContent = "Cancel";
+  cancelButton.textContent = "Отмена";
   cancelButton.addEventListener("click", closePopupModal);
 
   const saveButton = document.createElement("button");
   saveButton.type = "button";
   saveButton.className = "popup-modal-button is-primary";
-  saveButton.textContent = "Save";
+  saveButton.textContent = "Сохранить";
   saveButton.addEventListener("click", () => {
     void commitModalTextEditor();
   });
@@ -1633,10 +1667,10 @@ async function commitModalTextEditor(): Promise<void> {
     await applyConfigValue(modalState.path, modalState.draft, false);
     currentConfigFieldError = null;
     currentModalTextState = null;
-    setControlMessage(`Конфиг обновлён: ${modalState.path}`, "ok");
+    setControlMessage(`Настройки обновлены: ${modalState.path}`, "ok");
     renderShell();
     renderConfigViewer();
-    await recordLog("popup", "popup.config-edit.commit", `Updated ${modalState.path}.`, {
+    await recordLog("popup", "popup.config-edit.commit", `Обновлено значение ${modalState.path}.`, {
       path: modalState.path,
       scope: "local",
       valueLength: modalState.draft.length
@@ -1659,7 +1693,7 @@ async function commitModalTextEditor(): Promise<void> {
 
 function getModalTextEditorNote(path: ModalTextPath | null): string | null {
   if (path === "ai.openAiApiKey") {
-    return `A non-empty value writes ${OPENAI_API_KEY_ENV_VAR_NAME} for the current Windows user. Save an empty value to remove the variable.`;
+    return `Непустое значение запишет ${OPENAI_API_KEY_ENV_VAR_NAME} для текущего пользователя Windows. Сохраните пустой текст, чтобы удалить переменную.`;
   }
 
   return null;
@@ -1674,17 +1708,5 @@ function setControlMessage(
 }
 
 function getUserFacingError(error: unknown, fallbackMessage: string): string {
-  if (error instanceof ProtocolCommandError) {
-    if (error.code === "unsupported_tab") {
-      return "Терминал недоступен: переключитесь на обычную http(s)-страницу.";
-    }
-    if (error.code === "content_not_ready") {
-      return "Терминал недоступен: перезагрузите страницу и повторите попытку.";
-    }
-    if (error.message) {
-      return error.message;
-    }
-  }
-
-  return error instanceof Error && error.message ? error.message : fallbackMessage;
+  return formatUserFacingCommandError(error, fallbackMessage);
 }

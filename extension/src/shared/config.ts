@@ -8,12 +8,20 @@ import {
 } from "./ai";
 import { NATIVE_HOST_NAME, PROTOCOL_VERSION } from "./constants";
 
+export const DEFAULT_AI_COMPACTION_INSTRUCTIONS =
+  "Summarize the conversation history into compact, faithful context for the next turn. " +
+  "Preserve the user's goals, accepted decisions, constraints, important facts, open questions, " +
+  "unfinished work, and any code or data details that still matter. Remove repetition and low-value " +
+  "chatter. Do not invent facts or change meaning.";
+
 const AllowedModelsSchema = z
   .array(z.union([AiAllowedModelRuleSchema, z.string().min(1)]))
   .transform((value) => normalizeAllowedModelRules(value));
 const NullableModelSelectionSchema = z
   .union([AiModelSelectionSchema, z.string(), z.null()])
   .transform((value) => normalizeAiModelSelection(value));
+const PromptCachingRoutingSchema = z.enum(["stable_session_prefix", "provider_default"]);
+const PromptCachingRetentionSchema = z.enum(["in_memory", "24h"]);
 const JsonSchemaTextSchema = z.string().superRefine((value, context) => {
   const trimmed = value.trim();
   if (!trimmed) {
@@ -25,13 +33,13 @@ const JsonSchemaTextSchema = z.string().superRefine((value, context) => {
     if (!parsedValue || typeof parsedValue !== "object" || Array.isArray(parsedValue)) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "Structured output schema must be a JSON object."
+        message: "Схема структурированного вывода должна быть JSON-объектом."
       });
     }
   } catch {
     context.addIssue({
       code: z.ZodIssueCode.custom,
-      message: "Structured output schema must be valid JSON."
+      message: "Схема структурированного вывода должна быть корректным JSON."
     });
   }
 });
@@ -96,6 +104,10 @@ export const ExtensionConfigSchema = z.object({
       triggerPromptTokens: z.number().int().min(32),
       preserveRecentTurns: z.number().int().min(0),
       maxPassesPerPage: z.number().int().min(1)
+    }),
+    promptCaching: z.object({
+      routing: PromptCachingRoutingSchema,
+      retention: PromptCachingRetentionSchema
     }),
     rateLimits: z.object({
       reserveOutputTokens: z.number().int().min(1),
@@ -181,6 +193,12 @@ export const ExtensionConfigPatchSchema = z.object({
           maxPassesPerPage: z.number().int().min(1).optional()
         })
         .optional(),
+      promptCaching: z
+        .object({
+          routing: PromptCachingRoutingSchema.optional(),
+          retention: PromptCachingRetentionSchema.optional()
+        })
+        .optional(),
       rateLimits: z
         .object({
           reserveOutputTokens: z.number().int().min(1).optional(),
@@ -252,10 +270,14 @@ export const defaultConfig: ExtensionConfig = {
       enabled: true,
       streamingEnabled: true,
       modelOverride: null,
-      instructions: "",
+      instructions: DEFAULT_AI_COMPACTION_INSTRUCTIONS,
       triggerPromptTokens: 131072,
       preserveRecentTurns: 24,
       maxPassesPerPage: 16
+    },
+    promptCaching: {
+      routing: "stable_session_prefix",
+      retention: "in_memory"
     },
     rateLimits: {
       reserveOutputTokens: 32768,
@@ -268,6 +290,11 @@ export const defaultConfig: ExtensionConfig = {
     allowHostCrashCommand: true
   }
 };
+
+function resolveAiCompactionInstructions(instructions: string): string {
+  const trimmed = instructions.trim();
+  return trimmed.length > 0 ? trimmed : DEFAULT_AI_COMPACTION_INSTRUCTIONS;
+}
 
 export function mergeConfig(base: ExtensionConfig, patch?: ExtensionConfigPatch | null): ExtensionConfig {
   const safePatch = normalizeConfigPatch(patch ?? {});
@@ -313,6 +340,10 @@ export function mergeConfig(base: ExtensionConfig, patch?: ExtensionConfigPatch 
         ...base.ai.compaction,
         ...(safePatch.ai?.compaction ?? {})
       },
+      promptCaching: {
+        ...base.ai.promptCaching,
+        ...(safePatch.ai?.promptCaching ?? {})
+      },
       rateLimits: {
         ...base.ai.rateLimits,
         ...(safePatch.ai?.rateLimits ?? {})
@@ -323,6 +354,8 @@ export function mergeConfig(base: ExtensionConfig, patch?: ExtensionConfigPatch 
       ...(safePatch.test ?? {})
     }
   };
+
+  merged.ai.compaction.instructions = resolveAiCompactionInstructions(merged.ai.compaction.instructions);
 
   return ExtensionConfigSchema.parse(merged);
 }
@@ -375,6 +408,10 @@ export function mergeConfigPatch(
       compaction: {
         ...(safeBasePatch.ai?.compaction ?? {}),
         ...(safeNextPatch.ai?.compaction ?? {})
+      },
+      promptCaching: {
+        ...(safeBasePatch.ai?.promptCaching ?? {}),
+        ...(safeNextPatch.ai?.promptCaching ?? {})
       },
       rateLimits: {
         ...(safeBasePatch.ai?.rateLimits ?? {}),

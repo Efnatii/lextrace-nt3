@@ -65,3 +65,92 @@ export function connectRuntimeStream(handler: RuntimeStreamHandler): chrome.runt
 
   return port;
 }
+
+export function formatUserFacingCommandError(error: unknown, fallbackMessage: string): string {
+  if (error instanceof ProtocolCommandError) {
+    if (error.code === "unsupported_tab") {
+      return "Терминал недоступен: переключитесь на обычную http(s)-страницу.";
+    }
+    if (error.code === "content_not_ready") {
+      return "Терминал недоступен: перезагрузите страницу и повторите попытку.";
+    }
+  }
+
+  const openAiError = extractOpenAiErrorPayload(error);
+  if (openAiError?.code === "unsupported_country_region_territory") {
+    return "OpenAI API недоступен для текущей страны, региона или территории. Сетевые AI-запросы из этого окружения не выполнятся.";
+  }
+  if (openAiError?.message) {
+    return `OpenAI: ${openAiError.message}`;
+  }
+
+  return error instanceof Error && error.message ? error.message : fallbackMessage;
+}
+
+function extractOpenAiErrorPayload(error: unknown): { code?: string; message?: string } | null {
+  const direct = extractOpenAiErrorPayloadFromUnknown(error);
+  if (direct) {
+    return direct;
+  }
+
+  if (error instanceof ProtocolCommandError) {
+    const nested = extractOpenAiErrorPayloadFromUnknown(error.details);
+    if (nested) {
+      return nested;
+    }
+
+    return extractOpenAiErrorPayloadFromText(error.message);
+  }
+
+  if (error instanceof Error) {
+    return extractOpenAiErrorPayloadFromText(error.message);
+  }
+
+  return null;
+}
+
+function extractOpenAiErrorPayloadFromUnknown(value: unknown): { code?: string; message?: string } | null {
+  if (!value || typeof value !== "object") {
+    if (typeof value === "string") {
+      return extractOpenAiErrorPayloadFromText(value);
+    }
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  if ("error" in record) {
+    const nestedError = record.error;
+    if (nestedError && typeof nestedError === "object") {
+      const errorRecord = nestedError as Record<string, unknown>;
+      const code = typeof errorRecord.code === "string" ? errorRecord.code : undefined;
+      const message = typeof errorRecord.message === "string" ? errorRecord.message : undefined;
+      if (code || message) {
+        return { code, message };
+      }
+    }
+  }
+
+  for (const key of ["details", "cause", "body", "message"] as const) {
+    if (key in record) {
+      const nested = extractOpenAiErrorPayloadFromUnknown(record[key]);
+      if (nested) {
+        return nested;
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractOpenAiErrorPayloadFromText(text: string): { code?: string; message?: string } | null {
+  const jsonStart = text.indexOf("{");
+  if (jsonStart === -1) {
+    return null;
+  }
+
+  try {
+    return extractOpenAiErrorPayloadFromUnknown(JSON.parse(text.slice(jsonStart)));
+  } catch {
+    return null;
+  }
+}

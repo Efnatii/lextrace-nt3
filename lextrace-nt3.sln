@@ -6,6 +6,8 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "native-host", "native-host"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LexTrace.NativeHost", "native-host\LexTrace.NativeHost\LexTrace.NativeHost.csproj", "{995DCB3A-6329-952A-4838-E7D4BFBD6108}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LexTrace.NativeHost.Tests", "native-host\LexTrace.NativeHost.Tests\LexTrace.NativeHost.Tests.csproj", "{C9AA9ED2-5CC3-4B70-BD48-4AA69B932FB0}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -16,12 +18,17 @@ Global
 		{995DCB3A-6329-952A-4838-E7D4BFBD6108}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{995DCB3A-6329-952A-4838-E7D4BFBD6108}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{995DCB3A-6329-952A-4838-E7D4BFBD6108}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C9AA9ED2-5CC3-4B70-BD48-4AA69B932FB0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C9AA9ED2-5CC3-4B70-BD48-4AA69B932FB0}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C9AA9ED2-5CC3-4B70-BD48-4AA69B932FB0}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C9AA9ED2-5CC3-4B70-BD48-4AA69B932FB0}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{995DCB3A-6329-952A-4838-E7D4BFBD6108} = {9085DBEB-54AC-D291-9A27-AF3C57C5965F}
+		{C9AA9ED2-5CC3-4B70-BD48-4AA69B932FB0} = {9085DBEB-54AC-D291-9A27-AF3C57C5965F}
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {B46BF5A0-4176-4729-A587-0010C4845181}

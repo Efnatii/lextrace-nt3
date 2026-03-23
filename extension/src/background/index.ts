@@ -1,4 +1,5 @@
 import {
+  AiChatCompactResultSchema,
   AiChatListResultSchema,
   AiModelCatalogResultSchema,
   AiChatPageSessionSchema,
@@ -25,7 +26,7 @@ import {
   createEnvelope,
   createErrorResponse,
   createOkResponse,
-  ExtensionStreamMessageSchema,
+  parseNativeHostMessage,
   ProtocolResponseSchema,
   type ProtocolResponse,
   type RuntimeStreamMessage,
@@ -37,6 +38,7 @@ import {
   createInitialDesiredRuntime,
   createInitialWorkerStatus,
   NativeHostStatusSchema,
+  parseRuntimeWorkerStatus,
   PersistedRuntimeStateSchema,
   type DesiredRuntimeState,
   type NativeHostStatus,
@@ -129,12 +131,12 @@ class NativeHostBridge {
     this.manualDisconnect = true;
     this.port.disconnect();
     this.port = null;
-    this.clearPending("native host disconnected");
+    this.clearPending("нативный хост отключён");
   }
 
   async sendRequest(action: string, payload?: unknown): Promise<unknown> {
     if (!this.port) {
-      throw new Error("Native host is not connected.");
+      throw new Error("Нативный хост не подключён.");
     }
 
     const envelope = createEnvelope(action, "background", "native-host", payload);
@@ -142,7 +144,7 @@ class NativeHostBridge {
     return new Promise((resolve, reject) => {
       const timeoutId = globalThis.setTimeout(() => {
         this.pending.delete(envelope.id);
-        reject(new Error(`Native host request timed out for ${action}.`));
+        reject(new Error(`Истекло время ожидания ответа нативного хоста для ${action}.`));
       }, configCache.runtime.commandTimeoutMs);
 
       this.pending.set(envelope.id, {
@@ -162,19 +164,20 @@ class NativeHostBridge {
   }
 
   private async handleMessage(message: unknown): Promise<void> {
-    const responseResult = ProtocolResponseSchema.safeParse(message);
-    if (responseResult.success) {
-      const pending = this.pending.get(responseResult.data.id);
+    const parsedMessage = parseNativeHostMessage(message);
+    if (parsedMessage?.kind === "response") {
+      const responseResult = { data: parsedMessage.message };
+      const pending = this.pending.get(parsedMessage.message.id);
       if (pending) {
-        this.pending.delete(responseResult.data.id);
+        this.pending.delete(parsedMessage.message.id);
         globalThis.clearTimeout(pending.timeoutId);
-        if (responseResult.data.ok) {
-          pending.resolve(responseResult.data.result);
+        if (parsedMessage.message.ok) {
+          pending.resolve(parsedMessage.message.result);
         } else {
-          const nativeError = new Error(responseResult.data.error?.message ?? "Native host command failed.");
+          const nativeError = new Error(responseResult.data.error?.message ?? "Не удалось выполнить команду нативного хоста.");
           Object.assign(nativeError, {
-            code: responseResult.data.error?.code ?? null,
-            details: responseResult.data.error?.details ?? null
+            code: parsedMessage.message.error?.code ?? null,
+            details: parsedMessage.message.error?.details ?? null
           });
           pending.reject(nativeError);
         }
@@ -182,12 +185,11 @@ class NativeHostBridge {
       return;
     }
 
-    const streamResult = ExtensionStreamMessageSchema.safeParse(message);
-    if (streamResult.success) {
-      if (streamResult.data.stream === "runtime") {
-        await handleRuntimeStream(streamResult.data);
+    if (parsedMessage?.kind === "stream") {
+      if (parsedMessage.message.stream === "runtime") {
+        await handleRuntimeStream(parsedMessage.message);
       } else {
-        await handleAiStream(streamResult.data);
+        await handleAiStream(parsedMessage.message);
       }
       return;
     }
@@ -196,7 +198,7 @@ class NativeHostBridge {
       level: "warn",
       source: "protocol-router",
       event: "native-host.unknown-message",
-      summary: "Ignored unknown native host message.",
+      summary: "Неизвестное сообщение от нативного хоста проигнорировано.",
       details: message
     });
   }
@@ -207,7 +209,7 @@ class NativeHostBridge {
     this.port = null;
     this.manualDisconnect = false;
     aiModelCatalogCache = null;
-    this.clearPending(lastErrorMessage ?? "Native host disconnected.");
+    this.clearPending(lastErrorMessage ?? "Нативный хост отключён.");
 
     workerStatus = {
       ...workerStatus,
@@ -224,8 +226,8 @@ class NativeHostBridge {
       source: "background",
       event: "native-host.disconnected",
       summary: wasManual
-        ? "Native host disconnected by request."
-        : "Native host disconnected unexpectedly.",
+        ? "Нативный хост отключён по запросу."
+        : "Нативный хост отключился неожиданно.",
       details: {
         manual: wasManual,
         lastErrorMessage
@@ -274,7 +276,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         level: "error",
         source: "background",
         event: "runtime.message-error",
-        summary: "Message handling failed.",
+        summary: "Не удалось обработать сообщение.",
         details: {
           error: serializeError(error),
           message: sanitizeRuntimeMessageForLogs(message)
@@ -389,7 +391,7 @@ async function bootstrap(reason: string): Promise<void> {
         level: "info",
         source: "background",
         event: "service-worker.boot",
-        summary: "Service worker bootstrapped.",
+        summary: "Service worker инициализирован.",
         details: {
           reason,
           bootId
@@ -450,7 +452,7 @@ async function handleRuntimeMessage(
         return createErrorResponse(
           envelope.id,
           "forbidden",
-          "Demo commands are disabled in config."
+          "Демо-команды отключены в настройках."
         ) as ReturnType<typeof createOkResponse>;
       }
       await runNativeCommand(COMMANDS.taskDemoStart, payload);
@@ -461,7 +463,7 @@ async function handleRuntimeMessage(
         return createErrorResponse(
           envelope.id,
           "forbidden",
-          "Demo commands are disabled in config."
+          "Демо-команды отключены в настройках."
         ) as ReturnType<typeof createOkResponse>;
       }
       await runNativeCommand(COMMANDS.taskDemoStop, payload);
@@ -472,7 +474,7 @@ async function handleRuntimeMessage(
         return createErrorResponse(
           envelope.id,
           "forbidden",
-          "Host crash command is disabled in config."
+          "Команда аварийного завершения хоста отключена в настройках."
         ) as ReturnType<typeof createOkResponse>;
       }
       await runNativeCommand(COMMANDS.testHostCrash, payload);
@@ -489,6 +491,38 @@ async function handleRuntimeMessage(
 
     case COMMANDS.overlayClose:
       return closeOverlay(envelope.id, payload as OverlayTargetPayload, sender);
+
+    case COMMANDS.hostConnect:
+      await connectNativeHost(payload as { reason?: string });
+      return createOkResponse(envelope.id, {
+        workerStatus,
+        desired: desiredRuntime
+      });
+
+    case COMMANDS.hostDisconnect:
+      await disconnectNativeHost(payload as { reason?: string });
+      return createOkResponse(envelope.id, {
+        workerStatus,
+        desired: desiredRuntime
+      });
+
+    case COMMANDS.hostStatus:
+      return createOkResponse(envelope.id, {
+        workerStatus,
+        desired: desiredRuntime,
+        host: {
+          connected: nativeBridge.connected,
+          configuredHostName: configCache.runtime.nativeHostName,
+          keepAlive: shouldKeepNativeConnection()
+        }
+      });
+
+    case COMMANDS.hostRestart:
+      await restartNativeHost(payload as { reason?: string });
+      return createOkResponse(envelope.id, {
+        workerStatus,
+        desired: desiredRuntime
+      });
 
     case COMMANDS.configGet:
       return createOkResponse(envelope.id, getRuntimeSnapshot());
@@ -526,6 +560,12 @@ async function handleRuntimeMessage(
         payload as { pageKey: string; pageUrl: string; origin: "user" | "code"; text: string; requestId?: string }
       );
 
+    case COMMANDS.aiChatCompact:
+      return handleAiCompactCommand(
+        envelope.id,
+        payload as { pageKey: string; pageUrl?: string; mode?: "safe" | "force" }
+      );
+
     case COMMANDS.aiChatResume:
       return handleAiResumeCommand(envelope.id, payload as { pageKey: string });
 
@@ -539,7 +579,7 @@ async function handleRuntimeMessage(
       return createErrorResponse(
         envelope.id,
         "unsupported_action",
-        `Action ${envelope.action} is not implemented.`
+        `Действие ${envelope.action} не реализовано.`
       ) as ReturnType<typeof createOkResponse>;
   }
 }
@@ -559,7 +599,7 @@ async function startWorker(payload: { reason?: string }): Promise<void> {
     level: "info",
     source: "background",
     event: "worker.start",
-    summary: "Worker start command executed.",
+    summary: "Команда запуска воркера выполнена.",
     details: payload
   });
 }
@@ -598,7 +638,7 @@ async function stopWorker(payload: { reason?: string }): Promise<void> {
     level: "info",
     source: "background",
     event: "worker.stop",
-    summary: "Worker stop command executed.",
+    summary: "Команда остановки воркера выполнена.",
     details: payload
   });
 }
@@ -612,7 +652,7 @@ async function ensureNativeConnection(reason: string): Promise<void> {
     level: "info",
     source: "background",
     event: "native-host.connect",
-    summary: "Connecting to native host.",
+    summary: "Подключение к нативному хосту.",
     details: {
       reason,
       host: configCache.runtime.nativeHostName
@@ -634,6 +674,58 @@ async function ensureNativeConnection(reason: string): Promise<void> {
   await broadcastStatus();
 }
 
+async function connectNativeHost(payload: { reason?: string }): Promise<void> {
+  await ensureNativeConnection(payload.reason ?? COMMANDS.hostConnect);
+  await appendLog({
+    level: "info",
+    source: "background",
+    event: COMMANDS.hostConnect,
+    summary: "Команда подключения к нативному хосту выполнена.",
+    details: payload
+  });
+}
+
+async function disconnectNativeHost(payload: { reason?: string }): Promise<void> {
+  if (nativeBridge.connected) {
+    await nativeBridge.disconnect();
+  }
+
+  desiredRuntime = {
+    ...desiredRuntime,
+    reconnectAttempt: 0,
+    lastDisconnectAt: new Date().toISOString()
+  };
+  workerStatus = {
+    ...workerStatus,
+    running: false,
+    hostConnected: false,
+    nativeHostPid: null
+  };
+  await persistRuntimeState();
+  await broadcastStatus();
+  await appendLog({
+    level: "info",
+    source: "background",
+    event: COMMANDS.hostDisconnect,
+    summary: "Команда отключения нативного хоста выполнена.",
+    details: payload
+  });
+}
+
+async function restartNativeHost(payload: { reason?: string }): Promise<void> {
+  await disconnectNativeHost({
+    reason: payload.reason ?? COMMANDS.hostRestart
+  });
+  await ensureNativeConnection(payload.reason ?? COMMANDS.hostRestart);
+  await appendLog({
+    level: "info",
+    source: "background",
+    event: COMMANDS.hostRestart,
+    summary: "Команда перезапуска нативного хоста выполнена.",
+    details: payload
+  });
+}
+
 async function reconnectNative(reason: string): Promise<void> {
   if (!shouldKeepNativeConnection()) {
     return;
@@ -645,7 +737,7 @@ async function reconnectNative(reason: string): Promise<void> {
       level: "info",
       source: "background",
       event: "native-host.reconnected",
-      summary: "Native host connection is healthy.",
+      summary: "Соединение с нативным хостом работает штатно.",
       details: {
         reason,
         reconnectAttempt: desiredRuntime.reconnectAttempt
@@ -656,7 +748,7 @@ async function reconnectNative(reason: string): Promise<void> {
       level: "error",
       source: "background",
       event: "native-host.reconnect-failed",
-      summary: "Native host reconnect attempt failed.",
+      summary: "Не удалось переподключиться к нативному хосту.",
       details: {
         reason,
         error: serializeError(error)
@@ -681,7 +773,7 @@ async function scheduleReconnect(reason: string): Promise<void> {
       level: "error",
       source: "background",
       event: "native-host.reconnect-exhausted",
-      summary: "Reconnect attempts exhausted.",
+      summary: "Попытки переподключения исчерпаны.",
       details: {
         reason,
         attempts: nextAttempt
@@ -705,7 +797,7 @@ async function scheduleReconnect(reason: string): Promise<void> {
     level: "warn",
     source: "background",
     event: "native-host.reconnect-scheduled",
-    summary: "Reconnect scheduled.",
+    summary: "Запланировано переподключение.",
     details: {
       reason,
       delayMs,
@@ -751,7 +843,7 @@ async function runNativeCommand(action: string, payload: unknown): Promise<void>
     level: "info",
     source: "background",
     event: action,
-    summary: `Executed ${action}.`,
+    summary: `Выполнена команда ${action}.`,
     details: safePayload
   });
 }
@@ -771,12 +863,9 @@ function applyNativeStatus(result: unknown): void {
 
 async function handleRuntimeStream(message: RuntimeStreamMessage): Promise<void> {
   if (message.status) {
-    const statusResult = NativeHostStatusSchema.safeParse(message.status);
-    if (statusResult.success) {
-      applyNativeStatus(statusResult.data);
-      await persistRuntimeState();
-      await broadcastStatus();
-    }
+    workerStatus = parseRuntimeWorkerStatus(message, bootId);
+    await persistRuntimeState();
+    await broadcastStatus();
   }
 
   if (message.logEntry) {
@@ -787,8 +876,6 @@ async function handleRuntimeStream(message: RuntimeStreamMessage): Promise<void>
   }
 
   if (message.event === STREAM_EVENTS.log && message.logEntry && isLogLevelEnabled(message.logEntry.level, configCache.logging.level)) {
-    broadcastStream(message);
-  } else if (message.event === STREAM_EVENTS.status) {
     broadcastStream(message);
   }
 }
@@ -878,12 +965,38 @@ async function handleAiSendCommand(
     );
     updateAiSessionCache(result.session);
     await persistAiSessions();
-    broadcastAiSessionSnapshot(result.session, "AI request queued.");
+    broadcastAiSessionSnapshot(result.session, "AI-запрос поставлен в очередь.");
     return createOkResponse(requestId, result);
   } catch (error) {
     return createErrorResponse(
       requestId,
       "ai_send_failed",
+      error instanceof Error ? error.message : String(error),
+      serializeError(error)
+    );
+  }
+}
+
+async function handleAiCompactCommand(
+  requestId: string,
+  payload: { pageKey: string; pageUrl?: string; mode?: "safe" | "force" }
+): Promise<ProtocolResponse> {
+  try {
+    await ensureNativeConnection(COMMANDS.aiChatCompact);
+    const result = AiChatCompactResultSchema.parse(
+      await nativeBridge.sendRequest(COMMANDS.aiChatCompact, payload)
+    );
+    updateAiSessionCache(result.session);
+    await persistAiSessions();
+    broadcastAiSessionSnapshot(
+      result.session,
+      result.triggered ? "Контекст AI-сессии сжат." : "Сжатие контекста AI-сессии завершилось без изменений."
+    );
+    return createOkResponse(requestId, result);
+  } catch (error) {
+    return createErrorResponse(
+      requestId,
+      "ai_compact_failed",
       error instanceof Error ? error.message : String(error),
       serializeError(error)
     );
@@ -901,7 +1014,7 @@ async function handleAiResumeCommand(
     );
     updateAiSessionCache(result.session);
     await persistAiSessions();
-    broadcastAiSessionSnapshot(result.session, "AI page session resumed.");
+    broadcastAiSessionSnapshot(result.session, "Сессия AI для страницы возобновлена.");
     return createOkResponse(requestId, result);
   } catch (error) {
     return createErrorResponse(
@@ -924,7 +1037,7 @@ async function handleAiResetCommand(
     );
     updateAiSessionCache(result.session);
     await persistAiSessions();
-    broadcastAiSessionSnapshot(result.session, "AI page session reset.");
+    broadcastAiSessionSnapshot(result.session, "Сессия AI для страницы сброшена.");
     await syncNativeConnectionLifecycle();
     return createOkResponse(requestId, result);
   } catch (error) {
@@ -973,13 +1086,13 @@ async function openOverlay(
       level: "warn",
       source: "background",
       event: COMMANDS.overlayOpen,
-      summary: "Overlay open rejected for unsupported tab.",
+      summary: "Открытие оверлея отклонено для неподдерживаемой вкладки.",
       details: probeResult
     });
     return createOverlayErrorResponse(
       requestId,
       "unsupported_tab",
-      "Overlay terminal is only available on regular http(s) pages.",
+      "Оверлейный терминал доступен только на обычных страницах http(s).",
       probeResult
     );
   }
@@ -988,13 +1101,13 @@ async function openOverlay(
     const code = probeResult.reason ?? "content_not_ready";
     const message =
       code === "content_not_ready"
-        ? "Overlay terminal is unavailable until this page is reloaded."
-        : "Overlay terminal failed to open on the current page.";
+        ? "Оверлейный терминал будет доступен после перезагрузки страницы."
+        : "Не удалось открыть оверлейный терминал на текущей странице.";
     await appendLog({
       level: code === "content_not_ready" ? "warn" : "error",
       source: "background",
       event: COMMANDS.overlayOpen,
-      summary: "Overlay open rejected because the page is not ready.",
+      summary: "Открытие оверлея отклонено: страница ещё не готова.",
       details: probeResult
     });
     return createOverlayErrorResponse(requestId, code, message, probeResult);
@@ -1005,7 +1118,7 @@ async function openOverlay(
     return createOverlayErrorResponse(
       requestId,
       "unsupported_tab",
-      "Overlay terminal target tab could not be resolved."
+      "Не удалось определить вкладку для оверлейного терминала."
     );
   }
 
@@ -1021,7 +1134,7 @@ async function openOverlay(
       level: "error",
       source: "background",
       event: COMMANDS.overlayOpen,
-      summary: "Overlay terminal failed to open.",
+      summary: "Не удалось открыть оверлейный терминал.",
       details: {
         tabId: targetTab.id,
         url: getResolvedTabUrl(targetTab),
@@ -1031,7 +1144,7 @@ async function openOverlay(
     return createOverlayErrorResponse(
       requestId,
       "overlay_open_failed",
-      "Overlay terminal failed to open on the current page.",
+      "Не удалось открыть оверлейный терминал на текущей странице.",
       {
         tabId: targetTab.id,
         url: getResolvedTabUrl(targetTab),
@@ -1051,7 +1164,7 @@ async function closeOverlay(
     return createOverlayErrorResponse(
       requestId,
       "unsupported_tab",
-      "Overlay terminal target tab could not be resolved."
+      "Не удалось определить вкладку для оверлейного терминала."
     );
   }
 
@@ -1080,7 +1193,7 @@ async function probeOverlayTarget(
   payload: OverlayTargetPayload,
   sender: chrome.runtime.MessageSender
 ): Promise<OverlayProbeResult> {
-  const targetTab = await resolveTargetTab(payload.tabId ?? sender.tab?.id);
+  const targetTab = await resolveOverlayTargetTab(payload, sender);
   const tabId = typeof targetTab?.id === "number" ? targetTab.id : null;
   const url = getOverlaySupportUrl(targetTab, payload);
   const supportReason = getOverlaySupportReason(url);
@@ -1127,21 +1240,21 @@ async function sendContentCommand(
   resolvedTab: chrome.tabs.Tab
 ): Promise<unknown> {
   if (!resolvedTab.id) {
-    throw new Error("No eligible tab found for overlay command.");
+    throw new Error("Не найдена подходящая вкладка для команды оверлея.");
   }
 
   const contentEnvelope = createEnvelope(action, "background", "content", payload);
   const rawResponse = await chrome.tabs.sendMessage(resolvedTab.id, contentEnvelope);
   const response = ProtocolResponseSchema.parse(rawResponse);
   if (!response.ok) {
-    throw new Error(response.error?.message ?? `Content command ${action} failed.`);
+    throw new Error(response.error?.message ?? `Не удалось выполнить content-команду ${action}.`);
   }
 
   await appendLog({
     level: "info",
     source: "background",
     event: action,
-    summary: `Sent ${action} to tab ${resolvedTab.id}.`,
+    summary: `Команда ${action} отправлена на вкладку ${resolvedTab.id}.`,
     details: {
       payload,
       url: getResolvedTabUrl(resolvedTab)
@@ -1151,12 +1264,21 @@ async function sendContentCommand(
   return response.result;
 }
 
-async function resolveTargetTab(explicitTabId?: number): Promise<chrome.tabs.Tab | undefined> {
+async function resolveTargetTab(explicitTabId?: number, expectedUrl?: string): Promise<chrome.tabs.Tab | undefined> {
   if (explicitTabId) {
     try {
       return await chrome.tabs.get(explicitTabId);
     } catch {
       return undefined;
+    }
+  }
+
+  if (typeof expectedUrl === "string" && expectedUrl.length > 0) {
+    const matchingTabs = (await chrome.tabs.query({})).filter(
+      (tab) => tab.url === expectedUrl || tab.pendingUrl === expectedUrl
+    );
+    if (matchingTabs.length > 0) {
+      return matchingTabs.sort((left, right) => (right.lastAccessed ?? 0) - (left.lastAccessed ?? 0))[0];
     }
   }
 
@@ -1181,7 +1303,7 @@ async function requireOverlayTargetTab(
   payload: OverlayTargetPayload,
   sender: chrome.runtime.MessageSender
 ): Promise<chrome.tabs.Tab | undefined> {
-  const targetTab = await resolveTargetTab(payload.tabId ?? sender.tab?.id);
+  const targetTab = await resolveOverlayTargetTab(payload, sender);
   if (!targetTab?.id) {
     return undefined;
   }
@@ -1192,6 +1314,15 @@ async function requireOverlayTargetTab(
   }
 
   return targetTab;
+}
+
+async function resolveOverlayTargetTab(
+  payload: OverlayTargetPayload,
+  sender: chrome.runtime.MessageSender
+): Promise<chrome.tabs.Tab | undefined> {
+  const explicitTabId = typeof payload.tabId === "number" ? payload.tabId : undefined;
+  const senderTabId = explicitTabId === undefined && !payload.expectedUrl ? sender.tab?.id : undefined;
+  return resolveTargetTab(explicitTabId ?? senderTabId, payload.expectedUrl);
 }
 
 function getResolvedTabUrl(tab: chrome.tabs.Tab | undefined): string | null {
@@ -1210,7 +1341,7 @@ async function injectContentScriptIfNeeded(
     level: "info",
     source: "background",
     event: "content-script.inject.attempt",
-    summary: "Attempting to inject content script into current page.",
+    summary: "Попытка внедрить content-скрипт в текущую страницу.",
     details: {
       tabId: targetTab.id,
       url: getResolvedTabUrl(targetTab),
@@ -1230,7 +1361,7 @@ async function injectContentScriptIfNeeded(
       level: "info",
       source: "background",
       event: "content-script.inject.success",
-      summary: "Injected content script into current page.",
+      summary: "Content-скрипт внедрён в текущую страницу.",
       details: {
         tabId: targetTab.id,
         url: getResolvedTabUrl(targetTab)
@@ -1243,7 +1374,7 @@ async function injectContentScriptIfNeeded(
       level: "warn",
       source: "background",
       event: "content-script.inject.failed",
-      summary: "Content script injection failed.",
+      summary: "Не удалось внедрить content-скрипт.",
       details: {
         tabId: targetTab.id,
         url: getResolvedTabUrl(targetTab),
@@ -1410,7 +1541,7 @@ async function persistAiSessions(): Promise<void> {
     }
   }
 
-  console.warn("Failed to persist AI sessions to chrome.storage.session.", lastError);
+  console.warn("Не удалось сохранить AI-сессии в chrome.storage.session.", lastError);
 }
 
 async function persistLogs(): Promise<void> {
@@ -1433,7 +1564,7 @@ async function persistLogs(): Promise<void> {
     }
   }
 
-  console.warn("Failed to persist runtime logs to chrome.storage.session.", lastError);
+  console.warn("Не удалось сохранить runtime-логи в chrome.storage.session.", lastError);
 }
 
 function buildPersistedAiSessions(profile: {
@@ -1613,7 +1744,7 @@ async function syncAiSessionsFromNative(): Promise<void> {
       level: "warn",
       source: "background",
       event: "ai.chat.list.sync.failed",
-      summary: "Failed to hydrate AI sessions from native host.",
+      summary: "Не удалось восстановить AI-сессии из нативного хоста.",
       details: serializeError(error)
     });
   }
@@ -1650,7 +1781,7 @@ async function patchConfig(input: {
     level: "info",
     source: "config-store",
     event: "config.patch",
-    summary: `Patched ${input.scope} config.`,
+    summary: `Обновлён конфиг области ${input.scope}.`,
     details: {
       scope: input.scope,
       patch: redactSensitiveConfigData(input.patch)
@@ -1676,7 +1807,7 @@ async function resetConfigScope(input: {
     level: "info",
     source: "config-store",
     event: "config.reset",
-    summary: `Reset ${input.scope} config scope.`,
+    summary: `Сброшен конфиг области ${input.scope}.`,
     details: {
       scope: input.scope
     }
@@ -1789,17 +1920,20 @@ function getRuntimeSnapshot(): RuntimeSnapshot {
 }
 
 async function sendSnapshot(port: chrome.runtime.Port): Promise<void> {
+  const snapshot = getRuntimeSnapshot();
   port.postMessage({
     stream: "runtime",
     event: STREAM_EVENTS.snapshot,
     level: "info",
-    summary: "Runtime snapshot",
+    summary: "Снимок runtime",
     details: null,
     ts: new Date().toISOString(),
     correlationId: null,
-    status: workerStatus,
-    config: configCache,
-    logs
+    status: snapshot.workerStatus,
+    workerStatus: snapshot.workerStatus,
+    desired: snapshot.desired,
+    config: snapshot.config,
+    logs: snapshot.logs
   });
 }
 
@@ -1808,7 +1942,7 @@ async function broadcastStatus(): Promise<void> {
     stream: "runtime",
     event: STREAM_EVENTS.status,
     level: "info",
-    summary: "Worker status updated.",
+    summary: "Статус воркера обновлён.",
     details: desiredRuntime,
     ts: new Date().toISOString(),
     correlationId: null,
@@ -1821,7 +1955,7 @@ async function broadcastConfig(): Promise<void> {
     stream: "runtime",
     event: STREAM_EVENTS.config,
     level: "info",
-    summary: "Config updated.",
+    summary: "Конфиг обновлён.",
     details: null,
     ts: new Date().toISOString(),
     correlationId: null,

@@ -56,7 +56,7 @@ export function commitConfigEdit(state: ConfigEditState): ConfigEditCommitResult
     return {
       ok: false,
       path: state.path,
-      error: `Unknown config field path: ${state.path}`,
+      error: `Неизвестный путь поля конфига: ${state.path}`,
       rollbackDisplayValue: state.initialDisplayValue
     };
   }

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  DEFAULT_AI_COMPACTION_INSTRUCTIONS,
   buildEffectiveConfig,
   defaultConfig,
   mergeConfig,
@@ -61,9 +62,12 @@ describe("config merge", () => {
     expect(defaultConfig.logging.maxEntries).toBe(1000);
     expect(defaultConfig.ai.openAiApiKey).toBeNull();
     expect(defaultConfig.ai.compaction.streamingEnabled).toBe(true);
+    expect(defaultConfig.ai.compaction.instructions).toBe(DEFAULT_AI_COMPACTION_INSTRUCTIONS);
     expect(defaultConfig.ai.compaction.triggerPromptTokens).toBe(131072);
     expect(defaultConfig.ai.compaction.preserveRecentTurns).toBe(24);
     expect(defaultConfig.ai.compaction.maxPassesPerPage).toBe(16);
+    expect(defaultConfig.ai.promptCaching.routing).toBe("stable_session_prefix");
+    expect(defaultConfig.ai.promptCaching.retention).toBe("in_memory");
     expect(defaultConfig.ai.rateLimits.reserveOutputTokens).toBe(32768);
     expect(defaultConfig.ai.rateLimits.maxQueuedPerPage).toBe(250);
     expect(defaultConfig.ai.rateLimits.maxQueuedGlobal).toBe(1000);
@@ -104,6 +108,7 @@ describe("config merge", () => {
       { model: "gpt-5", tier: "standard" },
       { model: "gpt-4.1", tier: "priority" }
     ]);
+    expect(merged.ai.promptCaching).toEqual(defaultConfig.ai.promptCaching);
     expect(merged.ai.rateLimits.maxQueuedPerPage).toBe(8);
     expect(merged.ai.rateLimits.reserveOutputTokens).toBe(defaultConfig.ai.rateLimits.reserveOutputTokens);
     expect(merged.ai.compaction.enabled).toBe(defaultConfig.ai.compaction.enabled);
@@ -139,6 +144,10 @@ describe("config merge", () => {
         compaction: {
           modelOverride: "gpt-4.1",
           instructions: "compact system"
+        },
+        promptCaching: {
+          routing: "provider_default",
+          retention: "24h"
         }
       }
     } as unknown);
@@ -159,6 +168,39 @@ describe("config merge", () => {
       tier: "flex"
     });
     expect(effective.ai.compaction.instructions).toBe("compact system");
+    expect(effective.ai.promptCaching.routing).toBe("provider_default");
+    expect(effective.ai.promptCaching.retention).toBe("24h");
+  });
+
+  it("resolves blank compaction instructions to the default baseline prompt", () => {
+    const effective = buildEffectiveConfig(
+      {
+        ai: {
+          compaction: {
+            instructions: ""
+          }
+        }
+      },
+      null
+    );
+
+    expect(effective.ai.compaction.instructions).toBe(DEFAULT_AI_COMPACTION_INSTRUCTIONS);
+  });
+
+  it("migrates legacy top-level ai.model without requiring an explicit ai.chat patch", () => {
+    const normalized = normalizeConfigPatch({
+      ai: {
+        model: "gpt-4.1",
+        serviceTier: "priority"
+      }
+    } as unknown);
+
+    const effective = buildEffectiveConfig(normalized, null);
+
+    expect(effective.ai.chat.model).toEqual({
+      model: "gpt-4.1",
+      tier: "priority"
+    });
   });
 
   it("ignores removed local ai RPM/TPM caps during normalization", () => {

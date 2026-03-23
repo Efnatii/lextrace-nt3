@@ -168,10 +168,10 @@ describe("AI model catalog helpers", () => {
   });
 
   it("formats summary price and tooltip text for the selected tier", () => {
-    expect(formatAiModelSummaryPrice(modelCatalog[0], "priority")).toBe("Σ $17.5 / 1M");
-    expect(formatAiModelTooltip(modelCatalog[2], "flex")).toContain("Активный раздел: flex");
-    expect(formatAiModelTooltip(modelCatalog[2], "flex")).toContain("[priority]");
-    expect(formatAiModelTooltip(modelCatalog[2], "flex")).toContain("совпадение: gpt-5 (family)");
+    expect(formatAiModelSummaryPrice(modelCatalog[0], "priority")).toBe("$17.5 / 1 млн");
+    expect(formatAiModelTooltip(modelCatalog[2], "flex")).toContain("Активный тариф: flex");
+    expect(formatAiModelTooltip(modelCatalog[2], "flex")).toContain("[приоритет]");
+    expect(formatAiModelTooltip(modelCatalog[2], "flex")).toContain("совпадение: gpt-5 (по семейству)");
     expect(
       formatAiModelTooltip(modelCatalog[1], "standard", {
         model: "gpt-5-mini",
@@ -184,7 +184,7 @@ describe("AI model catalog helpers", () => {
         serverResetRequests: "10s",
         serverResetTokens: "5s"
       })
-    ).toContain("[budget]");
+    ).toContain("[лимиты]");
   });
 
   it("detects tier availability from pricing and catalog match", () => {

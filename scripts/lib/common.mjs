@@ -1,4 +1,4 @@
-import { promises as fs } from "node:fs";
+import { existsSync, promises as fs, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync } from "node:crypto";
 import path from "node:path";
@@ -22,6 +22,8 @@ export const paths = {
   packagedZip: path.resolve(currentDir, "..", "..", "artifacts", "packaged", "lextrace-nt3.zip"),
   nativeHostProject: path.resolve(currentDir, "..", "..", "native-host", "LexTrace.NativeHost"),
   nativeHostPublish: path.resolve(currentDir, "..", "..", "artifacts", "native-host", "publish"),
+  nativeHostBuilds: path.resolve(currentDir, "..", "..", "artifacts", "native-host", "builds"),
+  nativeHostPublishInfo: path.resolve(currentDir, "..", "..", "artifacts", "native-host", "publish-info.json"),
   nativeHostManifestDir: path.resolve(currentDir, "..", "..", "artifacts", "native-host", "manifests"),
   nativeHostManifest: path.resolve(currentDir, "..", "..", "artifacts", "native-host", "manifests", "com.lextrace.nt3.host.json"),
   tmp: path.resolve(currentDir, "..", "..", "artifacts", "tmp"),
@@ -34,7 +36,19 @@ export async function ensureDir(targetPath) {
 }
 
 export async function cleanDir(targetPath) {
-  await fs.rm(targetPath, { recursive: true, force: true });
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await fs.rm(targetPath, { recursive: true, force: true });
+      break;
+    } catch (error) {
+      if (!["EBUSY", "ENOTEMPTY", "EPERM"].includes(error?.code) || attempt === 4) {
+        throw error;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 200 * (attempt + 1)));
+    }
+  }
+
   await fs.mkdir(targetPath, { recursive: true });
 }
 
@@ -53,6 +67,21 @@ export async function writeJson(targetPath, value) {
 
 export async function readPackageJson() {
   return readJson(path.join(paths.root, "package.json"));
+}
+
+export function getNativeHostPublishPath() {
+  if (existsSync(paths.nativeHostPublishInfo)) {
+    try {
+      const metadata = JSON.parse(readFileSync(paths.nativeHostPublishInfo, "utf8"));
+      if (typeof metadata?.publishPath === "string" && metadata.publishPath.length > 0) {
+        return metadata.publishPath;
+      }
+    } catch {
+      // Fall back to the legacy path if the metadata file is unreadable.
+    }
+  }
+
+  return paths.nativeHostPublish;
 }
 
 export async function fileExists(targetPath) {
@@ -137,6 +166,10 @@ export async function run(command, args, options = {}) {
 }
 
 export function getNativeHostExePath() {
-  return path.join(paths.nativeHostPublish, "LexTrace.NativeHost.exe");
+  return path.join(getNativeHostPublishPath(), "LexTrace.NativeHost.exe");
+}
+
+export async function writeNativeHostPublishPath(publishPath) {
+  await writeJson(paths.nativeHostPublishInfo, { publishPath });
 }
 

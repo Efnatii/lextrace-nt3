@@ -16,9 +16,10 @@ import {
   chooseModelFromCatalog,
   findLatestAssistantMessage,
   getAiStatus,
+  getOverlayChatStatusSnapshot,
   getOverlayChatFeedText,
-  getOverlayChatStatusText,
   getPopupAiConfigPaths,
+  importOverlayChatQueue,
   getRuntimeSnapshot,
   getTabIdByUrl,
   getUserEnvironmentVariable,
@@ -34,6 +35,7 @@ import {
   restoreBaselineAiConfig,
   sessionHasAssistantJson,
   sessionHasAssistantText,
+  clickOverlayChatReset,
   selectOverlayTab,
   sendCommand,
   sendCommandExpectingError,
@@ -56,6 +58,7 @@ export const BASELINE_SCENARIO_ORDER = [
   "ai.config.sync",
   "ai.status",
   "ai.overlay.user-chat",
+  "ai.overlay.chat-ui-actions",
   "ai.shared-session",
   "ai.code-origin",
   "ai.structured-output",
@@ -277,6 +280,8 @@ export async function runBaselineAiSuite(session, options = {}) {
     assert.equal(config.ai.compaction.triggerPromptTokens, 64, "ai.compaction.triggerPromptTokens did not persist.");
     assert.equal(config.ai.compaction.preserveRecentTurns, 1, "ai.compaction.preserveRecentTurns did not persist.");
     assert.equal(config.ai.compaction.maxPassesPerPage, 2, "ai.compaction.maxPassesPerPage did not persist.");
+    assert.equal(config.ai.promptCaching.routing, "stable_session_prefix", "ai.promptCaching.routing did not persist.");
+    assert.equal(config.ai.promptCaching.retention, "in_memory", "ai.promptCaching.retention did not persist.");
     assert.equal(config.ai.rateLimits.reserveOutputTokens, 512, "ai.rateLimits.reserveOutputTokens did not persist.");
     assert.equal(config.ai.rateLimits.maxQueuedPerPage, 2, "ai.rateLimits.maxQueuedPerPage did not persist.");
     assert.equal(config.ai.rateLimits.maxQueuedGlobal, 3, "ai.rateLimits.maxQueuedGlobal did not persist.");
@@ -301,6 +306,8 @@ export async function runBaselineAiSuite(session, options = {}) {
         nativeState?.aiConfig?.compaction?.triggerPromptTokens === 64 &&
         nativeState?.aiConfig?.compaction?.preserveRecentTurns === 1 &&
         nativeState?.aiConfig?.compaction?.maxPassesPerPage === 2 &&
+        nativeState?.aiConfig?.promptCaching?.routing === "stable_session_prefix" &&
+        nativeState?.aiConfig?.promptCaching?.retention === "in_memory" &&
         nativeState?.aiConfig?.rateLimits?.reserveOutputTokens === 512 &&
         nativeState?.aiConfig?.rateLimits?.maxQueuedPerPage === 2 &&
         nativeState?.aiConfig?.rateLimits?.maxQueuedGlobal === 3
@@ -369,10 +376,14 @@ export async function runBaselineAiSuite(session, options = {}) {
       assert.deepEqual(sessionState.status.model, state.selectedModel, "AI status model does not match the selected model.");
       assert.equal(sessionState.status.streamingEnabled, true, "AI status must reflect streaming mode.");
       assert.equal(sessionState.status.structuredOutputEnabled, false, "Baseline structured output must be disabled.");
+      assert.equal(sessionState.status.promptCaching.routing, "stable_session_prefix", "AI status must expose prompt caching routing.");
+      assert.equal(sessionState.status.promptCaching.retention, "in_memory", "AI status must expose prompt caching retention.");
+      assert.equal(sessionState.status.promptCaching.session.requestCount, 0, "Fresh AI status must start with zero prompt-cache requests.");
       assert.equal(sessionState.status.availableActions.canSend, true, "AI status must allow sending requests.");
       return {
         requestState: sessionState.status.requestState,
-        canSend: sessionState.status.availableActions.canSend
+        canSend: sessionState.status.availableActions.canSend,
+        promptCaching: sessionState.status.promptCaching
       };
     });
 
@@ -403,20 +414,114 @@ export async function runBaselineAiSuite(session, options = {}) {
         );
 
         await switchToHandle(driver, mainHandle);
-        await waitFor(async () => /provider\s*:\s*openai/i.test(await getOverlayChatStatusText(driver)), 15000, "Overlay chat status must show the OpenAI provider.");
-        const statusText = await getOverlayChatStatusText(driver);
+        await waitFor(async () => (await getOverlayChatFeedText(driver)).includes(BASE_CHAT_INSTRUCTIONS), 15000, "Overlay chat transcript must show the configured system prompt.");
+        const chatFeedText = await getOverlayChatFeedText(driver);
+        const statusSnapshot = await getOverlayChatStatusSnapshot(driver);
+        assert.equal(statusSnapshot.rowFound, true, "Overlay chat status row must be present.");
+        assert.ok(statusSnapshot.chipKeys.includes("provider"), "Overlay chat status must expose the provider chip.");
+        assert.ok(statusSnapshot.chipKeys.includes("cache-state"), "Overlay chat status must expose the cache-state chip.");
+        assert.ok(statusSnapshot.chipKeys.includes("cache-ret"), "Overlay chat status must expose the cache-ret chip.");
+        assert.match(chatFeedText, /Системный промпт/i, "Overlay chat transcript must show the system prompt block.");
         assert.equal(sessionState.status.availableActions.canReset, true, "Overlay chat session must be resettable.");
         return {
           pageKey,
           messageCount: sessionState.messages.length,
-          requestState: sessionState.status.requestState
+          requestState: sessionState.status.requestState,
+          chatFeedText,
+          statusSnapshot
         };
       });
     }
 
     if (state.providerRegionBlocked) {
+      recordManagedSkip("ai.overlay.chat-ui-actions", "OpenAI provider access is region-blocked, so live overlay queue import and reset button behavior cannot be verified.");
       recordManagedSkip("ai.shared-session", "OpenAI provider access is region-blocked, so live shared-session reuse cannot be verified in overlay.");
     } else {
+      await runPreparedScenario("ai.overlay.chat-ui-actions", async () => {
+        const pageUrl = server.makeUrl("/overlay-chat-ui-actions");
+        const pageKey = normalizePageKey(pageUrl);
+
+        await switchToHandle(driver, mainHandle);
+        await driver.get(pageUrl);
+        const tabId = await getTabIdByUrl(driver, pageUrl);
+        assert.ok(typeof tabId === "number", "Unable to resolve the Edge tab for overlay chat UI actions.");
+        await switchToHandle(driver, popupHandle);
+        await sendCommand(driver, COMMANDS.overlayOpen, {
+          tabId,
+          expectedUrl: pageUrl
+        });
+
+        await switchToHandle(driver, mainHandle);
+        await waitForOverlay(driver);
+        await selectOverlayTab(driver, "chat");
+
+        const initialStatus = await getOverlayChatStatusSnapshot(driver);
+        assert.equal(initialStatus.rowFound, true, "Overlay chat status row must exist.");
+        assert.ok(initialStatus.chipKeys.includes("tokens"), "Initial overlay chat status must show the tokens chip.");
+        assert.ok(initialStatus.chipKeys.includes("queue"), "Initial overlay chat status must show the queue chip.");
+        assert.ok(initialStatus.chipKeys.includes("cache-state"), "Initial overlay chat status must show the cache-state chip.");
+        assert.ok(initialStatus.chips.every((chip) => chip.hiddenByCss === false), "Initial overlay chat status chips must remain visible.");
+
+        await sendOverlayChat(driver, "Reply with exact token EDGE_UI_ACTIONS_OK and nothing else.");
+        const sessionAfterSend = await waitForSession(driver, pageKey, pageUrl, (candidate) =>
+          candidate.status.requestState === "idle" &&
+          sessionHasAssistantText(candidate, "EDGE_UI_ACTIONS_OK")
+        );
+        assert.equal(sessionAfterSend.status.availableActions.canReset, true, "Overlay reset button must become available after a successful reply.");
+
+        await switchToHandle(driver, mainHandle);
+        await clickOverlayChatReset(driver);
+
+        const resetSession = await waitForSession(driver, pageKey, pageUrl, (candidate) =>
+          candidate.status.requestState === "idle" &&
+          candidate.messages.length === 0
+        );
+        assert.equal(resetSession.messages.length, 0, "Overlay reset button did not clear the transcript.");
+
+        await switchToHandle(driver, mainHandle);
+        await importOverlayChatQueue(driver, [
+          "First imported queue prompt",
+          "Second imported queue prompt"
+        ]);
+
+        await waitFor(async () => {
+          const importedSession = await getAiStatus(driver, pageUrl);
+          return importedSession.messages.some((message) =>
+            message.origin === "user" &&
+            message.text.includes("First imported queue prompt")
+          );
+        }, 30000, "Overlay queue import did not enqueue the first imported prompt.");
+
+        const sessionAfterImport = await waitForSession(driver, pageKey, pageUrl, (candidate) =>
+          candidate.status.requestState === "idle" &&
+          candidate.messages.filter((message) => message.origin === "user").length >= 2
+        );
+        assert.deepEqual(
+          sessionAfterImport.messages
+            .filter((message) => message.origin === "user")
+            .slice(-2)
+            .map((message) => message.text),
+          ["First imported queue prompt", "Second imported queue prompt"],
+          "Overlay queue import did not preserve the JSON order."
+        );
+
+        await switchToHandle(driver, mainHandle);
+        const finalStatus = await getOverlayChatStatusSnapshot(driver);
+        assert.ok(finalStatus.chipKeys.includes("served"), "Final overlay chat status must show the resolved service-tier chip.");
+        assert.ok(finalStatus.chipKeys.includes("cache-src"), "Final overlay chat status must show the cache source chip after a request.");
+        assert.ok(finalStatus.chips.every((chip) => chip.hiddenByCss === false), "Final overlay chat status chips must remain visible.");
+
+        return {
+          pageKey,
+          initialStatus,
+          finalStatus,
+          resetMessageCount: resetSession.messages.length,
+          importedUserMessages: sessionAfterImport.messages
+            .filter((message) => message.origin === "user")
+            .map((message) => message.text)
+        };
+      });
+
       await runPreparedScenario("ai.shared-session", async () => {
         const seedUrl = server.makeUrl("/shared?seed=1");
         const copyUrl = server.makeUrl("/shared?copy=1#fragment");
@@ -710,7 +815,7 @@ export async function runBaselineAiSuite(session, options = {}) {
       assert.ok(resetResult.session, "ai.chat.reset did not return the session payload.");
       const resetSession = await getAiStatus(driver, pageUrl);
       assert.equal(resetSession.status.requestState, "idle", "Reset AI session must return to idle.");
-      assert.ok(resetSession.messages.some((message) => message.kind === "reset"), "Reset AI session must record a reset message.");
+      assert.equal(resetSession.messages.length, 0, "Reset AI session must clear transcript messages.");
       return {
         pageKey,
         messageCountAfterReset: resetSession.messages.length
@@ -854,14 +959,17 @@ export async function runBaselineAiSuite(session, options = {}) {
           text: "Reply with exact token EDGE_COMPACTION_OK and nothing else."
         });
         const compactedSession = await waitForSession(driver, pageKey, pageUrl, (candidate) =>
-          candidate.messages.some((message) => message.kind === "compaction" && message.text.includes("completed")) &&
+          candidate.messages.some((message) => message.kind === "compaction-result") &&
           candidate.status.requestState === "idle" &&
           sessionHasAssistantText(candidate, "EDGE_COMPACTION_OK")
         );
-        assert.ok(compactedSession.messages.some((message) => message.kind === "compaction"), "Compaction message was not emitted.");
+        assert.ok(compactedSession.messages.some((message) => message.kind === "compaction-request"), "Compaction request message was not emitted.");
+        assert.ok(compactedSession.messages.some((message) => message.kind === "compaction-result"), "Compaction result message was not emitted.");
         return {
           pageKey,
-          compactionMessages: compactedSession.messages.filter((message) => message.kind === "compaction").length
+          compactionMessages: compactedSession.messages.filter((message) =>
+            message.kind === "compaction-request" || message.kind === "compaction-result"
+          ).length
         };
       });
     }

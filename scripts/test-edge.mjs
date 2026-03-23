@@ -18,8 +18,25 @@ import {
   run
 } from "./lib/common.mjs";
 
+const TERMINAL_OPENED_MESSAGES = ["opened on tab", "терминал открыт на вкладке"];
+const TERMINAL_READY_MESSAGES = ["available on the current page", "терминал доступен на текущей странице."];
+const TERMINAL_UNAVAILABLE_MESSAGES = ["regular http(s) page", "терминал недоступен: переключитесь на обычную http(s)-страницу."];
+const INVALID_INTEGER_MESSAGES = ["integer", "целым числом"];
+const OVERLAY_TITLES = ["LexTrace Terminal", "Терминал LexTrace"];
+const WORKER_RUNNING_TEXTS = ["running", "в работе"];
+const WORKER_STOPPED_TEXTS = ["stopped", "остановлен"];
+const HAS_OPENAI_API_KEY = Boolean(process.env.OPENAI_API_KEY?.trim());
+
 async function main() {
   const aiOnly = process.argv.includes("--ai-only");
+  if (aiOnly && !HAS_OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY is required for --ai-only.");
+  }
+
+  if (!HAS_OPENAI_API_KEY) {
+    console.warn("OPENAI_API_KEY is not set; skipping live AI checks.");
+  }
+
   await prepareArtifacts();
 
   const extensionMetadata = await ensureExtensionKeyMetadata();
@@ -119,12 +136,12 @@ async function runPlaywrightFlow({ popupUrl, pageUrl, slowUrl }) {
     await popupPage.locator("#status-preview").waitFor({ state: "detached" }).catch(() => {});
 
     await popupPage.locator("#open-terminal").click();
-    await expectTextInLocator(popupPage.locator("#terminal-state"), "opened on tab");
+    await expectTextInLocator(popupPage.locator("#terminal-state"), TERMINAL_OPENED_MESSAGES);
     await appPage.locator("#lextrace-overlay-root").waitFor({ state: "attached", timeout: 10000 });
 
     await appPage.goto("about:blank", { waitUntil: "load" });
     await popupPage.locator("#open-terminal").click();
-    await expectTextInLocator(popupPage.locator("#terminal-state"), "regular http(s) page");
+    await expectTextInLocator(popupPage.locator("#terminal-state"), TERMINAL_UNAVAILABLE_MESSAGES);
 
     await appPage.goto(pageUrl, { waitUntil: "load" });
     await popupPage.locator(".tab-button[data-tab='config']").click();
@@ -159,36 +176,38 @@ async function runPlaywrightFlow({ popupUrl, pageUrl, slowUrl }) {
     await popupPage.locator("button[data-config-path='runtime.commandTimeoutMs']").click();
     await popupPage.locator("[data-editor-path='runtime.commandTimeoutMs']").fill("broken");
     await popupPage.locator("[data-editor-path='runtime.commandTimeoutMs']").press("Enter");
-    await expectTextInLocator(popupPage.locator("#terminal-state"), "integer");
+    await expectTextInLocator(popupPage.locator("#terminal-state"), INVALID_INTEGER_MESSAGES);
     await popupPage.waitForFunction(() => {
       const button = document.querySelector("button[data-config-path='runtime.commandTimeoutMs']");
       return button?.textContent?.trim() === "2500";
     });
 
-    await setPlaywrightAllowedModel(popupPage, "gpt-5", "standard");
-    await setPlaywrightModelPanelValue(popupPage, "ai.model", "gpt-5", "standard");
+    if (HAS_OPENAI_API_KEY) {
+      await setPlaywrightAllowedModel(popupPage, "gpt-5", "standard");
+    await setPlaywrightModelPanelValue(popupPage, "ai.chat.model", "gpt-5", "standard");
     await popupPage.waitForFunction(() => {
-      const button = document.querySelector("button[data-config-path='ai.model']");
+      const button = document.querySelector("button[data-config-path='ai.chat.model']");
       const text = button?.textContent?.trim() ?? "";
       return text.includes("gpt-5") && text.includes("standard");
     });
 
     await setPlaywrightModalTextValue(
       popupPage,
-      "ai.instructions",
+      "ai.chat.instructions",
       "Всегда отвечай кратко.\nВозвращай только релевантный результат."
     );
     await popupPage.waitForFunction(() => {
-      const button = document.querySelector("button[data-config-path='ai.instructions']");
+      const button = document.querySelector("button[data-config-path='ai.chat.instructions']");
       return (button?.textContent ?? "").includes("Всегда отвечай кратко.");
     });
 
-    await popupPage.locator("button[data-config-path='ai.streamingEnabled']").click();
-    await popupPage.locator("[data-editor-path='ai.streamingEnabled']").selectOption("true");
-    await popupPage.waitForFunction(() => {
-      const button = document.querySelector("button[data-config-path='ai.streamingEnabled']");
+    await popupPage.locator("button[data-config-path='ai.chat.streamingEnabled']").click();
+    await popupPage.locator("[data-editor-path='ai.chat.streamingEnabled']").selectOption("true");
+      await popupPage.waitForFunction(() => {
+      const button = document.querySelector("button[data-config-path='ai.chat.streamingEnabled']");
       return button?.textContent?.trim() === "true";
     });
+    }
 
     await popupPage.locator("button[data-config-path='ui.overlay.visible']").click();
     await popupPage.locator("[data-editor-path='ui.overlay.visible']").selectOption("true");
@@ -228,14 +247,14 @@ async function runPlaywrightFlow({ popupUrl, pageUrl, slowUrl }) {
 
     const overlayRoot = appPage.locator("#lextrace-overlay-root");
     await overlayRoot.waitFor({ state: "attached", timeout: 10000 });
-    await overlayRoot.locator("text=LexTrace Terminal").waitFor({ timeout: 10000 });
+    await expectTextInLocator(overlayRoot.locator(".panel-header h1"), OVERLAY_TITLES);
     const activityFeed = overlayRoot.locator("[data-role='activity-feed']");
     await activityFeed.waitFor();
     assert.equal(await overlayRoot.locator(".overlay-tab-strip").count(), 1, "Overlay tab strip should be present.");
 
     await overlayRoot.locator(".close-button").click();
     await popupPage.locator("#open-terminal").click();
-    await overlayRoot.locator("text=LexTrace Terminal").waitFor({ timeout: 10000 });
+    await expectTextInLocator(overlayRoot.locator(".panel-header h1"), OVERLAY_TITLES);
 
     const terminalInput = overlayRoot.locator("[data-role='terminal-input']");
     await terminalInput.fill("work");
@@ -304,18 +323,21 @@ async function runPlaywrightFlow({ popupUrl, pageUrl, slowUrl }) {
     assert.equal(collapsedCount, await allActivityEntries.count(), "All terminal activity entries must be collapsed by default.");
     assert.equal(await overlayRoot.locator(".log-preview").count(), 0, "Collapsed log summary must not duplicate expanded content.");
 
-    await overlayRoot.locator(".overlay-tab-button[data-tab='chat']").click();
+    if (HAS_OPENAI_API_KEY) {
+      await overlayRoot.locator(".overlay-tab-button[data-tab='chat']").click();
     const chatFeed = overlayRoot.locator("[data-role='chat-feed']");
     const chatInput = overlayRoot.locator("[data-role='chat-input']");
     await chatFeed.waitFor();
-    await overlayRoot.locator("[data-role='chat-status-row']").waitFor();
     await appPage.waitForFunction(() => {
-      const text = document.querySelector("#lextrace-overlay-root")
-        ?.shadowRoot
-        ?.querySelector("[data-role='chat-status-row']")
+      const root = document.querySelector("#lextrace-overlay-root")?.shadowRoot;
+      const promptText = root
+        ?.querySelector(".chat-entry.kind-system-prompt .chat-entry-content")
         ?.textContent ?? "";
-      return text.includes("provider: openai");
+      const hasStatusRow = !!root?.querySelector("[data-role='chat-status-row']");
+      return promptText.length > 0 && hasStatusRow === true;
     });
+    assert.equal(await overlayRoot.locator("[data-role='chat-status-row']").count(), 1, "Chat status row must render.");
+    assert.equal(await overlayRoot.locator(".chat-entry.kind-system-prompt").count(), 1, "Chat transcript must render the system prompt block.");
     assert.equal(await overlayRoot.locator("[data-role='chat-send']").isHidden(), true, "Send button should be hidden on empty chat input.");
 
     await chatInput.fill("Reply with exact token EDGE_AI_OK and nothing else.");
@@ -358,7 +380,7 @@ async function runPlaywrightFlow({ popupUrl, pageUrl, slowUrl }) {
       pageUrl,
       "Reply with exact token EDGE_CODE_OK and nothing else."
     );
-    await popupPage.waitForFunction(async ([targetPageKey, targetPageUrl]) => {
+      await popupPage.waitForFunction(async ([targetPageKey, targetPageUrl]) => {
       const response = await chrome.runtime.sendMessage({
         id: crypto.randomUUID(),
         version: 1,
@@ -377,11 +399,12 @@ async function runPlaywrightFlow({ popupUrl, pageUrl, slowUrl }) {
       const text = JSON.stringify(response?.result?.session ?? {});
       return text.includes("EDGE_CODE_OK") && text.includes("\"origin\":\"code\"");
     }, [`${new URL(pageUrl).origin}/`, pageUrl], { timeout: 90000 });
+    }
 
     await runTerminalCommand(terminalInput, "test.host.crash");
     await popupPage.waitForFunction(() => {
-      const badge = document.querySelector("#status-badge");
-      return badge?.textContent?.trim() === "running";
+      const workerRunning = document.querySelector("#worker-running")?.textContent?.trim()?.toLowerCase() ?? "";
+      return ["running", "в работе"].includes(workerRunning);
     }, undefined, { timeout: 15000 });
 
     const recoveredTaskId = (await popupPage.locator("#worker-task").textContent())?.trim();
@@ -389,9 +412,9 @@ async function runPlaywrightFlow({ popupUrl, pageUrl, slowUrl }) {
 
     await runTerminalCommand(terminalInput, "worker.stop");
     await popupPage.waitForFunction(() => {
-      const workerRunning = document.querySelector("#worker-running")?.textContent?.trim();
+      const workerRunning = document.querySelector("#worker-running")?.textContent?.trim()?.toLowerCase();
       const workerTask = document.querySelector("#worker-task")?.textContent?.trim();
-      return workerRunning === "stopped" && workerTask === "-";
+      return ["stopped", "остановлен"].includes(workerRunning ?? "") && workerTask === "-";
     }, undefined, { timeout: 10000 });
 
     await runTerminalCommand(terminalInput, "clear");
@@ -447,7 +470,7 @@ async function runSeleniumFlow({ popupUrl, pageUrl, slowUrl, aiOnly = false }) {
       try {
         await waitFor(async () => {
           const message = await driver.executeScript("return document.querySelector('#terminal-state')?.textContent ?? null;");
-          return typeof message === "string" && message.toLowerCase().includes("opened on tab");
+          return textIncludesAny(message, TERMINAL_OPENED_MESSAGES) || textIncludesAny(message, TERMINAL_READY_MESSAGES);
         }, 10000, "Popup did not open terminal on slow current page.");
       } catch (error) {
         const slowDebug = await driver.executeScript(`
@@ -474,7 +497,7 @@ async function runSeleniumFlow({ popupUrl, pageUrl, slowUrl, aiOnly = false }) {
       await driver.executeScript("document.querySelector('#open-terminal')?.click();");
       await waitFor(async () => {
         const message = await driver.executeScript("return document.querySelector('#terminal-state')?.textContent ?? null;");
-        return typeof message === "string" && message.toLowerCase().includes("regular http(s) page");
+        return textIncludesAny(message, TERMINAL_UNAVAILABLE_MESSAGES);
       }, 10000, "Popup did not report unsupported tab.");
       await removeSeleniumTab(driver, unsupportedTabId);
     }
@@ -524,33 +547,35 @@ async function runSeleniumFlow({ popupUrl, pageUrl, slowUrl, aiOnly = false }) {
       await setSeleniumJsonInputValue(driver, "runtime.commandTimeoutMs", "broken", "enter");
       await waitFor(async () => {
         const message = await driver.executeScript("return document.querySelector('#terminal-state')?.textContent ?? null;");
-        return typeof message === "string" && message.toLowerCase().includes("integer");
+        return textIncludesAny(message, INVALID_INTEGER_MESSAGES);
       }, 10000, "Invalid numeric edit did not report an error.");
       assert.equal(await readSeleniumJsonValue(driver, "runtime.commandTimeoutMs"), "2500");
     }
 
-    await setSeleniumAllowedModel(driver, "gpt-5", "standard");
-    await setSeleniumModelPanelValue(driver, "ai.model", "gpt-5", "standard");
+    if (HAS_OPENAI_API_KEY) {
+      await setSeleniumAllowedModel(driver, "gpt-5", "standard");
+    await setSeleniumModelPanelValue(driver, "ai.chat.model", "gpt-5", "standard");
     await waitFor(async () => {
-      const value = await readSeleniumJsonValue(driver, "ai.model");
+      const value = await readSeleniumJsonValue(driver, "ai.chat.model");
       return typeof value === "string" && value.includes("gpt-5") && value.includes("standard");
     }, 10000, "AI model edit did not commit.");
 
     await setSeleniumModalTextValue(
       driver,
-      "ai.instructions",
+      "ai.chat.instructions",
       "Всегда отвечай кратко.\nВозвращай только релевантный результат."
     );
     await waitFor(async () => {
-      const value = await readSeleniumJsonValue(driver, "ai.instructions");
+      const value = await readSeleniumJsonValue(driver, "ai.chat.instructions");
       return typeof value === "string" && value.includes("Всегда отвечай кратко.");
     }, 10000, "AI instructions edit did not commit.");
 
-    await setSeleniumJsonSelectValue(driver, "ai.streamingEnabled", "true");
-    await waitFor(async () => {
-      const value = await readSeleniumJsonValue(driver, "ai.streamingEnabled");
+    await setSeleniumJsonSelectValue(driver, "ai.chat.streamingEnabled", "true");
+      await waitFor(async () => {
+      const value = await readSeleniumJsonValue(driver, "ai.chat.streamingEnabled");
       return value === "true";
     }, 10000, "AI streaming edit did not commit.");
+    }
 
     if (!aiOnly) {
       await setSeleniumJsonSelectValue(driver, "ui.overlay.visible", "true");
@@ -604,7 +629,7 @@ async function runSeleniumFlow({ popupUrl, pageUrl, slowUrl, aiOnly = false }) {
       const title = await driver.executeScript(`
         return document.querySelector('#lextrace-overlay-root')?.shadowRoot?.querySelector('.panel-header h1')?.textContent ?? null;
       `);
-      return title === "LexTrace Terminal";
+      return textIncludesAny(title, OVERLAY_TITLES);
     }, 10000, "Overlay terminal did not appear on page.");
 
     await driver.executeScript(`
@@ -622,18 +647,20 @@ async function runSeleniumFlow({ popupUrl, pageUrl, slowUrl, aiOnly = false }) {
       const title = await driver.executeScript(`
         return document.querySelector('#lextrace-overlay-root')?.shadowRoot?.querySelector('.panel-header h1')?.textContent ?? null;
       `);
-      return title === "LexTrace Terminal";
+      return textIncludesAny(title, OVERLAY_TITLES);
     }, 10000, "Overlay terminal did not reopen after Close.");
 
     const overlayStructure = await driver.executeScript(`
       const root = document.querySelector('#lextrace-overlay-root')?.shadowRoot;
       return {
         overlayTabs: root?.querySelectorAll('.overlay-tab-button')?.length ?? 0,
-        chatStatus: !!root?.querySelector('[data-role="chat-status-row"]')
+        chatStatus: !!root?.querySelector('[data-role="chat-status-row"]'),
+        systemPrompt: !!root?.querySelector('.chat-entry.kind-system-prompt')
       };
     `);
     assert.equal(overlayStructure.overlayTabs, 2, "Overlay must expose Console and Chat tabs.");
-    assert.equal(overlayStructure.chatStatus, true, "Chat status row is missing.");
+    assert.equal(overlayStructure.chatStatus, true, "Chat status row must be present.");
+    assert.equal(overlayStructure.systemPrompt, true, "Chat transcript must render the system prompt block.");
 
     if (!aiOnly) {
       await driver.executeScript(`
@@ -737,8 +764,8 @@ async function runSeleniumFlow({ popupUrl, pageUrl, slowUrl, aiOnly = false }) {
       await driver.switchTo().window(popupHandle);
       try {
         await waitFor(async () => {
-          const badgeText = await driver.executeScript("return document.querySelector('#status-badge')?.textContent?.trim() ?? null;");
-          return badgeText === "running";
+          const workerRunning = await driver.executeScript("return document.querySelector('#worker-running')?.textContent?.trim()?.toLowerCase() ?? null;");
+          return WORKER_RUNNING_TEXTS.includes(workerRunning ?? "");
         }, 10000, "Worker did not enter running state.");
       } catch (error) {
         const popupDebug = await driver.executeScript(`
@@ -796,7 +823,8 @@ async function runSeleniumFlow({ popupUrl, pageUrl, slowUrl, aiOnly = false }) {
       assert.equal(logMetrics.collapsedCount, logMetrics.activityCount, "All terminal activity entries must be collapsed by default.");
     }
 
-    await driver.executeScript(`
+    if (HAS_OPENAI_API_KEY) {
+      await driver.executeScript(`
       document
         .querySelector('#lextrace-overlay-root')
         ?.shadowRoot
@@ -804,15 +832,17 @@ async function runSeleniumFlow({ popupUrl, pageUrl, slowUrl, aiOnly = false }) {
         ?.click();
     `);
     await waitFor(async () => {
-      const statusText = await driver.executeScript(`
-        return document
+      const transcriptState = await driver.executeScript(`
+        const root = document
           .querySelector('#lextrace-overlay-root')
-          ?.shadowRoot
-          ?.querySelector('[data-role="chat-status-row"]')
-          ?.textContent ?? null;
+          ?.shadowRoot;
+        return {
+          hasStatusRow: !!root?.querySelector('[data-role="chat-status-row"]'),
+          promptText: root?.querySelector('.chat-entry.kind-system-prompt .chat-entry-content')?.textContent ?? null
+        };
       `);
-      return typeof statusText === "string" && statusText.includes("provider: openai");
-    }, 15000, "Chat status row did not render OpenAI state.");
+      return transcriptState && transcriptState.hasStatusRow === true && typeof transcriptState.promptText === "string";
+    }, 15000, "Chat transcript and status row did not render.");
 
     await driver.executeScript(`
       const root = document.querySelector('#lextrace-overlay-root')?.shadowRoot;
@@ -907,7 +937,7 @@ async function runSeleniumFlow({ popupUrl, pageUrl, slowUrl, aiOnly = false }) {
         ?.querySelector('.overlay-tab-button[data-tab="chat"]')
         ?.click();
     `);
-    await waitFor(async () => {
+      await waitFor(async () => {
       const feedText = await driver.executeScript(`
         return document
           .querySelector('#lextrace-overlay-root')
@@ -917,15 +947,16 @@ async function runSeleniumFlow({ popupUrl, pageUrl, slowUrl, aiOnly = false }) {
       `);
       return typeof feedText === "string" && feedText.includes("CODE");
     }, 30000, "Code-origin marker did not appear in shared page chat.");
+    }
 
     if (!aiOnly) {
       await runSeleniumTerminalCommand(driver, "test.host.crash");
 
       await driver.switchTo().window(popupHandle);
       await waitFor(async () => {
-        const badgeText = await driver.executeScript("return document.querySelector('#status-badge')?.textContent?.trim() ?? null;");
+        const workerRunning = await driver.executeScript("return document.querySelector('#worker-running')?.textContent?.trim()?.toLowerCase() ?? null;");
         const taskText = await driver.executeScript("return document.querySelector('#worker-task')?.textContent?.trim() ?? null;");
-        return badgeText === "running" && taskText === "demo-task";
+        return WORKER_RUNNING_TEXTS.includes(workerRunning ?? "") && taskText === "demo-task";
       }, 15000, "Host did not recover after crash.");
 
       await driver.switchTo().window(appHandle);
@@ -935,11 +966,11 @@ async function runSeleniumFlow({ popupUrl, pageUrl, slowUrl, aiOnly = false }) {
       await waitFor(async () => {
         const state = await driver.executeScript(`
           return {
-            workerRunning: document.querySelector('#worker-running')?.textContent?.trim() ?? null,
+            workerRunning: document.querySelector('#worker-running')?.textContent?.trim()?.toLowerCase() ?? null,
             workerTask: document.querySelector('#worker-task')?.textContent?.trim() ?? null
           };
         `);
-        return state?.workerRunning === "stopped" && state?.workerTask === "-";
+        return WORKER_STOPPED_TEXTS.includes(state?.workerRunning ?? "") && state?.workerTask === "-";
       }, 10000, "Worker did not stop cleanly.");
 
       await driver.switchTo().window(appHandle);
@@ -1001,19 +1032,34 @@ async function dragPlaywrightOverlay(overlayRoot, deltaX, deltaY) {
   await delay(300);
 }
 
-async function expectTextInLocator(locator, expectedText) {
+function textIncludesAny(text, expectedTexts) {
+  if (typeof text !== "string") {
+    return false;
+  }
+
+  const normalizedText = text.toLowerCase();
+  return expectedTexts.some((candidate) => normalizedText.includes(candidate.toLowerCase()));
+}
+
+async function expectTextInLocator(locator, expectedTexts) {
+  const candidates = Array.isArray(expectedTexts) ? expectedTexts : [expectedTexts];
   await locator.waitFor();
   await locator.page().waitForFunction(
-    ([selector, expected]) => {
+    ([selector, values]) => {
       const element = document.querySelector(selector);
-      return typeof element?.textContent === "string" && element.textContent.toLowerCase().includes(expected);
+      if (typeof element?.textContent !== "string") {
+        return false;
+      }
+
+      const normalizedText = element.textContent.toLowerCase();
+      return values.some((candidate) => normalizedText.includes(candidate));
     },
     [await locator.evaluate((element) => {
       if (!element.id) {
         throw new Error("Locator target must have an id for text assertion.");
       }
       return `#${element.id}`;
-    }), expectedText.toLowerCase()]
+    }), candidates.map((candidate) => candidate.toLowerCase())]
   );
 }
 

@@ -58,17 +58,17 @@ export function isContentScriptUnavailableError(error: unknown): boolean {
 
 export function getOverlayUserMessage(result: Pick<OverlayProbeResult, "eligible" | "ready" | "reason">): string {
   if (result.ready) {
-    return "Terminal available on current page.";
+    return "Терминал доступен на текущей странице.";
   }
 
   switch (result.reason) {
     case "unsupported_tab":
-      return "Terminal unavailable: switch to a regular http(s) page.";
+      return "Терминал недоступен: переключитесь на обычную http(s)-страницу.";
     case "content_not_ready":
-      return "Terminal unavailable: reload the page, then try again.";
+      return "Терминал недоступен: перезагрузите страницу и повторите попытку.";
     case "overlay_open_failed":
-      return "Terminal failed to open on the current page.";
+      return "Не удалось открыть терминал на текущей странице.";
     default:
-      return "Terminal availability is unknown.";
+      return "Доступность терминала пока неизвестна.";
   }
 }

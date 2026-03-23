@@ -9,5 +9,12 @@ artifacts/extension/
 artifacts/packaged/
 native-host/LexTrace.NativeHost/bin/
 native-host/LexTrace.NativeHost/obj/
+native-host/**/bin/
+native-host/**/obj/
+TestResults/
+.vs/
+*.user
+*.rsuser
+*.suo
 .DS_Store
 Thumbs.db

@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -18,11 +19,15 @@ internal sealed class OpenAiClient
     private DateTimeOffset _catalogCacheExpiresAt = DateTimeOffset.MinValue;
 
     public OpenAiClient()
+        : this(CreateConfiguredHttpClient())
+    {
+    }
+
+    internal OpenAiClient(HttpClient httpClient)
     {
         ReloadApiKeyFromEnvironment();
-        _httpClient = new HttpClient();
-        _httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        _httpClient.DefaultRequestHeaders.Add("OpenAI-Beta", "assistants=v2");
+        _httpClient = httpClient;
+        ConfigureDefaultHeaders(_httpClient);
     }
 
     public bool HasApiKey => !string.IsNullOrWhiteSpace(_apiKey);
@@ -68,22 +73,27 @@ internal sealed class OpenAiClient
                 return _catalogCache;
             }
 
-            using var request = BuildJsonRequest(HttpMethod.Get, ModelsPath, payload: null);
-            using var response = await SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken);
-            var modelsJson = await response.Content.ReadAsStringAsync(cancellationToken);
-            var apiModels = OpenAiModelCatalogBuilder.ParseModelsJson(modelsJson);
+            var pricingHtml = await TryGetPricingHtmlAsync(cancellationToken);
 
-            string pricingHtml;
             try
             {
-                pricingHtml = await _httpClient.GetStringAsync(PricingPageUrl, cancellationToken);
+                using var request = BuildJsonRequest(HttpMethod.Get, ModelsPath, payload: null);
+                using var response = await SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken);
+                var modelsJson = await response.Content.ReadAsStringAsync(cancellationToken);
+                var apiModels = OpenAiModelCatalogBuilder.ParseModelsJson(modelsJson);
+                _catalogCache = OpenAiModelCatalogBuilder.Build(apiModels, pricingHtml, now);
             }
-            catch
+            catch (OpenAiHttpException error) when (
+                error.StatusCode == HttpStatusCode.Forbidden &&
+                string.Equals(error.ErrorCode, "unsupported_country_region_territory", StringComparison.Ordinal))
             {
-                pricingHtml = string.Empty;
+                _catalogCache = OpenAiModelCatalogBuilder.BuildFromPricingOnly(
+                    pricingHtml,
+                    now,
+                    warning: "Каталог открыт из локального fallback по прайс-листу: OpenAI API недоступен для текущей страны, региона или территории."
+                );
             }
 
-            _catalogCache = OpenAiModelCatalogBuilder.Build(apiModels, pricingHtml, now);
             _catalogCacheExpiresAt = now.AddMinutes(10);
             return _catalogCache;
         }
@@ -98,13 +108,14 @@ internal sealed class OpenAiClient
         IReadOnlyList<string> inputItemsJson,
         bool background,
         bool stream,
+        PromptCaching.PromptCacheRequestSettings? promptCaching,
         CancellationToken cancellationToken
     )
     {
         using var request = BuildJsonRequest(
             HttpMethod.Post,
             ResponsesPath,
-            BuildResponsesPayload(config, inputItemsJson, background, stream)
+            BuildResponsesPayload(config, inputItemsJson, background, stream, promptCaching)
         );
         using var response = await SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken);
         return await OpenAiJsonResponse.FromHttpResponseAsync(response, cancellationToken);
@@ -114,13 +125,14 @@ internal sealed class OpenAiClient
         AiRuntimeConfig config,
         IReadOnlyList<string> inputItemsJson,
         bool background,
+        PromptCaching.PromptCacheRequestSettings? promptCaching,
         CancellationToken cancellationToken
     )
     {
         var request = BuildJsonRequest(
             HttpMethod.Post,
             ResponsesPath,
-            BuildResponsesPayload(config, inputItemsJson, background, stream: true)
+            BuildResponsesPayload(config, inputItemsJson, background, stream: true, promptCaching)
         );
         var response = await SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         return await OpenAiStreamResponse.CreateAsync(response, cancellationToken);
@@ -158,18 +170,14 @@ internal sealed class OpenAiClient
         AiModelSelection selection,
         IReadOnlyList<string> inputItemsJson,
         string instructions,
+        PromptCaching.PromptCacheRequestSettings? promptCaching,
         CancellationToken cancellationToken
     )
     {
         using var request = BuildJsonRequest(
             HttpMethod.Post,
             $"{ResponsesPath}/compact",
-            new
-            {
-                model = selection.Model,
-                input = BuildInputArray(inputItemsJson),
-                instructions = string.IsNullOrWhiteSpace(instructions) ? null : instructions
-            }
+            BuildCompactPayload(selection, inputItemsJson, instructions, promptCaching)
         );
         using var response = await SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken);
         return await OpenAiJsonResponse.FromHttpResponseAsync(response, cancellationToken);
@@ -234,15 +242,92 @@ internal sealed class OpenAiClient
         }
 
         var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        var statusCode = response.StatusCode;
         response.Dispose();
-        throw new InvalidOperationException($"OpenAI HTTP {(int)response.StatusCode}: {body}");
+        throw CreateHttpException(statusCode, body);
     }
 
-    private static object BuildResponsesPayload(
+    private static HttpClient CreateConfiguredHttpClient()
+    {
+        var httpClient = new HttpClient();
+        ConfigureDefaultHeaders(httpClient);
+        return httpClient;
+    }
+
+    private static void ConfigureDefaultHeaders(HttpClient httpClient)
+    {
+        if (!httpClient.DefaultRequestHeaders.Accept.Any(
+            header => string.Equals(header.MediaType, "application/json", StringComparison.OrdinalIgnoreCase)))
+        {
+            httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        }
+
+        if (!httpClient.DefaultRequestHeaders.Contains("OpenAI-Beta"))
+        {
+            httpClient.DefaultRequestHeaders.Add("OpenAI-Beta", "assistants=v2");
+        }
+    }
+
+    private async Task<string> TryGetPricingHtmlAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _httpClient.GetStringAsync(PricingPageUrl, cancellationToken);
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static OpenAiHttpException CreateHttpException(HttpStatusCode statusCode, string body)
+    {
+        string? errorCode = null;
+        string? errorMessage = null;
+        string? errorType = null;
+        string? errorParam = null;
+
+        try
+        {
+            using var document = JsonDocument.Parse(body);
+            if (document.RootElement.TryGetProperty("error", out var errorElement) &&
+                errorElement.ValueKind == JsonValueKind.Object)
+            {
+                if (errorElement.TryGetProperty("code", out var codeElement) && codeElement.ValueKind == JsonValueKind.String)
+                {
+                    errorCode = codeElement.GetString();
+                }
+
+                if (errorElement.TryGetProperty("message", out var messageElement) && messageElement.ValueKind == JsonValueKind.String)
+                {
+                    errorMessage = messageElement.GetString();
+                }
+
+                if (errorElement.TryGetProperty("type", out var typeElement) && typeElement.ValueKind == JsonValueKind.String)
+                {
+                    errorType = typeElement.GetString();
+                }
+
+                if (errorElement.TryGetProperty("param", out var paramElement) && paramElement.ValueKind == JsonValueKind.String)
+                {
+                    errorParam = paramElement.GetString();
+                }
+            }
+        }
+        catch
+        {
+            // Keep the raw body when it is not valid JSON.
+        }
+
+        return new OpenAiHttpException(statusCode, body, errorCode, errorMessage, errorType, errorParam);
+    }
+
+    internal static JsonObject BuildResponsesPayload(
         AiRuntimeConfig config,
         IReadOnlyList<string> inputItemsJson,
         bool background,
-        bool stream
+        bool stream,
+        PromptCaching.PromptCacheRequestSettings? promptCaching = null
     )
     {
         var payload = new JsonObject
@@ -255,6 +340,16 @@ internal sealed class OpenAiClient
             ["store"] = true
         };
 
+        if (!string.IsNullOrWhiteSpace(promptCaching?.CacheKey))
+        {
+            payload["prompt_cache_key"] = promptCaching.CacheKey;
+        }
+
+        if (!string.IsNullOrWhiteSpace(promptCaching?.RetentionApplied))
+        {
+            payload["prompt_cache_retention"] = promptCaching.RetentionApplied;
+        }
+
         if (!string.IsNullOrWhiteSpace(config.Chat.Instructions))
         {
             payload["instructions"] = config.Chat.Instructions;
@@ -264,6 +359,28 @@ internal sealed class OpenAiClient
         if (textPayload is not null)
         {
             payload["text"] = JsonSerializer.SerializeToNode(textPayload);
+        }
+
+        return payload;
+    }
+
+    internal static JsonObject BuildCompactPayload(
+        AiModelSelection selection,
+        IReadOnlyList<string> inputItemsJson,
+        string instructions,
+        PromptCaching.PromptCacheRequestSettings? promptCaching = null
+    )
+    {
+        var payload = new JsonObject
+        {
+            ["model"] = selection.Model,
+            ["input"] = BuildInputArray(inputItemsJson),
+            ["instructions"] = string.IsNullOrWhiteSpace(instructions) ? null : instructions
+        };
+
+        if (!string.IsNullOrWhiteSpace(promptCaching?.CacheKey))
+        {
+            payload["prompt_cache_key"] = promptCaching.CacheKey;
         }
 
         return payload;
@@ -335,6 +452,39 @@ internal sealed class OpenAiClient
         }
 
         return array;
+    }
+
+    internal sealed class OpenAiHttpException : InvalidOperationException
+    {
+        public OpenAiHttpException(
+            HttpStatusCode statusCode,
+            string responseBody,
+            string? errorCode,
+            string? errorMessage,
+            string? errorType,
+            string? errorParam
+        )
+            : base($"OpenAI HTTP {(int)statusCode}: {responseBody}")
+        {
+            StatusCode = statusCode;
+            ResponseBody = responseBody;
+            ErrorCode = errorCode;
+            ErrorMessage = errorMessage;
+            ErrorType = errorType;
+            ErrorParam = errorParam;
+        }
+
+        public HttpStatusCode StatusCode { get; }
+
+        public string ResponseBody { get; }
+
+        public string? ErrorCode { get; }
+
+        public string? ErrorMessage { get; }
+
+        public string? ErrorType { get; }
+
+        public string? ErrorParam { get; }
     }
 }
 

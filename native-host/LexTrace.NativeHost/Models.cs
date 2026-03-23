@@ -54,6 +54,7 @@ internal sealed class AiRuntimeConfig
 {
     public AiChatConfig Chat { get; set; } = new();
     public AiCompactionConfig Compaction { get; set; } = new();
+    public AiPromptCachingConfig PromptCaching { get; set; } = new();
     public AiRateLimitConfig RateLimits { get; set; } = new();
 
     public static AiRuntimeConfig CreateDefault() => new();
@@ -86,10 +87,30 @@ internal sealed class AiCompactionConfig
     public bool Enabled { get; set; } = true;
     public bool StreamingEnabled { get; set; } = true;
     public AiModelSelection? ModelOverride { get; set; }
-    public string Instructions { get; set; } = string.Empty;
+    public string Instructions { get; set; } = AiCompactionDefaults.DefaultInstructions;
     public int TriggerPromptTokens { get; set; } = 131072;
     public int PreserveRecentTurns { get; set; } = 24;
     public int MaxPassesPerPage { get; set; } = 16;
+}
+
+internal static class AiCompactionDefaults
+{
+    public const string DefaultInstructions =
+        "Summarize the conversation history into compact, faithful context for the next turn. " +
+        "Preserve the user's goals, accepted decisions, constraints, important facts, open questions, " +
+        "unfinished work, and any code or data details that still matter. Remove repetition and low-value " +
+        "chatter. Do not invent facts or change meaning.";
+
+    public static string ResolveInstructions(string? instructions) =>
+        string.IsNullOrWhiteSpace(instructions)
+            ? DefaultInstructions
+            : instructions.Trim();
+}
+
+internal sealed class AiPromptCachingConfig
+{
+    public string Routing { get; set; } = PromptCaching.RoutingStableSessionPrefix;
+    public string Retention { get; set; } = PromptCaching.RetentionInMemory;
 }
 
 internal sealed class AiRateLimitConfig
@@ -132,6 +153,31 @@ internal sealed class AiChatMessageRecord
     public object? Meta { get; set; }
 }
 
+internal sealed class AiCompactedMessageMeta
+{
+    public string? CompactedBy { get; set; }
+}
+
+internal sealed class AiCompactionRequestMeta
+{
+    public string CompactionId { get; set; } = string.Empty;
+    public List<string> AffectedMessageIds { get; set; } = [];
+    public string RangeStartMessageId { get; set; } = string.Empty;
+    public string RangeEndMessageId { get; set; } = string.Empty;
+    public string? InstructionsText { get; set; }
+}
+
+internal sealed class AiCompactionResultMeta
+{
+    public string CompactionId { get; set; } = string.Empty;
+    public List<string> AffectedMessageIds { get; set; } = [];
+    public string RangeStartMessageId { get; set; } = string.Empty;
+    public string RangeEndMessageId { get; set; } = string.Empty;
+    public string? ResultPreviewText { get; set; }
+    public int? CompactedItemCount { get; set; }
+    public int? PreservedTailCount { get; set; }
+}
+
 internal sealed class AiQueueItemRecord
 {
     public string Id { get; set; } = Guid.NewGuid().ToString("D");
@@ -147,6 +193,37 @@ internal sealed class AiQueueItemRecord
     public string? ModelId { get; set; }
     public int? LastSequenceNumber { get; set; }
     public int AttemptCount { get; set; }
+    public string PromptCacheRoutingApplied { get; set; } = PromptCaching.RoutingStableSessionPrefix;
+    public string PromptCacheRetentionApplied { get; set; } = PromptCaching.RetentionInMemory;
+    public string? PromptCacheKey { get; set; }
+}
+
+internal sealed class AiPromptCacheLastRequestState
+{
+    public string Source { get; set; } = PromptCaching.SourceChat;
+    public int? PromptTokens { get; set; }
+    public int? CachedTokens { get; set; }
+    public double? HitRatePct { get; set; }
+    public string Status { get; set; } = PromptCaching.StatusUnknown;
+    public string RetentionApplied { get; set; } = PromptCaching.RetentionInMemory;
+    public string RoutingApplied { get; set; } = PromptCaching.RoutingStableSessionPrefix;
+    public string? UpdatedAt { get; set; }
+}
+
+internal sealed class AiPromptCacheSessionState
+{
+    public int RequestCount { get; set; }
+    public int ChatRequestCount { get; set; }
+    public int CompactionRequestCount { get; set; }
+    public int PromptTokens { get; set; }
+    public int CachedTokens { get; set; }
+    public double? HitRatePct { get; set; }
+}
+
+internal sealed class AiPromptCachingState
+{
+    public AiPromptCacheLastRequestState? LastRequest { get; set; }
+    public AiPromptCacheSessionState Session { get; set; } = new();
 }
 
 internal sealed class AiPageSessionRecord
@@ -166,4 +243,5 @@ internal sealed class AiPageSessionRecord
     public AiQueueItemRecord? ActiveItem { get; set; }
     public AiQueueItemRecord? RetryableItem { get; set; }
     public List<string> CanonicalContextJsonItems { get; set; } = [];
+    public AiPromptCachingState PromptCaching { get; set; } = new();
 }

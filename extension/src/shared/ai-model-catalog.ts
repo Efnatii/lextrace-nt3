@@ -6,6 +6,7 @@ import type {
   AiModelPricingTier,
   AiServiceTier
 } from "./ai";
+import { formatAiServiceTierLabel } from "./ai";
 
 export type ModelCatalogSort =
   | "name-asc"
@@ -39,10 +40,10 @@ export function isAiModelTierAvailable(model: AiModelCatalogItem, serviceTier: A
 export function formatAiModelSummaryPrice(model: AiModelCatalogItem, serviceTier: AiServiceTier): string {
   const pricing = getAiModelPricingTier(model, serviceTier);
   if (pricing.summaryUsdPer1M === null) {
-    return "Σ н/д";
+    return "н/д";
   }
 
-  return `Σ $${formatPrice(pricing.summaryUsdPer1M)} / 1M`;
+  return `$${formatPrice(pricing.summaryUsdPer1M)} / 1 млн`;
 }
 
 export function formatAiModelTooltip(
@@ -61,7 +62,7 @@ export function formatAiModelTooltip(
     `Семейство: ${model.family}`,
     `Владелец: ${model.ownedBy ?? "н/д"}`,
     `Создана: ${createdAt}`,
-    `Активный раздел: ${activeTier}`,
+    `Активный тариф: ${formatAiServiceTierLabel(activeTier)}`,
     ""
   ];
 
@@ -69,32 +70,32 @@ export function formatAiModelTooltip(
     const pricing = getAiModelPricingTier(model, tier);
     const matchedBy = model.matchedBy[tier];
     const mainLine = [
-      `[${tier}]`,
-      `совпадение: ${pricing.pricingModelId ?? "н/д"} (${matchedBy})`,
-      `Σ ${formatOptionalPrice(pricing.summaryUsdPer1M, "/ 1M")}`,
-      `in ${formatOptionalPrice(pricing.inputUsdPer1M, "/ 1M")}`,
-      `cache ${formatOptionalPrice(pricing.cachedInputUsdPer1M, "/ 1M")}`,
-      `out ${formatOptionalPrice(pricing.outputUsdPer1M, "/ 1M")}`
+      `[${formatAiServiceTierLabel(tier)}]`,
+      `совпадение: ${pricing.pricingModelId ?? "н/д"} (${formatAiCatalogMatchLabel(matchedBy)})`,
+      `итого ${formatOptionalPrice(pricing.summaryUsdPer1M, "/ 1 млн")}`,
+      `вход ${formatOptionalPrice(pricing.inputUsdPer1M, "/ 1 млн")}`,
+      `кэш ${formatOptionalPrice(pricing.cachedInputUsdPer1M, "/ 1 млн")}`,
+      `выход ${formatOptionalPrice(pricing.outputUsdPer1M, "/ 1 млн")}`
     ].join(" | ");
 
     lines.push(mainLine);
     if (pricing.trainingUsdPer1M !== null || pricing.trainingUsdPerHour !== null) {
       lines.push(
-        `training: ${formatOptionalPrice(pricing.trainingUsdPer1M, "/ 1M")} | hourly: ${formatOptionalPrice(pricing.trainingUsdPerHour, "/ час")}`
+        `обучение: ${formatOptionalPrice(pricing.trainingUsdPer1M, "/ 1 млн")} | за час: ${formatOptionalPrice(pricing.trainingUsdPerHour, "/ час")}`
       );
     }
   }
 
   lines.push("");
-  lines.push("[budget]");
+  lines.push("[лимиты]");
   if (budgetState) {
     lines.push(
       `RPM: ${formatBudgetPair(budgetState.serverRemainingRequests, budgetState.serverLimitRequests)}`,
       `TPM: ${formatBudgetPair(budgetState.serverRemainingTokens, budgetState.serverLimitTokens)}`,
-      `Reset RPM: ${budgetState.serverResetRequests ?? "н/д"}`,
-      `Reset TPM: ${budgetState.serverResetTokens ?? "н/д"}`,
-      `Observed: ${budgetState.observedAt ?? "н/д"}`,
-      `Served: ${budgetState.lastResolvedServiceTier ?? "н/д"}`,
+      `Сброс RPM: ${budgetState.serverResetRequests ?? "н/д"}`,
+      `Сброс TPM: ${budgetState.serverResetTokens ?? "н/д"}`,
+      `Замер: ${budgetState.observedAt ?? "н/д"}`,
+      `Выдано по тарифу: ${budgetState.lastResolvedServiceTier ? formatAiServiceTierLabel(budgetState.lastResolvedServiceTier) : "н/д"}`,
       ""
     );
   } else {
@@ -113,7 +114,7 @@ export function formatAiModelCompactTooltip(
   const pricing = getAiModelPricingTier(model, tier);
   const lines = [
     model.id,
-    `[${tier}] Σ ${formatOptionalPrice(pricing.summaryUsdPer1M, "/ 1M")} | in ${formatOptionalPrice(pricing.inputUsdPer1M, "/ 1M")} | out ${formatOptionalPrice(pricing.outputUsdPer1M, "/ 1M")}`
+    `[${formatAiServiceTierLabel(tier)}] ${formatOptionalPrice(pricing.summaryUsdPer1M, "/ 1 млн")} | вход ${formatOptionalPrice(pricing.inputUsdPer1M, "/ 1 млн")} | выход ${formatOptionalPrice(pricing.outputUsdPer1M, "/ 1 млн")}`
   ];
 
   if (budgetState) {
@@ -122,11 +123,11 @@ export function formatAiModelCompactTooltip(
     );
 
     const resetParts = [
-      budgetState.serverResetRequests ? `req ${budgetState.serverResetRequests}` : null,
-      budgetState.serverResetTokens ? `tok ${budgetState.serverResetTokens}` : null
+      budgetState.serverResetRequests ? `rpm ${budgetState.serverResetRequests}` : null,
+      budgetState.serverResetTokens ? `tpm ${budgetState.serverResetTokens}` : null
     ].filter(Boolean);
     if (resetParts.length > 0) {
-      lines.push(`reset ${resetParts.join(" | ")}`);
+      lines.push(`сброс ${resetParts.join(" | ")}`);
     }
   }
 
@@ -275,15 +276,15 @@ export function buildAllowedModelSections(
       return {
         rule,
         model,
-        summaryPrice: model ? formatAiModelSummaryPrice(model, tier) : "Σ н/д",
+        summaryPrice: model ? formatAiModelSummaryPrice(model, tier) : "н/д",
         tooltip: model
           ? formatAiModelTooltip(model, tier, budgetState)
           : [
               `Модель: ${rule.model}`,
-              `Раздел: ${tier}`,
+              `Тариф: ${formatAiServiceTierLabel(tier)}`,
               "Модель отсутствует в текущем каталоге OpenAI.",
               budgetState
-                ? `Budget: RPM ${formatBudgetPair(budgetState.serverRemainingRequests, budgetState.serverLimitRequests)}, TPM ${formatBudgetPair(
+                ? `Лимиты: RPM ${formatBudgetPair(budgetState.serverRemainingRequests, budgetState.serverLimitRequests)}, TPM ${formatBudgetPair(
                     budgetState.serverRemainingTokens,
                     budgetState.serverLimitTokens
                   )}`
@@ -406,4 +407,16 @@ function resolveModelBudget(modelBudgets: AiModelBudgetMap, modelId: string): Ai
   }
 
   return null;
+}
+
+function formatAiCatalogMatchLabel(match: AiModelCatalogItem["matchedBy"][AiServiceTier]): string {
+  switch (match) {
+    case "exact":
+      return "точное";
+    case "family":
+      return "по семейству";
+    case "unavailable":
+    default:
+      return "недоступно";
+  }
 }

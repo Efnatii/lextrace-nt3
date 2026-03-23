@@ -5,7 +5,11 @@ using System.Text.RegularExpressions;
 
 namespace LexTrace.NativeHost;
 
-internal sealed record OpenAiModelCatalogResult(string FetchedAt, IReadOnlyList<OpenAiModelCatalogItem> Models);
+internal sealed record OpenAiModelCatalogResult(
+    string FetchedAt,
+    IReadOnlyList<OpenAiModelCatalogItem> Models,
+    string? Warning = null
+);
 
 internal sealed record OpenAiModelCatalogItem(
     string Id,
@@ -47,7 +51,7 @@ internal static class OpenAiModelCatalogBuilder
     private const string PricingSourceUrl = "https://developers.openai.com/api/docs/pricing";
 
     private static readonly Regex StandardPaneRegex = new(
-        "data-content-switcher-pane=\"true\"[^>]*data-value=\"standard\"[^>]*>(?<content>.*?)(?=<div data-content-switcher-pane=\"true\"|<script>)",
+        "data-content-switcher-pane=\"true\"[^>]*data-value=\"standard\"[^>]*>(?<content>.*?)(?=<div data-content-switcher-pane=\"true\"|<script>|$)",
         RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled
     );
 
@@ -103,6 +107,32 @@ internal static class OpenAiModelCatalogBuilder
     )
     {
         var pricingLookup = ParsePricing(pricingHtml);
+        return BuildCatalog(models, pricingLookup, fetchedAt);
+    }
+
+    public static OpenAiModelCatalogResult BuildFromPricingOnly(
+        string pricingHtml,
+        DateTimeOffset fetchedAt,
+        string? warning = null
+    )
+    {
+        var pricingLookup = ParsePricing(pricingHtml);
+        var models = pricingLookup.Keys
+            .Where(IsChatModelId)
+            .OrderBy(modelId => modelId, StringComparer.OrdinalIgnoreCase)
+            .Select(modelId => new OpenAiApiModelInfo(modelId, Created: null, OwnedBy: "pricing"))
+            .ToList();
+
+        return BuildCatalog(models, pricingLookup, fetchedAt, warning);
+    }
+
+    private static OpenAiModelCatalogResult BuildCatalog(
+        IReadOnlyList<OpenAiApiModelInfo> models,
+        IReadOnlyDictionary<string, OpenAiPricingAccumulator> pricingLookup,
+        DateTimeOffset fetchedAt,
+        string? warning = null
+    )
+    {
         var catalogItems = new List<OpenAiModelCatalogItem>();
 
         foreach (var model in models.Where(model => IsChatModelId(model.Id)).OrderBy(model => model.Id, StringComparer.OrdinalIgnoreCase))
@@ -122,7 +152,8 @@ internal static class OpenAiModelCatalogBuilder
 
         return new OpenAiModelCatalogResult(
             fetchedAt.ToString("O"),
-            catalogItems
+            catalogItems,
+            warning
         );
     }
 

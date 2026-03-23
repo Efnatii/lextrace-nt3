@@ -65,19 +65,13 @@ internal static class Program
                 }
                 catch (Exception error)
                 {
+                    var protocolError = CreateProtocolError(error);
                     await transport.SendAsync(
                         new ProtocolResponse(
                             envelope.Id,
                             Ok: false,
                             Result: null,
-                            Error: new ProtocolError(
-                                "native_host_error",
-                                error.Message,
-                                new
-                                {
-                                    error.StackTrace
-                                }
-                            ),
+                            Error: protocolError,
                             Ts: DateTimeOffset.UtcNow.ToString("O")
                         ),
                         cts.Token
@@ -191,5 +185,35 @@ internal static class Program
         }
 
         return property.Clone();
+    }
+
+    private static ProtocolError CreateProtocolError(Exception error)
+    {
+        if (error is OpenAiClient.OpenAiHttpException openAiError)
+        {
+            return new ProtocolError(
+                "openai_http_error",
+                error.Message,
+                new
+                {
+                    statusCode = (int)openAiError.StatusCode,
+                    openAiCode = openAiError.ErrorCode,
+                    openAiMessage = openAiError.ErrorMessage,
+                    openAiType = openAiError.ErrorType,
+                    openAiParam = openAiError.ErrorParam,
+                    body = openAiError.ResponseBody,
+                    error.StackTrace
+                }
+            );
+        }
+
+        return new ProtocolError(
+            "native_host_error",
+            error.Message,
+            new
+            {
+                error.StackTrace
+            }
+        );
     }
 }
