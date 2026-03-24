@@ -245,6 +245,9 @@ export const editableConfigFields = [
       "24h": formatAiPromptCacheRetentionLabel("24h")
     })
   ),
+  createDescriptor("ai.retries.maxRetries", "local", "number", NonNegativeIntegerSchema),
+  createDescriptor("ai.retries.baseDelayMs", "local", "number", AiPositiveIntegerSchema),
+  createDescriptor("ai.retries.maxDelayMs", "local", "number", AiPositiveIntegerSchema),
   createDescriptor("ai.rateLimits.reserveOutputTokens", "local", "number", AiPositiveIntegerSchema),
   createDescriptor("ai.rateLimits.maxQueuedPerPage", "local", "number", AiPositiveIntegerSchema),
   createDescriptor("ai.rateLimits.maxQueuedGlobal", "local", "number", AiPositiveIntegerSchema),
@@ -292,11 +295,12 @@ const configKeyOrderRegistry = new Map<string, readonly string[]>([
   ["", ["ui", "ai", "logging", "runtime", "protocol", "test"]],
   ["ui", ["popupActiveTab", "overlay"]],
   ["ui.overlay", ["activeTab", "visible", "width", "height", "left", "top"]],
-  ["ai", ["openAiApiKey", "allowedModels", "chat", "compaction", "promptCaching", "rateLimits"]],
+  ["ai", ["openAiApiKey", "allowedModels", "chat", "compaction", "promptCaching", "rateLimits", "retries"]],
   ["ai.chat", ["model", "streamingEnabled", "instructions", "structuredOutput"]],
   ["ai.chat.structuredOutput", ["name", "description", "schema", "strict"]],
   ["ai.compaction", ["enabled", "streamingEnabled", "modelOverride", "instructions", "triggerPromptTokens", "preserveRecentTurns", "maxPassesPerPage"]],
   ["ai.promptCaching", ["routing", "retention"]],
+  ["ai.retries", ["maxRetries", "baseDelayMs", "maxDelayMs"]],
   ["ai.rateLimits", ["reserveOutputTokens", "maxQueuedPerPage", "maxQueuedGlobal"]],
   ["logging", ["level", "maxEntries", "collapseThreshold"]],
   ["runtime", ["nativeHostName", "reconnectPolicy", "heartbeatMs", "commandTimeoutMs"]],

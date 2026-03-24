@@ -115,6 +115,7 @@ describe("config field parsing and formatting", () => {
     ["runtime.nativeHostName", "com.lextrace.custom", "com.lextrace.custom"],
     ["ai.promptCaching.routing", "provider_default", "provider_default"],
     ["ai.promptCaching.retention", "24h", "24h"],
+    ["ai.retries.maxRetries", "2", 2],
     ["ai.chat.model", '{"model":"gpt-5","tier":"flex"}', { model: "gpt-5", tier: "flex" }],
     ["ai.chat.model", "null", null],
     ["ai.allowedModels", '["gpt-5","gpt-5-mini"]', [
@@ -275,6 +276,9 @@ describe("config normalization and patch composition", () => {
           ai: {
             rateLimits: {
               maxQueuedPerPage: 8
+            },
+            retries: {
+              maxRetries: 2
             }
           }
         }
@@ -286,14 +290,17 @@ describe("config normalization and patch composition", () => {
           activeTab: "chat"
         }
       },
-      ai: {
-        chat: {
-          streamingEnabled: false
-        },
-        rateLimits: {
-          maxQueuedPerPage: 8
+        ai: {
+          chat: {
+            streamingEnabled: false
+          },
+          retries: {
+            maxRetries: 2
+          },
+          rateLimits: {
+            maxQueuedPerPage: 8
+          }
         }
-      }
     });
   });
 

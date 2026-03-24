@@ -1,10 +1,17 @@
 using System.Diagnostics;
+using System.Net;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 
 namespace LexTrace.NativeHost;
 
 internal sealed class RuntimeEngine
 {
+    private static readonly JsonSerializerOptions CanonicalContextJsonSerializerOptions = new()
+    {
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+    };
+
     private readonly NativeMessagingTransport _transport;
     private readonly HostStateStore _stateStore;
     private readonly OpenAiClient _openAiClient;
@@ -25,6 +32,39 @@ internal sealed class RuntimeEngine
         int? CompactedItemCount,
         int? PreservedTailCount
     );
+
+    internal sealed record RetryDisposition(
+        string Decision,
+        string FailureClassification
+    )
+    {
+        public const string DecisionAutoRetry = "auto-retry";
+        public const string DecisionRestartFresh = "restart-fresh";
+        public const string DecisionManualPause = "manual-pause";
+    }
+
+    internal sealed record RetryHandlingDecision(
+        string Action,
+        string FailureClassification,
+        string RetryMode,
+        int DelayMs,
+        bool ClearResponseState
+    )
+    {
+        public const string ActionAutoRetry = "auto-retry";
+        public const string ActionManualPause = "manual-pause";
+    }
+
+    private sealed class OpenAiTerminalResponseException : InvalidOperationException
+    {
+        public OpenAiTerminalResponseException(string responseStatus)
+            : base($"OpenAI background response ended with status {responseStatus}.")
+        {
+            ResponseStatus = responseStatus;
+        }
+
+        public string ResponseStatus { get; }
+    }
 
     public RuntimeEngine(NativeMessagingTransport transport, HostStateStore stateStore)
     {
@@ -147,6 +187,7 @@ internal sealed class RuntimeEngine
         _journal.AiConfig.Chat.StructuredOutput ??= new AiStructuredOutputConfig();
         _journal.AiConfig.Compaction ??= new AiCompactionConfig();
         _journal.AiConfig.PromptCaching ??= new AiPromptCachingConfig();
+        _journal.AiConfig.Retries ??= new AiRetryConfig();
         _journal.AiConfig.RateLimits ??= new AiRateLimitConfig();
         _journal.AiConfig.Compaction.Instructions = ResolveCompactionInstructions(_journal.AiConfig);
         _journal.AiConfig.PromptCaching.Routing = PromptCaching.NormalizeRouting(_journal.AiConfig.PromptCaching.Routing);
@@ -169,7 +210,7 @@ internal sealed class RuntimeEngine
         session.RequestState ??= "idle";
         session.Messages ??= [];
         session.PendingQueue ??= [];
-        session.CanonicalContextJsonItems ??= [];
+        session.CanonicalContextJsonItems = NormalizeCanonicalContextJsonItems(session.CanonicalContextJsonItems ?? []);
         session.PromptCaching ??= new AiPromptCachingState();
         session.PromptCaching.Session ??= new AiPromptCacheSessionState();
         if (session.PromptCaching.LastRequest is not null)
@@ -220,6 +261,9 @@ internal sealed class RuntimeEngine
         item.CreatedAt ??= DateTimeOffset.UtcNow.ToString("O");
         item.State ??= "queued";
         item.UserMessageId ??= string.Empty;
+        item.AttemptCount = Math.Max(0, item.AttemptCount);
+        item.AutoRetryCount = Math.Max(0, item.AutoRetryCount);
+        item.NotBeforeAt = NormalizeOptionalIsoTimestamp(item.NotBeforeAt);
         item.PromptCacheRoutingApplied = PromptCaching.NormalizeRouting(item.PromptCacheRoutingApplied);
         item.PromptCacheRetentionApplied = PromptCaching.NormalizeRetention(item.PromptCacheRetentionApplied);
     }
@@ -252,6 +296,9 @@ internal sealed class RuntimeEngine
                     : _journal.AiConfig.Chat.StructuredOutput.Name,
                 compactionEnabled = _journal.AiConfig.Compaction.Enabled,
                 compactionStreamingEnabled = _journal.AiConfig.Compaction.StreamingEnabled,
+                maxRetries = _journal.AiConfig.Retries.MaxRetries,
+                retryBaseDelayMs = _journal.AiConfig.Retries.BaseDelayMs,
+                retryMaxDelayMs = _journal.AiConfig.Retries.MaxDelayMs,
                 reserveOutputTokens = _journal.AiConfig.RateLimits.ReserveOutputTokens,
                 maxQueuedPerPage = _journal.AiConfig.RateLimits.MaxQueuedPerPage,
                 maxQueuedGlobal = _journal.AiConfig.RateLimits.MaxQueuedGlobal,
@@ -618,10 +665,10 @@ internal sealed class RuntimeEngine
             session = GetOrCreatePageSessionLocked(pageKey, pageUrl: null);
             if (session.RetryableItem is not null)
             {
+                ResetRetryCycleForManualResume(session.RetryableItem);
                 session.PendingQueue.Insert(0, session.RetryableItem);
                 session.RetryableItem = null;
                 session.RequestState = "queued";
-                session.LastError = null;
             }
 
             await _stateStore.SaveAsync(_journal, cancellationToken);
@@ -925,6 +972,25 @@ internal sealed class RuntimeEngine
         var rangeEndMessageId = affectedMessageIds[^1];
         var resolvedInstructions = ResolveCompactionInstructions(config);
         var preservedTailItems = GetPreservedTailContextJson(session, config.Compaction.PreserveRecentTurns);
+        var compactionInputItems = GetCompactionInputItems(session, preservedTailItems);
+        if (compactionInputItems.Count == 0)
+        {
+            await EmitLogAsync(
+                "info",
+                "ai.chat.compaction.requested",
+                "Manual AI context compaction skipped.",
+                new
+                {
+                    pageKey,
+                    mode,
+                    reason = "no_compaction_input"
+                },
+                cancellationToken,
+                correlationId
+            );
+            return new ManualCompactionResult(false, mode, null, "no_compaction_input", 0, null, null);
+        }
+
         var promptCacheRequest = PromptCaching.ResolveCompactionRequest(config, session, compactionSelection);
         AiChatMessageRecord? compactionRequestMessage = null;
 
@@ -1017,7 +1083,7 @@ internal sealed class RuntimeEngine
         {
             var response = await _openAiClient.CompactAsync(
                 compactionSelection,
-                session.CanonicalContextJsonItems,
+                compactionInputItems,
                 resolvedInstructions,
                 promptCacheRequest,
                 cancellationToken
@@ -1316,6 +1382,7 @@ internal sealed class RuntimeEngine
             {
                 AiQueueItemRecord? activeItem;
                 AiPageSessionRecord? session;
+                TimeSpan? waitDelay = null;
 
                 await _stateLock.WaitAsync(cancellationToken);
                 try
@@ -1343,27 +1410,40 @@ internal sealed class RuntimeEngine
 
                         session.PendingQueue.Insert(0, blockedItem);
                         session.RetryableItem = null;
-                        activeItem = session.PendingQueue[0];
-                        session.PendingQueue.RemoveAt(0);
-                        session.ActiveItem = activeItem;
-                        activeItem.State = "running";
-                        activeItem.ModelId = null;
-                        session.RequestState = "running";
-                        session.LastError = null;
-                        session.LastCheckpointAt = NowIso();
-                        await _stateStore.SaveAsync(_journal, cancellationToken);
+                        if (TryTakeNextPendingQueueItemForExecution(session, DateTimeOffset.UtcNow, out activeItem, out var nextRetryAt))
+                        {
+                            ActivateQueuedItem(session, activeItem!);
+                            session.RequestState = "running";
+                            session.LastError = null;
+                            session.LastCheckpointAt = NowIso();
+                            await _stateStore.SaveAsync(_journal, cancellationToken);
+                        }
+                        else
+                        {
+                            session.RequestState = "queued";
+                            session.LastCheckpointAt = NowIso();
+                            await _stateStore.SaveAsync(_journal, cancellationToken);
+                            waitDelay = GetWaitDelay(nextRetryAt);
+                            activeItem = null;
+                        }
                     }
                     else if (session.PendingQueue.Count > 0)
                     {
-                        activeItem = session.PendingQueue[0];
-                        session.PendingQueue.RemoveAt(0);
-                        session.ActiveItem = activeItem;
-                        activeItem.State = "running";
-                        activeItem.ModelId = null;
-                        session.RequestState = "running";
-                        session.LastCheckpointAt = NowIso();
-                        MarkMessageState(session, activeItem.UserMessageId, "completed");
-                        await _stateStore.SaveAsync(_journal, cancellationToken);
+                        if (TryTakeNextPendingQueueItemForExecution(session, DateTimeOffset.UtcNow, out activeItem, out var nextRetryAt))
+                        {
+                            ActivateQueuedItem(session, activeItem!);
+                            session.RequestState = "running";
+                            session.LastCheckpointAt = NowIso();
+                            await _stateStore.SaveAsync(_journal, cancellationToken);
+                        }
+                        else
+                        {
+                            session.RequestState = "queued";
+                            session.LastCheckpointAt = NowIso();
+                            await _stateStore.SaveAsync(_journal, cancellationToken);
+                            waitDelay = GetWaitDelay(nextRetryAt);
+                            activeItem = null;
+                        }
                     }
                     else
                     {
@@ -1379,6 +1459,17 @@ internal sealed class RuntimeEngine
                 finally
                 {
                     _stateLock.Release();
+                }
+
+                if (activeItem is null)
+                {
+                    if (waitDelay is null)
+                    {
+                        return;
+                    }
+
+                    await Task.Delay(waitDelay.Value, cancellationToken);
+                    continue;
                 }
 
                 await ProcessActiveQueueItemAsync(pageKey, activeItem!, cancellationToken);
@@ -1436,7 +1527,7 @@ internal sealed class RuntimeEngine
         }
         catch (Exception error)
         {
-            await MarkRetryableAsync(pageKey, activeItem, error.Message, cancellationToken);
+            await HandleActiveItemFailureAsync(pageKey, activeItem, error, cancellationToken);
             return;
         }
         var executionModel = string.IsNullOrWhiteSpace(activeItem.ModelId)
@@ -1536,7 +1627,7 @@ internal sealed class RuntimeEngine
         }
         catch (Exception error)
         {
-            await MarkRetryableAsync(pageKey, activeItem, error.Message, cancellationToken);
+            await HandleActiveItemFailureAsync(pageKey, activeItem, error, cancellationToken);
         }
     }
 
@@ -1571,7 +1662,7 @@ internal sealed class RuntimeEngine
         }
         catch (Exception error)
         {
-            await MarkRetryableAsync(pageKey, activeItem, error.Message, cancellationToken);
+            await HandleActiveItemFailureAsync(pageKey, activeItem, error, cancellationToken);
         }
     }
 
@@ -1628,7 +1719,7 @@ internal sealed class RuntimeEngine
                     break;
 
                 case "response.failed":
-                    throw new InvalidOperationException("OpenAI stream reported response.failed.");
+                    throw new OpenAiTerminalResponseException("failed");
             }
         }
 
@@ -1667,7 +1758,7 @@ internal sealed class RuntimeEngine
 
             if (responseStatus is "failed" or "cancelled" or "incomplete")
             {
-                throw new InvalidOperationException($"OpenAI background response ended with status {responseStatus}.");
+                throw new OpenAiTerminalResponseException(responseStatus);
             }
 
             await Task.Delay(1500, cancellationToken);
@@ -1859,71 +1950,374 @@ internal sealed class RuntimeEngine
         }
     }
 
+    private async Task HandleActiveItemFailureAsync(
+        string pageKey,
+        AiQueueItemRecord activeItem,
+        Exception error,
+        CancellationToken cancellationToken
+    )
+    {
+        var errorMessage = error.Message;
+        var retryHandling = DetermineRetryHandling(error, activeItem, _journal.AiConfig.Retries);
+        if (retryHandling.Action == RetryHandlingDecision.ActionAutoRetry)
+        {
+            await ScheduleAutomaticRetryAsync(pageKey, activeItem, errorMessage, retryHandling, cancellationToken);
+            return;
+        }
+
+        await MarkRetryableAsync(pageKey, activeItem, errorMessage, retryHandling, cancellationToken);
+    }
+
+    private async Task ScheduleAutomaticRetryAsync(
+        string pageKey,
+        AiQueueItemRecord activeItem,
+        string errorMessage,
+        RetryHandlingDecision retryHandling,
+        CancellationToken cancellationToken
+    )
+    {
+        AiPageSessionRecord? session = null;
+        AiChatMessageRecord? assistantMessage = null;
+        var nextRetryAt = DateTimeOffset.UtcNow.AddMilliseconds(retryHandling.DelayMs).ToString("O");
+
+        await _stateLock.WaitAsync(cancellationToken);
+        try
+        {
+            session = GetOrCreatePageSessionLocked(pageKey, pageUrl: null);
+            session.ActiveItem = null;
+            activeItem.State = "queued";
+            activeItem.AutoRetryCount += 1;
+            activeItem.NotBeforeAt = nextRetryAt;
+            PrepareQueueItemForRetry(session, activeItem, retryHandling.RetryMode, messageState: "pending");
+            session.PendingQueue.Insert(0, activeItem);
+            session.RequestState = "queued";
+            session.LastError = errorMessage;
+            session.Recoverable = true;
+            session.LastCheckpointAt = NowIso();
+            assistantMessage = FindAssistantMessage(session, activeItem);
+            MarkPendingCompactionRequestFailed(session);
+
+            await _stateStore.SaveAsync(_journal, cancellationToken);
+        }
+        finally
+        {
+            _stateLock.Release();
+        }
+
+        await EmitAiEventAsync(
+            "ai.chat.status",
+            "AI request scheduled for automatic retry.",
+            session!,
+            cancellationToken,
+            details: new
+            {
+                activeItem.RequestId,
+                errorMessage,
+                attemptCount = activeItem.AttemptCount,
+                maxRetries = _journal.AiConfig.Retries.MaxRetries,
+                delayMs = retryHandling.DelayMs,
+                retryMode = retryHandling.RetryMode,
+                failureClassification = retryHandling.FailureClassification,
+                nextRetryAt
+            },
+            messageRecord: assistantMessage
+        );
+
+        await EmitLogAsync(
+            "warn",
+            "ai.chat.retry_scheduled",
+            "AI request scheduled for automatic retry.",
+            new
+            {
+                pageKey,
+                requestId = activeItem.RequestId,
+                errorMessage,
+                attemptCount = activeItem.AttemptCount,
+                maxRetries = _journal.AiConfig.Retries.MaxRetries,
+                delayMs = retryHandling.DelayMs,
+                retryMode = retryHandling.RetryMode,
+                failureClassification = retryHandling.FailureClassification,
+                nextRetryAt,
+                recoverable = session!.Recoverable,
+                requestState = session.RequestState
+            },
+            cancellationToken
+        );
+    }
+
     private async Task MarkRetryableAsync(
         string pageKey,
         AiQueueItemRecord activeItem,
         string errorMessage,
+        RetryHandlingDecision retryHandling,
         CancellationToken cancellationToken
     )
     {
+        AiPageSessionRecord? session = null;
+        AiChatMessageRecord? assistantMessage = null;
+
         await _stateLock.WaitAsync(cancellationToken);
         try
         {
-            var session = GetOrCreatePageSessionLocked(pageKey, pageUrl: null);
+            session = GetOrCreatePageSessionLocked(pageKey, pageUrl: null);
             session.ActiveItem = null;
             activeItem.State = "retryable";
+            activeItem.NotBeforeAt = null;
+            PrepareQueueItemForRetry(session, activeItem, retryHandling.RetryMode, messageState: "error");
             session.RetryableItem = activeItem;
             session.RequestState = "paused";
             session.LastError = errorMessage;
             session.Recoverable = true;
             session.LastCheckpointAt = NowIso();
-
-            var assistantMessage = session.Messages.FirstOrDefault(message => message.Id == activeItem.AssistantMessageId);
-            if (assistantMessage is not null && assistantMessage.State == "streaming")
-            {
-                assistantMessage.State = "error";
-            }
-
-            var pendingCompactionMessage = session.Messages.LastOrDefault(message => message.Kind == "compaction-request" && message.State == "pending");
-            if (pendingCompactionMessage is not null)
-            {
-                pendingCompactionMessage.State = "error";
-                pendingCompactionMessage.Text = "Context compaction request failed.";
-            }
+            assistantMessage = FindAssistantMessage(session, activeItem);
+            MarkPendingCompactionRequestFailed(session);
 
             await _stateStore.SaveAsync(_journal, cancellationToken);
-
-            await EmitAiEventAsync(
-                "ai.chat.error",
-                "AI request moved to retryable state.",
-                session,
-                cancellationToken,
-                details: new
-                {
-                    activeItem.RequestId,
-                    errorMessage
-                },
-                messageRecord: assistantMessage
-            );
-
-            await EmitLogAsync(
-                "error",
-                "ai.chat.error",
-                "AI request moved to retryable state.",
-                new
-                {
-                    pageKey,
-                    requestId = activeItem.RequestId,
-                    errorMessage,
-                    recoverable = session.Recoverable,
-                    requestState = session.RequestState
-                },
-                cancellationToken
-            );
         }
         finally
         {
             _stateLock.Release();
+        }
+
+        await EmitAiEventAsync(
+            "ai.chat.error",
+            "AI request moved to retryable state.",
+            session!,
+            cancellationToken,
+            details: new
+            {
+                activeItem.RequestId,
+                errorMessage,
+                attemptCount = activeItem.AttemptCount,
+                maxRetries = _journal.AiConfig.Retries.MaxRetries,
+                retryMode = retryHandling.RetryMode,
+                failureClassification = retryHandling.FailureClassification
+            },
+            messageRecord: assistantMessage
+        );
+
+        await EmitLogAsync(
+            "error",
+            "ai.chat.error",
+            "AI request moved to retryable state.",
+            new
+            {
+                pageKey,
+                requestId = activeItem.RequestId,
+                errorMessage,
+                attemptCount = activeItem.AttemptCount,
+                maxRetries = _journal.AiConfig.Retries.MaxRetries,
+                retryMode = retryHandling.RetryMode,
+                failureClassification = retryHandling.FailureClassification,
+                recoverable = session!.Recoverable,
+                requestState = session.RequestState
+            },
+            cancellationToken
+        );
+    }
+
+    internal static RetryDisposition ClassifyRetry(Exception error)
+    {
+        if (error is OpenAiTerminalResponseException terminal)
+        {
+            return new RetryDisposition(
+                RetryDisposition.DecisionManualPause,
+                $"openai_response_{terminal.ResponseStatus}"
+            );
+        }
+
+        if (error is OpenAiClient.OpenAiHttpException openAiError)
+        {
+            if (openAiError.StatusCode == HttpStatusCode.BadRequest && IsExpiredResumeError(openAiError))
+            {
+                return new RetryDisposition(
+                    RetryDisposition.DecisionRestartFresh,
+                    "expired_response_id"
+                );
+            }
+
+            if (openAiError.StatusCode == HttpStatusCode.RequestTimeout)
+            {
+                return new RetryDisposition(
+                    RetryDisposition.DecisionAutoRetry,
+                    "openai_http_408"
+                );
+            }
+
+            if ((int)openAiError.StatusCode == 409)
+            {
+                return new RetryDisposition(
+                    RetryDisposition.DecisionAutoRetry,
+                    "openai_http_409"
+                );
+            }
+
+            if (openAiError.StatusCode == HttpStatusCode.TooManyRequests)
+            {
+                return new RetryDisposition(
+                    string.Equals(openAiError.ErrorCode, "insufficient_quota", StringComparison.OrdinalIgnoreCase)
+                        ? RetryDisposition.DecisionManualPause
+                        : RetryDisposition.DecisionAutoRetry,
+                    string.Equals(openAiError.ErrorCode, "insufficient_quota", StringComparison.OrdinalIgnoreCase)
+                        ? "insufficient_quota"
+                        : "openai_http_429"
+                );
+            }
+
+            if ((int)openAiError.StatusCode >= 500)
+            {
+                return new RetryDisposition(
+                    RetryDisposition.DecisionAutoRetry,
+                    $"openai_http_{(int)openAiError.StatusCode}"
+                );
+            }
+
+            return new RetryDisposition(
+                RetryDisposition.DecisionManualPause,
+                $"openai_http_{(int)openAiError.StatusCode}"
+            );
+        }
+
+        if (error is HttpRequestException)
+        {
+            return new RetryDisposition(
+                RetryDisposition.DecisionAutoRetry,
+                "transport_http"
+            );
+        }
+
+        if (error is IOException or EndOfStreamException)
+        {
+            return new RetryDisposition(
+                RetryDisposition.DecisionAutoRetry,
+                "stream_disconnect"
+            );
+        }
+
+        return new RetryDisposition(
+            RetryDisposition.DecisionManualPause,
+            "non_retryable_error"
+        );
+    }
+
+    internal static RetryHandlingDecision DetermineRetryHandling(
+        Exception error,
+        AiQueueItemRecord activeItem,
+        AiRetryConfig config
+    )
+    {
+        var disposition = ClassifyRetry(error);
+        var retryMode = ResolveRetryMode(activeItem, disposition);
+        var clearResponseState = string.Equals(retryMode, "restart", StringComparison.Ordinal);
+
+        if ((disposition.Decision == RetryDisposition.DecisionAutoRetry ||
+             disposition.Decision == RetryDisposition.DecisionRestartFresh) &&
+            activeItem.AutoRetryCount < config.MaxRetries)
+        {
+            var retryIndex = activeItem.AutoRetryCount + 1;
+            return new RetryHandlingDecision(
+                RetryHandlingDecision.ActionAutoRetry,
+                disposition.FailureClassification,
+                retryMode,
+                ComputeRetryDelayMs(config, retryIndex),
+                clearResponseState
+            );
+        }
+
+        return new RetryHandlingDecision(
+            RetryHandlingDecision.ActionManualPause,
+            disposition.FailureClassification,
+            retryMode,
+            0,
+            clearResponseState
+        );
+    }
+
+    internal static int ComputeRetryDelayMs(AiRetryConfig config, int retryIndex)
+    {
+        if (retryIndex <= 0)
+        {
+            return 0;
+        }
+
+        var multiplier = 1L << Math.Min(retryIndex - 1, 30);
+        var delayMs = config.BaseDelayMs * multiplier;
+        return (int)Math.Min(delayMs, config.MaxDelayMs);
+    }
+
+    internal static void ResetRetryCycleForManualResume(AiQueueItemRecord? item)
+    {
+        if (item is null)
+        {
+            return;
+        }
+
+        item.AutoRetryCount = 0;
+        item.NotBeforeAt = null;
+        if (item.State != "blocked")
+        {
+            item.State = "queued";
+        }
+    }
+
+    private static string ResolveRetryMode(
+        AiQueueItemRecord activeItem,
+        RetryDisposition disposition
+    ) =>
+        disposition.Decision == RetryDisposition.DecisionRestartFresh ||
+        string.IsNullOrWhiteSpace(activeItem.OpenAiResponseId)
+            ? "restart"
+            : "resume";
+
+    private static bool IsExpiredResumeError(OpenAiClient.OpenAiHttpException error)
+    {
+        var message = error.ErrorMessage ?? error.ResponseBody;
+        return message.Contains("no longer be streamed", StringComparison.OrdinalIgnoreCase) &&
+               message.Contains("more than 5 minutes old", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static AiChatMessageRecord? FindAssistantMessage(
+        AiPageSessionRecord session,
+        AiQueueItemRecord activeItem
+    ) =>
+        session.Messages.FirstOrDefault(message => message.Id == activeItem.AssistantMessageId);
+
+    internal static void PrepareQueueItemForRetry(
+        AiPageSessionRecord session,
+        AiQueueItemRecord activeItem,
+        string retryMode,
+        string messageState
+    )
+    {
+        var assistantMessage = FindAssistantMessage(session, activeItem);
+        if (string.Equals(retryMode, "restart", StringComparison.Ordinal))
+        {
+            activeItem.OpenAiResponseId = null;
+            activeItem.LastSequenceNumber = null;
+            activeItem.ModelId = null;
+            session.OpenAiResponseId = null;
+            session.LastSequenceNumber = null;
+
+            if (assistantMessage is not null)
+            {
+                assistantMessage.Text = string.Empty;
+                assistantMessage.OpenAiResponseId = null;
+            }
+        }
+
+        if (assistantMessage is not null)
+        {
+            assistantMessage.State = messageState;
+        }
+    }
+
+    private static void MarkPendingCompactionRequestFailed(AiPageSessionRecord session)
+    {
+        var pendingCompactionMessage = session.Messages.LastOrDefault(message => message.Kind == "compaction-request" && message.State == "pending");
+        if (pendingCompactionMessage is not null)
+        {
+            pendingCompactionMessage.State = "error";
+            pendingCompactionMessage.Text = "Context compaction request failed.";
         }
     }
 
@@ -1969,6 +2363,12 @@ internal sealed class RuntimeEngine
         var rangeEndMessageId = affectedMessageIds[^1];
         var resolvedInstructions = ResolveCompactionInstructions(config);
         var preservedTailItems = GetPreservedTailContextJson(session, config.Compaction.PreserveRecentTurns);
+        var compactionInputItems = GetCompactionInputItems(session, preservedTailItems);
+        if (compactionInputItems.Count == 0)
+        {
+            return;
+        }
+
         var promptCacheRequest = PromptCaching.ResolveCompactionRequest(config, session, compactionSelection);
 
         AiChatMessageRecord? compactionRequestMessage = null;
@@ -2040,7 +2440,7 @@ internal sealed class RuntimeEngine
 
         var response = await _openAiClient.CompactAsync(
             compactionSelection,
-            session.CanonicalContextJsonItems,
+            compactionInputItems,
             resolvedInstructions,
             promptCacheRequest,
             cancellationToken
@@ -2475,6 +2875,34 @@ internal sealed class RuntimeEngine
         return activeCount + GetVisibleQueueCount(session);
     }
 
+    internal static bool TryTakeNextPendingQueueItemForExecution(
+        AiPageSessionRecord session,
+        DateTimeOffset now,
+        out AiQueueItemRecord? activeItem,
+        out DateTimeOffset? nextRetryAt
+    )
+    {
+        activeItem = null;
+        nextRetryAt = null;
+
+        if (session.PendingQueue.Count == 0)
+        {
+            return false;
+        }
+
+        var candidate = session.PendingQueue[0];
+        nextRetryAt = GetQueueItemNotBeforeAt(candidate);
+        if (nextRetryAt is not null && nextRetryAt > now)
+        {
+            return false;
+        }
+
+        session.PendingQueue.RemoveAt(0);
+        candidate.NotBeforeAt = null;
+        activeItem = candidate;
+        return true;
+    }
+
     private int GetVisibleQueueCountLocked(AiPageSessionRecord session) => GetVisibleQueueCount(session);
 
     private int GetSessionQueuedWorkCountLocked(AiPageSessionRecord session) => GetQueuedWorkCount(session);
@@ -2499,6 +2927,33 @@ internal sealed class RuntimeEngine
         }
         return queue.ToArray();
     }
+
+    private static void ActivateQueuedItem(AiPageSessionRecord session, AiQueueItemRecord activeItem)
+    {
+        session.ActiveItem = activeItem;
+        activeItem.State = "running";
+        if (string.IsNullOrWhiteSpace(activeItem.OpenAiResponseId))
+        {
+            activeItem.ModelId = null;
+        }
+        activeItem.AttemptCount += 1;
+        MarkMessageState(session, activeItem.UserMessageId, "completed");
+    }
+
+    private static TimeSpan GetWaitDelay(DateTimeOffset? nextRetryAt)
+    {
+        var fallbackDelay = TimeSpan.FromMilliseconds(250);
+        if (nextRetryAt is null)
+        {
+            return fallbackDelay;
+        }
+
+        var delay = nextRetryAt.Value - DateTimeOffset.UtcNow;
+        return delay > TimeSpan.Zero ? delay : fallbackDelay;
+    }
+
+    private static string? GetSessionNextRetryAt(AiPageSessionRecord session) =>
+        NormalizeOptionalIsoTimestamp(session.PendingQueue.FirstOrDefault(item => item is not null && GetQueueItemNotBeforeAt(item) is not null)?.NotBeforeAt);
 
     private AiChatMessageRecord EnsureAssistantDraftMessage(AiPageSessionRecord session, AiQueueItemRecord activeItem)
     {
@@ -2543,7 +2998,7 @@ internal sealed class RuntimeEngine
     }
 
     private static string SerializeUserMessageInputJson(string _origin, string text) =>
-        JsonSerializer.Serialize(new
+        SerializeCanonicalContextJson(new
         {
             type = "message",
             role = "user",
@@ -2558,7 +3013,7 @@ internal sealed class RuntimeEngine
         });
 
     private static string SerializeAssistantMessageOutputJson(string text) =>
-        JsonSerializer.Serialize(new
+        SerializeCanonicalContextJson(new
         {
             type = "message",
             role = "assistant",
@@ -2570,6 +3025,97 @@ internal sealed class RuntimeEngine
                     text
                 }
             }
+        });
+
+    private static string SerializeCanonicalContextJson(object value) =>
+        JsonSerializer.Serialize(value, CanonicalContextJsonSerializerOptions);
+
+    internal static List<string> NormalizeCanonicalContextJsonItems(IEnumerable<string> items)
+    {
+        var normalized = new List<string>();
+        foreach (var item in items)
+        {
+            var normalizedItem = NormalizeCanonicalContextItemJson(item);
+            if (!string.IsNullOrWhiteSpace(normalizedItem) &&
+                !normalized.Contains(normalizedItem, StringComparer.Ordinal))
+            {
+                normalized.Add(normalizedItem);
+            }
+        }
+
+        return normalized;
+    }
+
+    internal static string NormalizeCanonicalContextItemJson(string itemJson)
+    {
+        if (string.IsNullOrWhiteSpace(itemJson))
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            using var itemDocument = JsonDocument.Parse(itemJson);
+            return NormalizeCanonicalContextItemJson(itemDocument.RootElement);
+        }
+        catch (JsonException)
+        {
+            return itemJson.Trim();
+        }
+    }
+
+    private static string NormalizeCanonicalContextItemJson(JsonElement itemElement)
+    {
+        var type = GetOptionalString(itemElement, "type");
+        return type switch
+        {
+            "message" => NormalizeCanonicalMessageItemJson(itemElement),
+            "compaction" => NormalizeCanonicalCompactionItemJson(itemElement),
+            _ => JsonSerializer.Serialize(itemElement, CanonicalContextJsonSerializerOptions)
+        };
+    }
+
+    private static string NormalizeCanonicalMessageItemJson(JsonElement itemElement)
+    {
+        var normalizedContent = new List<Dictionary<string, object?>>();
+        if (itemElement.TryGetProperty("content", out var contentProperty) && contentProperty.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var contentItem in contentProperty.EnumerateArray())
+            {
+                var contentType = GetOptionalString(contentItem, "type");
+                if (string.IsNullOrWhiteSpace(contentType))
+                {
+                    continue;
+                }
+
+                var normalizedContentItem = new Dictionary<string, object?>
+                {
+                    ["type"] = contentType
+                };
+
+                var text = GetOptionalString(contentItem, "text");
+                if (text is not null)
+                {
+                    normalizedContentItem["text"] = text;
+                }
+
+                normalizedContent.Add(normalizedContentItem);
+            }
+        }
+
+        return SerializeCanonicalContextJson(new
+        {
+            type = "message",
+            role = GetOptionalString(itemElement, "role") ?? "assistant",
+            content = normalizedContent
+        });
+    }
+
+    private static string NormalizeCanonicalCompactionItemJson(JsonElement itemElement) =>
+        SerializeCanonicalContextJson(new
+        {
+            type = "compaction",
+            encrypted_content = GetOptionalString(itemElement, "encrypted_content") ?? string.Empty
         });
 
     private static List<string> MergeCanonicalContext(
@@ -2663,6 +3209,40 @@ internal sealed class RuntimeEngine
             .ToList();
     }
 
+    internal static List<string> GetCompactionInputItems(AiPageSessionRecord session, int preserveRecentTurns) =>
+        GetCompactionInputItems(session, GetPreservedTailContextJson(session, preserveRecentTurns));
+
+    private static List<string> GetCompactionInputItems(
+        AiPageSessionRecord session,
+        IReadOnlyList<string> preservedTailItems
+    )
+    {
+        var inputItems = new List<string>(session.CanonicalContextJsonItems);
+        foreach (var preservedTailItem in preservedTailItems)
+        {
+            var index = FindLastIndex(inputItems, preservedTailItem);
+            if (index >= 0)
+            {
+                inputItems.RemoveAt(index);
+            }
+        }
+
+        return inputItems;
+    }
+
+    private static int FindLastIndex(IReadOnlyList<string> items, string value)
+    {
+        for (var index = items.Count - 1; index >= 0; index--)
+        {
+            if (string.Equals(items[index], value, StringComparison.Ordinal))
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
     private int EstimateBudgetTokenCost(AiPageSessionRecord session, string pendingText)
     {
         return ApplyReserveOutputTokens(
@@ -2708,11 +3288,11 @@ internal sealed class RuntimeEngine
         {
             foreach (var item in outputProperty.EnumerateArray())
             {
-                outputItems.Add(item.GetRawText());
+                outputItems.Add(NormalizeCanonicalContextItemJson(item));
             }
         }
 
-        return outputItems;
+        return NormalizeCanonicalContextJsonItems(outputItems);
     }
 
     internal static string BuildCompactionResultPreview(IReadOnlyList<string> compactedItems)
@@ -2955,6 +3535,13 @@ internal sealed class RuntimeEngine
             );
         }
 
+        if (aiElement.TryGetProperty("retries", out var retriesElement) && retriesElement.ValueKind == JsonValueKind.Object)
+        {
+            journal.AiConfig.Retries.MaxRetries = GetOptionalInt(retriesElement, "maxRetries") ?? journal.AiConfig.Retries.MaxRetries;
+            journal.AiConfig.Retries.BaseDelayMs = GetOptionalInt(retriesElement, "baseDelayMs") ?? journal.AiConfig.Retries.BaseDelayMs;
+            journal.AiConfig.Retries.MaxDelayMs = GetOptionalInt(retriesElement, "maxDelayMs") ?? journal.AiConfig.Retries.MaxDelayMs;
+        }
+
         if (aiElement.TryGetProperty("rateLimits", out var rateLimitElement) && rateLimitElement.ValueKind == JsonValueKind.Object)
         {
             journal.AiConfig.RateLimits.ReserveOutputTokens = GetOptionalInt(rateLimitElement, "reserveOutputTokens") ?? journal.AiConfig.RateLimits.ReserveOutputTokens;
@@ -2998,6 +3585,7 @@ internal sealed class RuntimeEngine
             activeRequestId = session.ActiveItem?.RequestId,
             openaiResponseId = session.OpenAiResponseId,
             lastSequenceNumber = session.LastSequenceNumber,
+            nextRetryAt = GetSessionNextRetryAt(session),
             queuedCount = queue.Length,
             recoverable = session.Recoverable,
             lastCheckpointAt = session.LastCheckpointAt,
@@ -3061,6 +3649,7 @@ internal sealed class RuntimeEngine
             activeRequestId = session.ActiveItem?.RequestId,
             openaiResponseId = session.OpenAiResponseId,
             lastSequenceNumber = session.LastSequenceNumber,
+            nextRetryAt = GetSessionNextRetryAt(session),
             recoverable = session.Recoverable,
             rateLimits = BuildAiRateLimitPayload(currentModelBudget),
             currentModelBudget = currentModelBudget is null ? null : BuildAiModelBudgetPayload(currentModelBudget),
@@ -3106,7 +3695,9 @@ internal sealed class RuntimeEngine
         origin = item?.Origin ?? "user",
         text = item?.Text ?? string.Empty,
         createdAt = item?.CreatedAt ?? DateTimeOffset.UtcNow.ToString("O"),
-        state = item?.State ?? "queued"
+        state = item?.State ?? "queued",
+        attemptCount = item?.AttemptCount ?? 0,
+        nextRetryAt = NormalizeOptionalIsoTimestamp(item?.NotBeforeAt)
     };
 
     private static object? BuildPromptCacheTelemetryDetails(
@@ -3443,6 +4034,12 @@ internal sealed class RuntimeEngine
 
     private static DateTimeOffset? ParseTimestamp(string? value) =>
         DateTimeOffset.TryParse(value, out var parsedValue) ? parsedValue : null;
+
+    private static string? NormalizeOptionalIsoTimestamp(string? value) =>
+        ParseTimestamp(value)?.ToString("O");
+
+    private static DateTimeOffset? GetQueueItemNotBeforeAt(AiQueueItemRecord? item) =>
+        ParseTimestamp(item?.NotBeforeAt);
 
     private static TimeSpan ParseResetDuration(string? value)
     {

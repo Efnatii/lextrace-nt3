@@ -168,7 +168,9 @@ export const AiChatQueueItemSchema = z.object({
   origin: z.enum(["user", "code"]),
   text: z.string().min(1),
   createdAt: z.string().min(1),
-  state: z.enum(["queued", "running", "retryable", "blocked"])
+  state: z.enum(["queued", "running", "retryable", "blocked"]),
+  attemptCount: z.number().int().min(0).optional(),
+  nextRetryAt: z.string().nullable().optional()
 });
 
 export const AiAvailableActionsSchema = z.object({
@@ -223,6 +225,7 @@ export const AiChatStatusSchema = z.object({
   activeRequestId: z.string().nullable(),
   openaiResponseId: z.string().nullable(),
   lastSequenceNumber: z.number().int().min(0).nullable(),
+  nextRetryAt: z.string().nullable().optional(),
   recoverable: z.boolean(),
   rateLimits: AiRateLimitSnapshotSchema.optional(),
   currentModelBudget: AiModelBudgetStateSchema.nullable(),
@@ -239,6 +242,7 @@ export const AiChatPageSessionSchema = z.object({
   activeRequestId: z.string().nullable(),
   openaiResponseId: z.string().nullable(),
   lastSequenceNumber: z.number().int().min(0).nullable(),
+  nextRetryAt: z.string().nullable().optional(),
   queuedCount: z.number().int().min(0),
   recoverable: z.boolean(),
   lastCheckpointAt: z.string().nullable(),
@@ -754,6 +758,7 @@ export function createDefaultAiStatus(pageKey: string, pageUrlSample: string | n
     activeRequestId: null,
     openaiResponseId: null,
     lastSequenceNumber: null,
+    nextRetryAt: null,
     recoverable: false,
     rateLimits: createEmptyAiRateLimitSnapshot(),
     currentModelBudget: null,

@@ -330,6 +330,8 @@ describe("protocol validation", () => {
     expect(parsed.message.session?.messages[0]?.state).toBe("pending");
     expect(parsed.message.session?.messages[0]?.meta).toBeNull();
     expect(parsed.message.session?.queue[0]?.state).toBe("queued");
+    expect(parsed.message.session?.queue[0]?.attemptCount).toBe(0);
+    expect(parsed.message.session?.queue[0]?.nextRetryAt).toBeNull();
   });
 
   it("accepts host AI status streams that encode optional fields as null", () => {
@@ -531,5 +533,170 @@ describe("protocol validation", () => {
     expect(parsed.message.status?.requestState).toBe("idle");
     expect(parsed.message.status?.contextPromptTokens).toBe(4096);
     expect(parsed.message.session?.status.contextPromptTokens).toBe(4096);
+  });
+
+  it("accepts retry visibility fields in AI queue and session payloads", () => {
+    const stream = {
+      stream: "ai",
+      event: "ai.chat.status",
+      level: "warn",
+      summary: "AI request scheduled for automatic retry.",
+      details: null,
+      ts: "2026-03-24T10:00:00.000Z",
+      correlationId: null,
+      pageKey: "https://example.com/retry",
+      pageUrl: "https://example.com/retry",
+      requestId: "req-retry",
+      sequenceNumber: null,
+      status: {
+        provider: "openai",
+        apiKeyPresent: true,
+        model: {
+          model: "gpt-5",
+          tier: "standard"
+        },
+        resolvedServiceTier: null,
+        streamingEnabled: true,
+        structuredOutputEnabled: false,
+        structuredOutputName: null,
+        structuredOutputStrict: true,
+        requestState: "queued",
+        lastError: "temporary network failure",
+        historyScope: "page",
+        pageKey: "https://example.com/retry",
+        pageUrlSample: "https://example.com/retry",
+        queueCount: 1,
+        contextPromptTokens: 1024,
+        activeRequestId: null,
+        openaiResponseId: null,
+        lastSequenceNumber: null,
+        nextRetryAt: "2026-03-24T10:00:05.000Z",
+        recoverable: true,
+        rateLimits: {
+          serverLimitRequests: null,
+          serverLimitTokens: null,
+          serverRemainingRequests: null,
+          serverRemainingTokens: null,
+          serverResetRequests: null,
+          serverResetTokens: null
+        },
+        currentModelBudget: null,
+        modelBudgets: {},
+        promptCaching: {
+          routing: "stable_session_prefix",
+          retention: "in_memory",
+          lastRequest: null,
+          session: {
+            requestCount: 0,
+            chatRequestCount: 0,
+            compactionRequestCount: 0,
+            promptTokens: 0,
+            cachedTokens: 0,
+            hitRatePct: null
+          }
+        },
+        availableActions: {
+          canSend: true,
+          canResume: false,
+          canReset: true
+        }
+      },
+      session: {
+        pageKey: "https://example.com/retry",
+        pageUrlSample: "https://example.com/retry",
+        attachedViewIds: [],
+        state: "queued",
+        activeRequestId: null,
+        openaiResponseId: null,
+        lastSequenceNumber: null,
+        nextRetryAt: "2026-03-24T10:00:05.000Z",
+        queuedCount: 1,
+        recoverable: true,
+        lastCheckpointAt: "2026-03-24T10:00:00.000Z",
+        lastError: "temporary network failure",
+        messages: [],
+        queue: [
+          {
+            id: "queue-1",
+            requestId: "req-retry",
+            pageKey: "https://example.com/retry",
+            origin: "user",
+            text: "retry me",
+            createdAt: "2026-03-24T09:59:59.000Z",
+            state: "queued",
+            attemptCount: 2,
+            nextRetryAt: "2026-03-24T10:00:05.000Z"
+          }
+        ],
+        status: {
+          provider: "openai",
+          apiKeyPresent: true,
+          model: {
+            model: "gpt-5",
+            tier: "standard"
+          },
+          resolvedServiceTier: null,
+          streamingEnabled: true,
+          structuredOutputEnabled: false,
+          structuredOutputName: null,
+          structuredOutputStrict: true,
+          requestState: "queued",
+          lastError: "temporary network failure",
+          historyScope: "page",
+          pageKey: "https://example.com/retry",
+          pageUrlSample: "https://example.com/retry",
+          queueCount: 1,
+          contextPromptTokens: 1024,
+          activeRequestId: null,
+          openaiResponseId: null,
+          lastSequenceNumber: null,
+          nextRetryAt: "2026-03-24T10:00:05.000Z",
+          recoverable: true,
+          rateLimits: {
+            serverLimitRequests: null,
+            serverLimitTokens: null,
+            serverRemainingRequests: null,
+            serverRemainingTokens: null,
+            serverResetRequests: null,
+            serverResetTokens: null
+          },
+          currentModelBudget: null,
+          modelBudgets: {},
+          promptCaching: {
+            routing: "stable_session_prefix",
+            retention: "in_memory",
+            lastRequest: null,
+            session: {
+              requestCount: 0,
+              chatRequestCount: 0,
+              compactionRequestCount: 0,
+              promptTokens: 0,
+              cachedTokens: 0,
+              hitRatePct: null
+            }
+          },
+          availableActions: {
+            canSend: true,
+            canResume: false,
+            canReset: true
+          }
+        }
+      }
+    };
+
+    const parsed = parseNativeHostMessage(stream);
+    expect(parsed).toMatchObject({
+      kind: "stream",
+      normalized: false
+    });
+
+    if (!parsed || parsed.kind !== "stream" || parsed.message.stream !== "ai") {
+      throw new Error("Expected AI retry stream payload.");
+    }
+
+    expect(parsed.message.status?.nextRetryAt).toBe("2026-03-24T10:00:05.000Z");
+    expect(parsed.message.session?.nextRetryAt).toBe("2026-03-24T10:00:05.000Z");
+    expect(parsed.message.session?.queue[0]?.attemptCount).toBe(2);
+    expect(parsed.message.session?.queue[0]?.nextRetryAt).toBe("2026-03-24T10:00:05.000Z");
   });
 });

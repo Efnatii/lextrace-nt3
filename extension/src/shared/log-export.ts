@@ -46,6 +46,7 @@ export type SafeAiConfigSnapshot = {
   chat: ExtensionConfig["ai"]["chat"];
   compaction: ExtensionConfig["ai"]["compaction"];
   promptCaching: ExtensionConfig["ai"]["promptCaching"];
+  retries: ExtensionConfig["ai"]["retries"];
   rateLimits: ExtensionConfig["ai"]["rateLimits"];
 };
 
@@ -71,6 +72,9 @@ function cloneSafeAiConfig(config: ExtensionConfig | null): SafeAiConfigSnapshot
     },
     promptCaching: {
       ...config.ai.promptCaching
+    },
+    retries: {
+      ...config.ai.retries
     },
     rateLimits: {
       ...config.ai.rateLimits

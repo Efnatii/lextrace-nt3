@@ -740,6 +740,9 @@ async function verifyHostValue(pathName, expected, state) {
     "ai.compaction.maxPassesPerPage": "aiConfig.compaction.maxPassesPerPage",
     "ai.promptCaching.routing": "aiConfig.promptCaching.routing",
     "ai.promptCaching.retention": "aiConfig.promptCaching.retention",
+    "ai.retries.maxRetries": "aiConfig.retries.maxRetries",
+    "ai.retries.baseDelayMs": "aiConfig.retries.baseDelayMs",
+    "ai.retries.maxDelayMs": "aiConfig.retries.maxDelayMs",
     "ai.rateLimits.reserveOutputTokens": "aiConfig.rateLimits.reserveOutputTokens",
     "ai.rateLimits.maxQueuedPerPage": "aiConfig.rateLimits.maxQueuedPerPage",
     "ai.rateLimits.maxQueuedGlobal": "aiConfig.rateLimits.maxQueuedGlobal"

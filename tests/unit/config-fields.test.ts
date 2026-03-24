@@ -98,6 +98,12 @@ describe("editable config fields", () => {
       valueType: "enum",
       editorType: "select"
     });
+
+    expect(getEditableConfigField("ai.retries.maxRetries")).toMatchObject({
+      scope: "local",
+      valueType: "number",
+      editorType: "inline"
+    });
   });
 
   it("builds nested config patches from field paths", () => {
@@ -116,6 +122,7 @@ describe("editable config fields", () => {
     expect(parseConfigFieldDraft("ai.openAiApiKey", "sk-test")).toBe("sk-test");
     expect(parseConfigFieldDraft("protocol.testCommandsEnabled", "true")).toBe(true);
     expect(parseConfigFieldDraft("ai.promptCaching.retention", "24h")).toBe("24h");
+    expect(parseConfigFieldDraft("ai.retries.maxRetries", "4")).toBe(4);
     expect(parseConfigFieldDraft("ai.chat.model", '{"model":"gpt-5","tier":"priority"}')).toEqual({
       model: "gpt-5",
       tier: "priority"
@@ -200,6 +207,7 @@ describe("editable config fields", () => {
     expect(
       getOrderedConfigEntries(
         {
+          retries: {},
           allowedModels: [],
           chat: {},
           openAiApiKey: null,
@@ -209,7 +217,18 @@ describe("editable config fields", () => {
         },
         "ai"
       ).map(([key]) => key)
-    ).toEqual(["openAiApiKey", "allowedModels", "chat", "compaction", "promptCaching", "rateLimits"]);
+    ).toEqual(["openAiApiKey", "allowedModels", "chat", "compaction", "promptCaching", "rateLimits", "retries"]);
+
+    expect(
+      getOrderedConfigEntries(
+        {
+          maxDelayMs: 30000,
+          maxRetries: 3,
+          baseDelayMs: 1000
+        },
+        "ai.retries"
+      ).map(([key]) => key)
+    ).toEqual(["maxRetries", "baseDelayMs", "maxDelayMs"]);
 
     expect(
       getOrderedConfigEntries(
@@ -268,6 +287,7 @@ describe("editable config fields", () => {
     expect(getEditableConfigPaths({ includeSensitive: false })).not.toContain("ai.openAiApiKey");
     expect(getEditableConfigPaths({ prefix: "ai.", includeSensitive: false })).toContain("ai.chat.streamingEnabled");
     expect(getEditableConfigPaths({ prefix: "ai.", includeSensitive: false })).toContain("ai.compaction.enabled");
+    expect(getEditableConfigPaths({ prefix: "ai.", includeSensitive: false })).toContain("ai.retries.maxRetries");
     expect(getEditableConfigPaths({ prefix: "ai.", includeSensitive: false })).not.toContain("ai.openAiApiKey");
   });
 

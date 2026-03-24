@@ -147,6 +147,7 @@ describe("log export helpers", () => {
 
     expect(payload.scope).toBe("chat");
     expect(payload.aiConfig?.chat.instructions).toBe("Chat system prompt");
+    expect(payload.aiConfig?.retries).toEqual(defaultConfig.ai.retries);
     expect(payload.aiConfig).not.toHaveProperty("openAiApiKey");
     expect(payload.transcriptItems[0]).toMatchObject({
       type: "system-prompt",

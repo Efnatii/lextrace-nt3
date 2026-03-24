@@ -56,6 +56,7 @@ internal sealed class AiRuntimeConfig
     public AiCompactionConfig Compaction { get; set; } = new();
     public AiPromptCachingConfig PromptCaching { get; set; } = new();
     public AiRateLimitConfig RateLimits { get; set; } = new();
+    public AiRetryConfig Retries { get; set; } = new();
 
     public static AiRuntimeConfig CreateDefault() => new();
 }
@@ -118,6 +119,13 @@ internal sealed class AiRateLimitConfig
     public int ReserveOutputTokens { get; set; } = 32768;
     public int MaxQueuedPerPage { get; set; } = 250;
     public int MaxQueuedGlobal { get; set; } = 1000;
+}
+
+internal sealed class AiRetryConfig
+{
+    public int MaxRetries { get; set; } = 3;
+    public int BaseDelayMs { get; set; } = 1000;
+    public int MaxDelayMs { get; set; } = 30000;
 }
 
 internal class AiRateLimitSnapshot
@@ -193,6 +201,8 @@ internal sealed class AiQueueItemRecord
     public string? ModelId { get; set; }
     public int? LastSequenceNumber { get; set; }
     public int AttemptCount { get; set; }
+    public int AutoRetryCount { get; set; }
+    public string? NotBeforeAt { get; set; }
     public string PromptCacheRoutingApplied { get; set; } = PromptCaching.RoutingStableSessionPrefix;
     public string PromptCacheRetentionApplied { get; set; } = PromptCaching.RetentionInMemory;
     public string? PromptCacheKey { get; set; }

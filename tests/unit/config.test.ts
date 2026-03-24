@@ -68,6 +68,9 @@ describe("config merge", () => {
     expect(defaultConfig.ai.compaction.maxPassesPerPage).toBe(16);
     expect(defaultConfig.ai.promptCaching.routing).toBe("stable_session_prefix");
     expect(defaultConfig.ai.promptCaching.retention).toBe("in_memory");
+    expect(defaultConfig.ai.retries.maxRetries).toBe(3);
+    expect(defaultConfig.ai.retries.baseDelayMs).toBe(1000);
+    expect(defaultConfig.ai.retries.maxDelayMs).toBe(30000);
     expect(defaultConfig.ai.rateLimits.reserveOutputTokens).toBe(32768);
     expect(defaultConfig.ai.rateLimits.maxQueuedPerPage).toBe(250);
     expect(defaultConfig.ai.rateLimits.maxQueuedGlobal).toBe(1000);
@@ -109,6 +112,7 @@ describe("config merge", () => {
       { model: "gpt-4.1", tier: "priority" }
     ]);
     expect(merged.ai.promptCaching).toEqual(defaultConfig.ai.promptCaching);
+    expect(merged.ai.retries).toEqual(defaultConfig.ai.retries);
     expect(merged.ai.rateLimits.maxQueuedPerPage).toBe(8);
     expect(merged.ai.rateLimits.reserveOutputTokens).toBe(defaultConfig.ai.rateLimits.reserveOutputTokens);
     expect(merged.ai.compaction.enabled).toBe(defaultConfig.ai.compaction.enabled);

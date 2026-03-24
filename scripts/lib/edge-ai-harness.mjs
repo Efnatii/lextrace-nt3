@@ -51,6 +51,9 @@ export const AI_UI_PATHS = [
   "ai.compaction.maxPassesPerPage",
   "ai.promptCaching.routing",
   "ai.promptCaching.retention",
+  "ai.retries.maxRetries",
+  "ai.retries.baseDelayMs",
+  "ai.retries.maxDelayMs",
   "ai.rateLimits.reserveOutputTokens",
   "ai.rateLimits.maxQueuedPerPage",
   "ai.rateLimits.maxQueuedGlobal"
@@ -919,6 +922,11 @@ export function buildBaselineAiPatch(selectedModel) {
       promptCaching: {
         routing: "stable_session_prefix",
         retention: "in_memory"
+      },
+      retries: {
+        maxRetries: 3,
+        baseDelayMs: 1000,
+        maxDelayMs: 30000
       },
       rateLimits: {
         reserveOutputTokens: 512,

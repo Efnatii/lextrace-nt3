@@ -22,6 +22,11 @@ const NullableModelSelectionSchema = z
   .transform((value) => normalizeAiModelSelection(value));
 const PromptCachingRoutingSchema = z.enum(["stable_session_prefix", "provider_default"]);
 const PromptCachingRetentionSchema = z.enum(["in_memory", "24h"]);
+const AiRetriesSchema = z.object({
+  maxRetries: z.number().int().min(0),
+  baseDelayMs: z.number().int().min(1),
+  maxDelayMs: z.number().int().min(1)
+});
 const JsonSchemaTextSchema = z.string().superRefine((value, context) => {
   const trimmed = value.trim();
   if (!trimmed) {
@@ -109,6 +114,7 @@ export const ExtensionConfigSchema = z.object({
       routing: PromptCachingRoutingSchema,
       retention: PromptCachingRetentionSchema
     }),
+    retries: AiRetriesSchema,
     rateLimits: z.object({
       reserveOutputTokens: z.number().int().min(1),
       maxQueuedPerPage: z.number().int().min(1),
@@ -199,6 +205,13 @@ export const ExtensionConfigPatchSchema = z.object({
           retention: PromptCachingRetentionSchema.optional()
         })
         .optional(),
+      retries: z
+        .object({
+          maxRetries: z.number().int().min(0).optional(),
+          baseDelayMs: z.number().int().min(1).optional(),
+          maxDelayMs: z.number().int().min(1).optional()
+        })
+        .optional(),
       rateLimits: z
         .object({
           reserveOutputTokens: z.number().int().min(1).optional(),
@@ -279,6 +292,11 @@ export const defaultConfig: ExtensionConfig = {
       routing: "stable_session_prefix",
       retention: "in_memory"
     },
+    retries: {
+      maxRetries: 3,
+      baseDelayMs: 1000,
+      maxDelayMs: 30000
+    },
     rateLimits: {
       reserveOutputTokens: 32768,
       maxQueuedPerPage: 250,
@@ -343,6 +361,10 @@ export function mergeConfig(base: ExtensionConfig, patch?: ExtensionConfigPatch 
       promptCaching: {
         ...base.ai.promptCaching,
         ...(safePatch.ai?.promptCaching ?? {})
+      },
+      retries: {
+        ...base.ai.retries,
+        ...(safePatch.ai?.retries ?? {})
       },
       rateLimits: {
         ...base.ai.rateLimits,
@@ -412,6 +434,10 @@ export function mergeConfigPatch(
       promptCaching: {
         ...(safeBasePatch.ai?.promptCaching ?? {}),
         ...(safeNextPatch.ai?.promptCaching ?? {})
+      },
+      retries: {
+        ...(safeBasePatch.ai?.retries ?? {}),
+        ...(safeNextPatch.ai?.retries ?? {})
       },
       rateLimits: {
         ...(safeBasePatch.ai?.rateLimits ?? {}),

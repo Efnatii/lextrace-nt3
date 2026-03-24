@@ -523,6 +523,7 @@ function normalizeAiStatusPayload(value: unknown, pageKey: string, pageUrlSample
     activeRequestId: getNullableString(raw.activeRequestId),
     openaiResponseId: getNullableString(raw.openaiResponseId),
     lastSequenceNumber: getNullableInteger(raw.lastSequenceNumber),
+    nextRetryAt: getNullableString(raw.nextRetryAt),
     lastError: getNullableString(raw.lastError),
     recoverable: getBoolean(raw.recoverable, defaults.recoverable),
     rateLimits: isRecord(raw.rateLimits)
@@ -597,7 +598,9 @@ function normalizeAiQueueItemPayload(value: unknown, fallbackPageKey: string): R
     origin,
     text,
     createdAt: getNonEmptyString(value.createdAt) ?? new Date().toISOString(),
-    state: normalizeAiQueueState(value.state)
+    state: normalizeAiQueueState(value.state),
+    attemptCount: getNonNegativeInteger(value.attemptCount, 0),
+    nextRetryAt: getNullableString(value.nextRetryAt)
   };
 }
 
@@ -632,6 +635,7 @@ function normalizeAiSessionPayload(value: unknown, fallbackPageKey: string, fall
     activeRequestId: getNullableString(value.activeRequestId),
     openaiResponseId: getNullableString(value.openaiResponseId),
     lastSequenceNumber: getNullableInteger(value.lastSequenceNumber),
+    nextRetryAt: getNullableString(value.nextRetryAt) ?? (typeof status.nextRetryAt === "string" ? status.nextRetryAt : null),
     queuedCount: getNonNegativeInteger(value.queuedCount, queue.length),
     recoverable: getBoolean(value.recoverable, false),
     lastCheckpointAt: getNullableString(value.lastCheckpointAt),

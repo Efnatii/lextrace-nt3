@@ -120,6 +120,126 @@ public sealed class RuntimeEngineCompactionTests
     }
 
     [Fact]
+    public void NormalizeCanonicalContextItemJsonRemovesResponseMetadataAndPreservesUtf8Text()
+    {
+        var normalized = RuntimeEngine.NormalizeCanonicalContextItemJson(
+            """
+            {"id":"msg_123","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"\u041f\u0440\u0438\u0432\u0435\u0442"}],"role":"assistant","phase":"final_answer"}
+            """
+        );
+
+        Assert.Equal(
+            """
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Привет"}]}
+            """,
+            normalized
+        );
+    }
+
+    [Fact]
+    public void NormalizeCanonicalContextJsonItemsDeduplicatesRetainedMessagesAgainstPreservedTail()
+    {
+        var normalized = RuntimeEngine.NormalizeCanonicalContextJsonItems(
+        [
+            """
+            {"id":"msg_123","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"\u041f\u0440\u0438\u0432\u0435\u0442"}],"role":"assistant","phase":"final_answer"}
+            """,
+            """
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Привет"}]}
+            """
+        ]);
+
+        Assert.Single(normalized);
+        Assert.Equal(
+            """
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Привет"}]}
+            """,
+            normalized[0]
+        );
+    }
+
+    [Fact]
+    public void GetCompactionInputItemsExcludesPreservedTailFromCanonicalWindow()
+    {
+        var session = new AiPageSessionRecord
+        {
+            Messages =
+            [
+                new AiChatMessageRecord
+                {
+                    Id = "user-1",
+                    Kind = "user",
+                    Origin = "user",
+                    Role = "user",
+                    Text = "older user",
+                    State = "completed"
+                },
+                new AiChatMessageRecord
+                {
+                    Id = "assistant-1",
+                    Kind = "assistant",
+                    Origin = "assistant",
+                    Role = "assistant",
+                    Text = "older assistant",
+                    State = "completed"
+                },
+                new AiChatMessageRecord
+                {
+                    Id = "user-2",
+                    Kind = "user",
+                    Origin = "user",
+                    Role = "user",
+                    Text = "recent user",
+                    State = "completed"
+                },
+                new AiChatMessageRecord
+                {
+                    Id = "assistant-2",
+                    Kind = "assistant",
+                    Origin = "assistant",
+                    Role = "assistant",
+                    Text = "recent assistant",
+                    State = "completed"
+                }
+            ],
+            CanonicalContextJsonItems =
+            [
+                """
+                {"type":"compaction","encrypted_content":"opaque-state"}
+                """,
+                """
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"older user"}]}
+                """,
+                """
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"older assistant"}]}
+                """,
+                """
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"recent user"}]}
+                """,
+                """
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent assistant"}]}
+                """
+            ]
+        };
+
+        var inputItems = RuntimeEngine.GetCompactionInputItems(session, preserveRecentTurns: 1);
+
+        Assert.Equal(
+        [
+            """
+            {"type":"compaction","encrypted_content":"opaque-state"}
+            """,
+            """
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"older user"}]}
+            """,
+            """
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"older assistant"}]}
+            """
+        ],
+        inputItems);
+    }
+
+    [Fact]
     public void PromptTokenEstimateExcludesReserveButBudgetPathKeepsIt()
     {
         var promptTokens = RuntimeEngine.EstimatePromptTokenCost(
