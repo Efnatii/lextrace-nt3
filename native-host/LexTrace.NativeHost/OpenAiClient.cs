@@ -6,7 +6,7 @@ using System.Text.Json.Nodes;
 
 namespace LexTrace.NativeHost;
 
-internal sealed class OpenAiClient
+internal sealed class OpenAiClient : IOpenAiClient
 {
     public const string ApiKeyEnvironmentVariableName = "OPENAI_API_KEY";
     private const string ResponsesPath = "https://api.openai.com/v1/responses";
@@ -121,7 +121,7 @@ internal sealed class OpenAiClient
         return await OpenAiJsonResponse.FromHttpResponseAsync(response, cancellationToken);
     }
 
-    public async Task<OpenAiStreamResponse> CreateResponseStreamAsync(
+    public async Task<IOpenAiStreamResponse> CreateResponseStreamAsync(
         AiRuntimeConfig config,
         IReadOnlyList<string> inputItemsJson,
         bool background,
@@ -145,7 +145,7 @@ internal sealed class OpenAiClient
         return await OpenAiJsonResponse.FromHttpResponseAsync(response, cancellationToken);
     }
 
-    public async Task<OpenAiStreamResponse> ResumeResponseStreamAsync(
+    public async Task<IOpenAiStreamResponse> ResumeResponseStreamAsync(
         string responseId,
         int? startingAfter,
         CancellationToken cancellationToken
@@ -503,7 +503,7 @@ internal sealed record OpenAiJsonResponse(JsonDocument Document, AiRateLimitSnap
     }
 }
 
-internal sealed class OpenAiStreamResponse : IAsyncDisposable
+internal sealed class OpenAiStreamResponse : IOpenAiStreamResponse
 {
     private readonly HttpResponseMessage _response;
     private readonly StreamReader _reader;

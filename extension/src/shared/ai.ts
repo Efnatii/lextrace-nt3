@@ -439,6 +439,167 @@ export function getAiCompactionResultMeta(message: AiChatMessage): AiCompactionR
   return parsedMeta.success ? parsedMeta.data : null;
 }
 
+type AiConversationTranscriptTurn = {
+  key: string;
+  firstIndex: number;
+  userMessage: AiChatMessage | null;
+  assistantMessage: AiChatMessage | null;
+};
+
+function isAiAssistantTranscriptMessage(message: AiChatMessage): boolean {
+  return message.role === "assistant" || message.kind === "assistant";
+}
+
+function getAiAssistantTranscriptMessageScore(message: AiChatMessage): number {
+  const hasText = message.text.trim().length > 0;
+  switch (message.state) {
+    case "completed":
+      return hasText ? 5 : 4;
+    case "streaming":
+      return hasText ? 3 : 2;
+    case "error":
+      return hasText ? 2 : 1;
+    case "pending":
+    default:
+      return hasText ? 1 : 0;
+  }
+}
+
+function shouldReplaceAiAssistantTranscriptMessage(existing: AiChatMessage, candidate: AiChatMessage): boolean {
+  const existingScore = getAiAssistantTranscriptMessageScore(existing);
+  const candidateScore = getAiAssistantTranscriptMessageScore(candidate);
+  if (candidateScore !== existingScore) {
+    return candidateScore > existingScore;
+  }
+
+  return candidate.id.localeCompare(existing.id, "en", { sensitivity: "base", numeric: true }) > 0;
+}
+
+export function orderAiTranscriptMessages(messages: readonly AiChatMessage[]): AiChatMessage[] {
+  const turns = new Map<string, AiConversationTranscriptTurn>();
+  const orderedTurns: AiConversationTranscriptTurn[] = [];
+  const messageToTurnKey = new Map<string, string>();
+  for (const [index, message] of messages.entries()) {
+    if (!isAiConversationalKind(message.kind)) {
+      continue;
+    }
+
+    const requestKey = message.requestId?.trim();
+    let turn: AiConversationTranscriptTurn | undefined;
+    if (requestKey) {
+      turn = turns.get(requestKey);
+      if (!turn) {
+        turn = {
+          key: requestKey,
+          firstIndex: index,
+          userMessage: null,
+          assistantMessage: null
+        };
+        turns.set(requestKey, turn);
+        orderedTurns.push(turn);
+      }
+    } else if (isAiAssistantTranscriptMessage(message)) {
+      turn = orderedTurns.find((candidate) => candidate.userMessage && !candidate.assistantMessage);
+    }
+
+    if (!turn) {
+      const key = `legacy:${message.id}`;
+      turn = {
+        key,
+        firstIndex: index,
+        userMessage: null,
+        assistantMessage: null
+      };
+      orderedTurns.push(turn);
+      turns.set(key, turn);
+    }
+
+    turn.firstIndex = Math.min(turn.firstIndex, index);
+
+    if (isAiAssistantTranscriptMessage(message)) {
+      if (!turn.assistantMessage || shouldReplaceAiAssistantTranscriptMessage(turn.assistantMessage, message)) {
+        turn.assistantMessage = message;
+      }
+    } else if (!turn.userMessage) {
+      turn.userMessage = message;
+    }
+
+    messageToTurnKey.set(message.id, turn.key);
+  }
+
+  const orderedMessages: AiChatMessage[] = [];
+  const emittedTurns = new Set<string>();
+  for (const [index, message] of messages.entries()) {
+    if (!isAiTranscriptKind(message.kind)) {
+      continue;
+    }
+
+    if (!isAiConversationalKind(message.kind)) {
+      orderedMessages.push(message);
+      continue;
+    }
+
+    const turnKey = messageToTurnKey.get(message.id);
+    const turn = turnKey ? turns.get(turnKey) : undefined;
+    if (!turn || emittedTurns.has(turn.key) || turn.firstIndex !== index) {
+      continue;
+    }
+
+    emittedTurns.add(turn.key);
+    if (turn.userMessage) {
+      orderedMessages.push(turn.userMessage);
+    }
+    if (turn.assistantMessage) {
+      orderedMessages.push(turn.assistantMessage);
+    }
+  }
+
+  for (const turn of orderedTurns) {
+    if (emittedTurns.has(turn.key)) {
+      continue;
+    }
+
+    if (turn.userMessage) {
+      orderedMessages.push(turn.userMessage);
+    }
+    if (turn.assistantMessage) {
+      orderedMessages.push(turn.assistantMessage);
+    }
+  }
+
+  return orderedMessages;
+}
+
+export function getAiMessageDisplayText(message: AiChatMessage): string {
+  if (message.text.length > 0) {
+    return message.text;
+  }
+
+  if (message.kind === "assistant" && message.role === "assistant") {
+    switch (message.state) {
+      case "pending":
+        return "\u041e\u0436\u0438\u0434\u0430\u043d\u0438\u0435 \u043e\u0442\u0432\u0435\u0442\u0430\u2026";
+      case "streaming":
+        return "\u2026";
+      case "error":
+        return "\u041e\u0442\u0432\u0435\u0442 \u043d\u0435 \u043f\u043e\u043b\u0443\u0447\u0435\u043d.";
+      default:
+        break;
+    }
+  }
+
+  return "";
+}
+
+export function isScrollPinnedToBottom(
+  scrollHeight: number,
+  scrollTop: number,
+  clientHeight: number,
+  threshold = 24
+): boolean {
+  return scrollHeight - scrollTop - clientHeight <= threshold;
+}
+
 export function buildAiChatTranscriptItems(
   messages: readonly AiChatMessage[],
   instructions: string | null | undefined
@@ -453,12 +614,27 @@ export function buildAiChatTranscriptItems(
   ];
 
   const compactionMetaById = new Map<string, AiCompactionRangeMeta>();
+  const compactionEventItemsInRawOrder: Array<{
+    id: string;
+    anchorMessageId: string | null;
+    item: AiTranscriptCompactionRequestItem | AiTranscriptCompactionResultItem;
+  }> = [];
   for (const message of messages) {
     if (message.kind === "compaction-request") {
       const meta = getAiCompactionRequestMeta(message);
       if (meta) {
         compactionMetaById.set(meta.compactionId, meta);
       }
+      compactionEventItemsInRawOrder.push({
+        id: message.id,
+        anchorMessageId: meta?.rangeEndMessageId?.trim() || null,
+        item: {
+          type: "compaction-request",
+          id: message.id,
+          message,
+          meta
+        }
+      });
       continue;
     }
 
@@ -467,11 +643,22 @@ export function buildAiChatTranscriptItems(
       if (meta) {
         compactionMetaById.set(meta.compactionId, meta);
       }
+      compactionEventItemsInRawOrder.push({
+        id: message.id,
+        anchorMessageId: meta?.rangeEndMessageId?.trim() || null,
+        item: {
+          type: "compaction-result",
+          id: message.id,
+          message,
+          meta
+        }
+      });
     }
   }
 
+  const bodyItems: Array<AiTranscriptMessageItem | AiTranscriptCompactedRangeItem> = [];
   let activeRange: AiTranscriptCompactedRangeItem | null = null;
-  for (const message of messages) {
+  for (const message of orderAiTranscriptMessages(messages)) {
     if (!isAiTranscriptKind(message.kind)) {
       continue;
     }
@@ -480,7 +667,7 @@ export function buildAiChatTranscriptItems(
       const compactedBy = getAiCompactedBy(message);
       if (!compactedBy) {
         activeRange = null;
-        transcript.push({
+        bodyItems.push({
           type: "message",
           id: message.id,
           message,
@@ -507,13 +694,17 @@ export function buildAiChatTranscriptItems(
         rangeEndMessageId: meta?.rangeEndMessageId ?? message.id,
         messages: [message]
       };
-      transcript.push(activeRange);
+      bodyItems.push(activeRange);
+      continue;
+    }
+
+    if (message.kind === "compaction-request" || message.kind === "compaction-result") {
       continue;
     }
 
     activeRange = null;
     if (message.kind === "compaction") {
-      transcript.push({
+      bodyItems.push({
         type: "message",
         id: message.id,
         message,
@@ -521,23 +712,56 @@ export function buildAiChatTranscriptItems(
       });
       continue;
     }
+  }
 
-    if (message.kind === "compaction-request") {
-      transcript.push({
-        type: "compaction-request",
-        id: message.id,
-        message,
-        meta: getAiCompactionRequestMeta(message)
-      });
+  const consumedCompactionEventIds = new Set<string>();
+  const appendCompactionEventsForRange = (range: AiTranscriptCompactedRangeItem) => {
+    const anchorMessageIds = new Set(range.messages.map((message) => message.id));
+    for (const event of compactionEventItemsInRawOrder) {
+      if (!event.anchorMessageId || consumedCompactionEventIds.has(event.id)) {
+        continue;
+      }
+
+      if (!anchorMessageIds.has(event.anchorMessageId)) {
+        continue;
+      }
+
+      consumedCompactionEventIds.add(event.id);
+      transcript.push(event.item);
+    }
+  };
+
+  const appendCompactionEventsForAnchor = (anchorMessageId: string | null) => {
+    if (!anchorMessageId) {
+      return;
+    }
+
+    for (const event of compactionEventItemsInRawOrder) {
+      if (event.anchorMessageId !== anchorMessageId || consumedCompactionEventIds.has(event.id)) {
+        continue;
+      }
+
+      consumedCompactionEventIds.add(event.id);
+      transcript.push(event.item);
+    }
+  };
+
+  for (const item of bodyItems) {
+    transcript.push(item);
+    if (item.type === "compacted-range") {
+      appendCompactionEventsForRange(item);
       continue;
     }
 
-    transcript.push({
-      type: "compaction-result",
-      id: message.id,
-      message,
-      meta: getAiCompactionResultMeta(message)
-    });
+    appendCompactionEventsForAnchor(item.message.id);
+  }
+
+  for (const event of compactionEventItemsInRawOrder) {
+    if (consumedCompactionEventIds.has(event.id)) {
+      continue;
+    }
+
+    transcript.push(event.item);
   }
 
   return transcript;

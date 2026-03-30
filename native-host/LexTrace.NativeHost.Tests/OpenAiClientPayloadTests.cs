@@ -69,6 +69,26 @@ public sealed class OpenAiClientPayloadTests
         Assert.Null(payload["prompt_cache_retention"]);
     }
 
+    [Fact]
+    public void BuildCompactPayloadDoesNotSetMaxOutputTokensWhenNoExplicitLimitIsConfigured()
+    {
+        var config = CreateConfig();
+        var session = new AiPageSessionRecord
+        {
+            PageKey = "https://example.com/page"
+        };
+        var request = PromptCaching.ResolveCompactionRequest(config, session, config.Chat.Model!);
+
+        var payload = OpenAiClient.BuildCompactPayload(
+            config.Chat.Model!,
+            ["{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}"],
+            "compact",
+            request
+        );
+
+        Assert.Null(payload["max_output_tokens"]);
+    }
+
     private static AiRuntimeConfig CreateConfig() => new()
     {
         Chat = new AiChatConfig

@@ -241,6 +241,10 @@ export function getTerminalHelpLines(
         entries: getTerminalAliasHelpEntries("chat", options)
       },
       {
+        title: "text",
+        entries: getTerminalAliasHelpEntries("text", options)
+      },
+      {
         title: "models",
         entries: getTerminalAliasHelpEntries("models", options)
       },

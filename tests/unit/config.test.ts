@@ -6,7 +6,8 @@ import {
   defaultConfig,
   mergeConfig,
   mergeConfigPatch,
-  normalizeConfigPatch
+  normalizeConfigPatch,
+  normalizePersistedConfigPatch
 } from "../../extension/src/shared/config";
 
 describe("config merge", () => {
@@ -71,9 +72,33 @@ describe("config merge", () => {
     expect(defaultConfig.ai.retries.maxRetries).toBe(3);
     expect(defaultConfig.ai.retries.baseDelayMs).toBe(1000);
     expect(defaultConfig.ai.retries.maxDelayMs).toBe(30000);
+    expect(defaultConfig.ai.queueRetries.maxRetries).toBe(3);
+    expect(defaultConfig.ai.queueRetries.baseDelayMs).toBe(1000);
+    expect(defaultConfig.ai.queueRetries.maxDelayMs).toBe(30000);
     expect(defaultConfig.ai.rateLimits.reserveOutputTokens).toBe(32768);
     expect(defaultConfig.ai.rateLimits.maxQueuedPerPage).toBe(250);
     expect(defaultConfig.ai.rateLimits.maxQueuedGlobal).toBe(1000);
+    expect(defaultConfig.debug.textElements.highlightEnabled).toBe(false);
+    expect(defaultConfig.debug.textElements.inlineEditingEnabled).toBe(false);
+    expect(defaultConfig.debug.textElements.displayMode).toBe("effective");
+    expect(defaultConfig.debug.textElements.autoScanMode).toBe("off");
+  });
+
+  it("merges debug.textElements settings without dropping sibling defaults", () => {
+    const merged = mergeConfig(defaultConfig, {
+      debug: {
+        textElements: {
+          highlightEnabled: true,
+          displayMode: "original",
+          autoScanMode: "incremental"
+        }
+      }
+    });
+
+    expect(merged.debug.textElements.highlightEnabled).toBe(true);
+    expect(merged.debug.textElements.inlineEditingEnabled).toBe(false);
+    expect(merged.debug.textElements.displayMode).toBe("original");
+    expect(merged.debug.textElements.autoScanMode).toBe("incremental");
   });
 
   it("merges nested ai config without dropping sibling defaults", () => {
@@ -113,6 +138,7 @@ describe("config merge", () => {
     ]);
     expect(merged.ai.promptCaching).toEqual(defaultConfig.ai.promptCaching);
     expect(merged.ai.retries).toEqual(defaultConfig.ai.retries);
+    expect(merged.ai.queueRetries).toEqual(defaultConfig.ai.queueRetries);
     expect(merged.ai.rateLimits.maxQueuedPerPage).toBe(8);
     expect(merged.ai.rateLimits.reserveOutputTokens).toBe(defaultConfig.ai.rateLimits.reserveOutputTokens);
     expect(merged.ai.compaction.enabled).toBe(defaultConfig.ai.compaction.enabled);
@@ -205,6 +231,29 @@ describe("config merge", () => {
       model: "gpt-4.1",
       tier: "priority"
     });
+  });
+
+  it("inherits queueRetries from retries when older patches do not define queueRetries yet", () => {
+    const effective = buildEffectiveConfig(
+      normalizePersistedConfigPatch(
+      {
+        ai: {
+          retries: {
+            maxRetries: 7,
+            baseDelayMs: 2500,
+            maxDelayMs: 45000
+          }
+        }
+      }),
+      null
+    );
+
+    expect(effective.ai.retries).toEqual({
+      maxRetries: 7,
+      baseDelayMs: 2500,
+      maxDelayMs: 45000
+    });
+    expect(effective.ai.queueRetries).toEqual(effective.ai.retries);
   });
 
   it("ignores removed local ai RPM/TPM caps during normalization", () => {

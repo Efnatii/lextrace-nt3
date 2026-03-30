@@ -743,6 +743,9 @@ async function verifyHostValue(pathName, expected, state) {
     "ai.retries.maxRetries": "aiConfig.retries.maxRetries",
     "ai.retries.baseDelayMs": "aiConfig.retries.baseDelayMs",
     "ai.retries.maxDelayMs": "aiConfig.retries.maxDelayMs",
+    "ai.queueRetries.maxRetries": "aiConfig.queueRetries.maxRetries",
+    "ai.queueRetries.baseDelayMs": "aiConfig.queueRetries.baseDelayMs",
+    "ai.queueRetries.maxDelayMs": "aiConfig.queueRetries.maxDelayMs",
     "ai.rateLimits.reserveOutputTokens": "aiConfig.rateLimits.reserveOutputTokens",
     "ai.rateLimits.maxQueuedPerPage": "aiConfig.rateLimits.maxQueuedPerPage",
     "ai.rateLimits.maxQueuedGlobal": "aiConfig.rateLimits.maxQueuedGlobal"

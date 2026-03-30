@@ -16,6 +16,7 @@ describe("terminal helpers", () => {
     expect(helpLines[0]).toBe("Справка по консоли LexTrace");
     expect(helpLines).toContain("[основное]");
     expect(helpLines).toContain("[config]");
+    expect(helpLines).toContain("[text]");
     expect(helpLines).toContain("[ai]");
     expect(helpLines).toContain("[raw fallback]");
     expect(helpLines).toContain("chat.compact.force [current|url <url>|key <pageKey> [pageUrl <url>]] [DANGER]");
@@ -62,6 +63,11 @@ describe("terminal helpers", () => {
     const aiHelp = getTerminalHelpLines(undefined, "ai");
     expect(aiHelp).toContain("[ai]");
     expect(aiHelp).toContain("ai.key.status [SECRET]");
+
+    const textHelp = getTerminalHelpLines(undefined, "text");
+    expect(textHelp).toContain("[text]");
+    expect(textHelp).toContain("text.download");
+    expect(textHelp).toContain("text.delete <bindingId|page|all>");
   });
 
   it("prioritizes alias suggestions before raw protocol templates", () => {
@@ -82,6 +88,7 @@ describe("terminal helpers", () => {
       "models.allow remove gpt-5 flex",
       "models.allow clear"
     ]);
+    expect(getTerminalSuggestions("text.")).toContain("text.status");
     expect(getTerminalSuggestions("host")).toEqual([
       "host.connect",
       "host.disconnect",
@@ -231,6 +238,13 @@ describe("terminal helpers", () => {
       action: "start",
       taskId: "demo-task",
       raw: "demo.start demo-task"
+    });
+    expect(parseTerminalCommand("text.delete txt_123")).toEqual({
+      kind: "alias",
+      namespace: "text",
+      action: "delete",
+      bindingId: "txt_123",
+      raw: "text.delete txt_123"
     });
   });
 

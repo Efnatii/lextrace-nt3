@@ -7,6 +7,7 @@ import {
   normalizeAllowedModelRules
 } from "./ai";
 import { NATIVE_HOST_NAME, PROTOCOL_VERSION } from "./constants";
+import { TextDisplayModeSchema } from "./text-elements";
 
 export const DEFAULT_AI_COMPACTION_INSTRUCTIONS =
   "Summarize the conversation history into compact, faithful context for the next turn. " +
@@ -22,6 +23,7 @@ const NullableModelSelectionSchema = z
   .transform((value) => normalizeAiModelSelection(value));
 const PromptCachingRoutingSchema = z.enum(["stable_session_prefix", "provider_default"]);
 const PromptCachingRetentionSchema = z.enum(["in_memory", "24h"]);
+export const TextAutoScanModeSchema = z.enum(["off", "incremental"]);
 const AiRetriesSchema = z.object({
   maxRetries: z.number().int().min(0),
   baseDelayMs: z.number().int().min(1),
@@ -51,7 +53,7 @@ const JsonSchemaTextSchema = z.string().superRefine((value, context) => {
 
 export const LogLevelSchema = z.enum(["debug", "info", "warn", "error"]);
 export const PopupTabSchema = z.enum(["control", "config"]);
-export const OverlayTabSchema = z.enum(["console", "chat"]);
+export const OverlayTabSchema = z.enum(["console", "chat", "texts"]);
 
 export const ReconnectPolicySchema = z.object({
   baseDelayMs: z.number().int().min(250),
@@ -66,6 +68,13 @@ export const OverlayUiConfigSchema = z.object({
   top: z.number().int().min(0),
   visible: z.boolean(),
   activeTab: OverlayTabSchema
+});
+
+export const TextElementDebugConfigSchema = z.object({
+  highlightEnabled: z.boolean(),
+  inlineEditingEnabled: z.boolean(),
+  displayMode: TextDisplayModeSchema,
+  autoScanMode: TextAutoScanModeSchema
 });
 
 export const ExtensionConfigSchema = z.object({
@@ -86,6 +95,9 @@ export const ExtensionConfigSchema = z.object({
   }),
   protocol: z.object({
     testCommandsEnabled: z.boolean()
+  }),
+  debug: z.object({
+    textElements: TextElementDebugConfigSchema
   }),
   ai: z.object({
     openAiApiKey: z.string().nullable(),
@@ -115,6 +127,7 @@ export const ExtensionConfigSchema = z.object({
       retention: PromptCachingRetentionSchema
     }),
     retries: AiRetriesSchema,
+    queueRetries: AiRetriesSchema,
     rateLimits: z.object({
       reserveOutputTokens: z.number().int().min(1),
       maxQueuedPerPage: z.number().int().min(1),
@@ -169,6 +182,18 @@ export const ExtensionConfigPatchSchema = z.object({
       testCommandsEnabled: z.boolean().optional()
     })
     .optional(),
+  debug: z
+    .object({
+      textElements: z
+        .object({
+          highlightEnabled: z.boolean().optional(),
+          inlineEditingEnabled: z.boolean().optional(),
+          displayMode: TextDisplayModeSchema.optional(),
+          autoScanMode: TextAutoScanModeSchema.optional()
+        })
+        .optional()
+    })
+    .optional(),
   ai: z
     .object({
       openAiApiKey: z.string().nullable().optional(),
@@ -212,6 +237,13 @@ export const ExtensionConfigPatchSchema = z.object({
           maxDelayMs: z.number().int().min(1).optional()
         })
         .optional(),
+      queueRetries: z
+        .object({
+          maxRetries: z.number().int().min(0).optional(),
+          baseDelayMs: z.number().int().min(1).optional(),
+          maxDelayMs: z.number().int().min(1).optional()
+        })
+        .optional(),
       rateLimits: z
         .object({
           reserveOutputTokens: z.number().int().min(1).optional(),
@@ -232,6 +264,7 @@ export const ExtensionConfigPatchSchema = z.object({
 export type LogLevel = z.infer<typeof LogLevelSchema>;
 export type PopupTab = z.infer<typeof PopupTabSchema>;
 export type OverlayTab = z.infer<typeof OverlayTabSchema>;
+export type TextAutoScanMode = z.infer<typeof TextAutoScanModeSchema>;
 export type ExtensionConfig = z.infer<typeof ExtensionConfigSchema>;
 export type ExtensionConfigPatch = z.infer<typeof ExtensionConfigPatchSchema>;
 
@@ -265,6 +298,14 @@ export const defaultConfig: ExtensionConfig = {
   protocol: {
     testCommandsEnabled: true
   },
+  debug: {
+    textElements: {
+      highlightEnabled: false,
+      inlineEditingEnabled: false,
+      displayMode: "effective",
+      autoScanMode: "off"
+    }
+  },
   ai: {
     openAiApiKey: null,
     allowedModels: [],
@@ -293,6 +334,11 @@ export const defaultConfig: ExtensionConfig = {
       retention: "in_memory"
     },
     retries: {
+      maxRetries: 3,
+      baseDelayMs: 1000,
+      maxDelayMs: 30000
+    },
+    queueRetries: {
       maxRetries: 3,
       baseDelayMs: 1000,
       maxDelayMs: 30000
@@ -343,6 +389,14 @@ export function mergeConfig(base: ExtensionConfig, patch?: ExtensionConfigPatch 
       ...base.protocol,
       ...(safePatch.protocol ?? {})
     },
+    debug: {
+      ...base.debug,
+      ...(safePatch.debug ?? {}),
+      textElements: {
+        ...base.debug.textElements,
+        ...(safePatch.debug?.textElements ?? {})
+      }
+    },
     ai: {
       ...base.ai,
       ...(safePatch.ai ?? {}),
@@ -365,6 +419,10 @@ export function mergeConfig(base: ExtensionConfig, patch?: ExtensionConfigPatch 
       retries: {
         ...base.ai.retries,
         ...(safePatch.ai?.retries ?? {})
+      },
+      queueRetries: {
+        ...base.ai.queueRetries,
+        ...(safePatch.ai?.queueRetries ?? {})
       },
       rateLimits: {
         ...base.ai.rateLimits,
@@ -416,6 +474,14 @@ export function mergeConfigPatch(
       ...(safeBasePatch.protocol ?? {}),
       ...(safeNextPatch.protocol ?? {})
     },
+    debug: {
+      ...(safeBasePatch.debug ?? {}),
+      ...(safeNextPatch.debug ?? {}),
+      textElements: {
+        ...(safeBasePatch.debug?.textElements ?? {}),
+        ...(safeNextPatch.debug?.textElements ?? {})
+      }
+    },
     ai: {
       ...(safeBasePatch.ai ?? {}),
       ...(safeNextPatch.ai ?? {}),
@@ -439,6 +505,10 @@ export function mergeConfigPatch(
         ...(safeBasePatch.ai?.retries ?? {}),
         ...(safeNextPatch.ai?.retries ?? {})
       },
+      queueRetries: {
+        ...(safeBasePatch.ai?.queueRetries ?? {}),
+        ...(safeNextPatch.ai?.queueRetries ?? {})
+      },
       rateLimits: {
         ...(safeBasePatch.ai?.rateLimits ?? {}),
         ...(safeNextPatch.ai?.rateLimits ?? {})
@@ -457,6 +527,12 @@ export function buildEffectiveConfig(localPatch?: ExtensionConfigPatch | null, s
 
 export function normalizeConfigPatch(value: unknown): ExtensionConfigPatch {
   return ExtensionConfigPatchSchema.parse(migrateLegacyAiConfigShape(value));
+}
+
+export function normalizePersistedConfigPatch(value: unknown): ExtensionConfigPatch {
+  return ExtensionConfigPatchSchema.parse(
+    inheritQueueRetryPatchFromRetries(migrateLegacyAiConfigShape(value))
+  );
 }
 
 function migrateLegacyAiConfigShape(value: unknown): unknown {
@@ -505,6 +581,26 @@ function migrateLegacyAiConfigShape(value: unknown): unknown {
   }
 
   delete aiPatch.serviceTier;
+
+  return patch;
+}
+
+function inheritQueueRetryPatchFromRetries(value: unknown): unknown {
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+
+  const patch = structuredClone(value as Record<string, unknown>);
+  const ai = patch.ai;
+  if (!ai || typeof ai !== "object") {
+    return patch;
+  }
+
+  const aiPatch = ai as Record<string, unknown>;
+  if (!("queueRetries" in aiPatch) && aiPatch.retries && typeof aiPatch.retries === "object") {
+    aiPatch.queueRetries = structuredClone(aiPatch.retries);
+  }
+
   return patch;
 }
 

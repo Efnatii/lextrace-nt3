@@ -2,7 +2,7 @@ using System.Text.Json;
 
 namespace LexTrace.NativeHost;
 
-internal sealed class NativeMessagingTransport
+internal sealed class NativeMessagingTransport : INativeMessagingTransport
 {
     private readonly Stream _input = Console.OpenStandardInput();
     private readonly Stream _output = Console.OpenStandardOutput();

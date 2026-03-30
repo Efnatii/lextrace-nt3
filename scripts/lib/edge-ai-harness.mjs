@@ -54,6 +54,9 @@ export const AI_UI_PATHS = [
   "ai.retries.maxRetries",
   "ai.retries.baseDelayMs",
   "ai.retries.maxDelayMs",
+  "ai.queueRetries.maxRetries",
+  "ai.queueRetries.baseDelayMs",
+  "ai.queueRetries.maxDelayMs",
   "ai.rateLimits.reserveOutputTokens",
   "ai.rateLimits.maxQueuedPerPage",
   "ai.rateLimits.maxQueuedGlobal"
@@ -184,15 +187,15 @@ export async function closeAiHarnessSession(session) {
   }
 }
 
-export async function launchEdgeWithExtension() {
+export async function launchEdgeWithExtension(options = {}) {
   await fs.mkdir(paths.tmp, { recursive: true });
   const userDataDir = await fs.mkdtemp(path.join(paths.tmp, "edge-user-data-"));
-  const options = createEdgeOptions(userDataDir);
-  options.addExtensions(paths.packagedCrx);
+  const edgeOptions = createEdgeOptions(userDataDir, options);
+  edgeOptions.addExtensions(paths.packagedCrx);
 
   const driver = await new Builder()
     .forBrowser(Browser.EDGE)
-    .setEdgeOptions(options)
+    .setEdgeOptions(edgeOptions)
     .build();
 
   return {
@@ -201,7 +204,7 @@ export async function launchEdgeWithExtension() {
   };
 }
 
-export function createEdgeOptions(userDataDir) {
+export function createEdgeOptions(userDataDir, settings = {}) {
   const options = new edge.Options();
   options.addArguments(
     `--user-data-dir=${userDataDir}`,
@@ -210,6 +213,9 @@ export function createEdgeOptions(userDataDir) {
     "--disable-search-engine-choice-screen",
     "--disable-features=msEdgeAccountConsistency"
   );
+  if (settings?.userPreferences && typeof settings.userPreferences === "object") {
+    options.setUserPreferences(settings.userPreferences);
+  }
   return options;
 }
 
@@ -924,6 +930,11 @@ export function buildBaselineAiPatch(selectedModel) {
         retention: "in_memory"
       },
       retries: {
+        maxRetries: 3,
+        baseDelayMs: 1000,
+        maxDelayMs: 30000
+      },
+      queueRetries: {
         maxRetries: 3,
         baseDelayMs: 1000,
         maxDelayMs: 30000

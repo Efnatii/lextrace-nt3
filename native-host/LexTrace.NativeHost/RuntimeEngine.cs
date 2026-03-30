@@ -12,9 +12,9 @@ internal sealed class RuntimeEngine
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
     };
 
-    private readonly NativeMessagingTransport _transport;
-    private readonly HostStateStore _stateStore;
-    private readonly OpenAiClient _openAiClient;
+    private readonly INativeMessagingTransport _transport;
+    private readonly IHostStateStore _stateStore;
+    private readonly IOpenAiClient _openAiClient;
     private readonly SemaphoreSlim _stateLock = new(1, 1);
     private readonly Dictionary<string, CancellationTokenSource> _aiProcessingTokens = [];
     private readonly Dictionary<string, Task> _aiProcessingTasks = [];
@@ -31,6 +31,61 @@ internal sealed class RuntimeEngine
         int? AffectedMessageCount,
         int? CompactedItemCount,
         int? PreservedTailCount
+    );
+
+    private sealed class AiConversationTurn
+    {
+        public string Key { get; init; } = string.Empty;
+        public string? RequestId { get; init; }
+        public int FirstMessageIndex { get; set; } = int.MaxValue;
+        public AiChatMessageRecord? UserMessage { get; set; }
+        public AiChatMessageRecord? AssistantMessage { get; set; }
+
+        public bool IsCompleted =>
+            UserMessage?.State == "completed" &&
+            AssistantMessage?.State == "completed";
+
+        public IEnumerable<AiChatMessageRecord> Messages
+        {
+            get
+            {
+                if (UserMessage is not null)
+                {
+                    yield return UserMessage;
+                }
+
+                if (AssistantMessage is not null)
+                {
+                    yield return AssistantMessage;
+                }
+            }
+        }
+    }
+
+    private sealed record CompactionPreparation(
+        string RequestId,
+        string CompactionId,
+        List<AiChatMessageRecord> AffectedMessages,
+        List<string> AffectedMessageIds,
+        string RangeStartMessageId,
+        string RangeEndMessageId,
+        string ResolvedInstructions,
+        List<string> PreservedTailItems,
+        List<string> CompactionInputItems,
+        PromptCaching.PromptCacheRequestSettings PromptCacheRequest,
+        int PreCompactionPromptTokens,
+        string PendingText
+    );
+
+    private sealed record CompactionApplyResult(
+        bool Applied,
+        string? Reason,
+        int PrePromptTokens,
+        int PostPromptTokens,
+        int CompactedItemCount,
+        int PreservedTailCount,
+        string ResultPreviewText,
+        AiChatMessageRecord? ResultMessage
     );
 
     internal sealed record RetryDisposition(
@@ -57,20 +112,54 @@ internal sealed class RuntimeEngine
 
     private sealed class OpenAiTerminalResponseException : InvalidOperationException
     {
-        public OpenAiTerminalResponseException(string responseStatus)
-            : base($"OpenAI background response ended with status {responseStatus}.")
+        public OpenAiTerminalResponseException(
+            string responseStatus,
+            string? errorCode = null,
+            string? terminalErrorMessage = null)
+            : base(BuildMessage(responseStatus, errorCode, terminalErrorMessage))
         {
             ResponseStatus = responseStatus;
+            ErrorCode = errorCode;
+            TerminalErrorMessage = terminalErrorMessage;
         }
 
         public string ResponseStatus { get; }
+
+        public string? ErrorCode { get; }
+
+        public string? TerminalErrorMessage { get; }
+
+        private static string BuildMessage(
+            string responseStatus,
+            string? errorCode,
+            string? terminalErrorMessage)
+        {
+            var suffixParts = new List<string>();
+            if (!string.IsNullOrWhiteSpace(errorCode))
+            {
+                suffixParts.Add($"code={errorCode}");
+            }
+
+            if (!string.IsNullOrWhiteSpace(terminalErrorMessage))
+            {
+                suffixParts.Add(terminalErrorMessage!);
+            }
+
+            return suffixParts.Count == 0
+                ? $"OpenAI background response ended with status {responseStatus}."
+                : $"OpenAI background response ended with status {responseStatus}: {string.Join("; ", suffixParts)}.";
+        }
     }
 
-    public RuntimeEngine(NativeMessagingTransport transport, HostStateStore stateStore)
+    public RuntimeEngine(
+        INativeMessagingTransport transport,
+        IHostStateStore stateStore,
+        IOpenAiClient? openAiClient = null
+    )
     {
         _transport = transport;
         _stateStore = stateStore;
-        _openAiClient = new OpenAiClient();
+        _openAiClient = openAiClient ?? new OpenAiClient();
     }
 
     public async Task InitializeAsync(CancellationToken cancellationToken)
@@ -188,6 +277,7 @@ internal sealed class RuntimeEngine
         _journal.AiConfig.Compaction ??= new AiCompactionConfig();
         _journal.AiConfig.PromptCaching ??= new AiPromptCachingConfig();
         _journal.AiConfig.Retries ??= new AiRetryConfig();
+        _journal.AiConfig.QueueRetries ??= new AiRetryConfig();
         _journal.AiConfig.RateLimits ??= new AiRateLimitConfig();
         _journal.AiConfig.Compaction.Instructions = ResolveCompactionInstructions(_journal.AiConfig);
         _journal.AiConfig.PromptCaching.Routing = PromptCaching.NormalizeRouting(_journal.AiConfig.PromptCaching.Routing);
@@ -210,6 +300,7 @@ internal sealed class RuntimeEngine
         session.RequestState ??= "idle";
         session.Messages ??= [];
         session.PendingQueue ??= [];
+        session.LastRejectedAutoCompactionAffectedTurnCount = Math.Max(0, session.LastRejectedAutoCompactionAffectedTurnCount);
         session.CanonicalContextJsonItems = NormalizeCanonicalContextJsonItems(session.CanonicalContextJsonItems ?? []);
         session.PromptCaching ??= new AiPromptCachingState();
         session.PromptCaching.Session ??= new AiPromptCacheSessionState();
@@ -264,6 +355,7 @@ internal sealed class RuntimeEngine
         item.AttemptCount = Math.Max(0, item.AttemptCount);
         item.AutoRetryCount = Math.Max(0, item.AutoRetryCount);
         item.NotBeforeAt = NormalizeOptionalIsoTimestamp(item.NotBeforeAt);
+        item.RetryPolicyScope = NormalizeRetryPolicyScope(item.RetryPolicyScope);
         item.PromptCacheRoutingApplied = PromptCaching.NormalizeRouting(item.PromptCacheRoutingApplied);
         item.PromptCacheRetentionApplied = PromptCaching.NormalizeRetention(item.PromptCacheRetentionApplied);
     }
@@ -299,6 +391,9 @@ internal sealed class RuntimeEngine
                 maxRetries = _journal.AiConfig.Retries.MaxRetries,
                 retryBaseDelayMs = _journal.AiConfig.Retries.BaseDelayMs,
                 retryMaxDelayMs = _journal.AiConfig.Retries.MaxDelayMs,
+                queueMaxRetries = _journal.AiConfig.QueueRetries.MaxRetries,
+                queueRetryBaseDelayMs = _journal.AiConfig.QueueRetries.BaseDelayMs,
+                queueRetryMaxDelayMs = _journal.AiConfig.QueueRetries.MaxDelayMs,
                 reserveOutputTokens = _journal.AiConfig.RateLimits.ReserveOutputTokens,
                 maxQueuedPerPage = _journal.AiConfig.RateLimits.MaxQueuedPerPage,
                 maxQueuedGlobal = _journal.AiConfig.RateLimits.MaxQueuedGlobal,
@@ -558,6 +653,7 @@ internal sealed class RuntimeEngine
         var requestId = GetOptionalString(envelope.Payload, "requestId") ?? Guid.NewGuid().ToString("D");
 
         AiPageSessionRecord session;
+        var retryPolicyScope = "single";
 
         await _stateLock.WaitAsync(cancellationToken);
         try
@@ -583,6 +679,8 @@ internal sealed class RuntimeEngine
                 throw new InvalidOperationException("Page AI queue limit has been reached.");
             }
 
+            retryPolicyScope = GetSessionQueuedWorkCountLocked(session) > 0 ? "queue" : "single";
+
             var userMessage = new AiChatMessageRecord
             {
                 PageKey = pageKey,
@@ -595,6 +693,8 @@ internal sealed class RuntimeEngine
             };
             session.Messages.Add(userMessage);
 
+            var assistantPlaceholder = CreateAssistantPlaceholderMessage(session, pageKey, requestId, userMessage.Id);
+
             session.PendingQueue.Add(new AiQueueItemRecord
             {
                 RequestId = requestId,
@@ -602,7 +702,9 @@ internal sealed class RuntimeEngine
                 Origin = origin,
                 Text = text,
                 UserMessageId = userMessage.Id,
-                State = "queued"
+                AssistantMessageId = assistantPlaceholder.Id,
+                State = "queued",
+                RetryPolicyScope = retryPolicyScope
             });
             session.RequestState = session.ActiveItem is null ? "queued" : session.RequestState;
             session.LastError = null;
@@ -640,6 +742,7 @@ internal sealed class RuntimeEngine
                 pageKey,
                 requestId,
                 origin,
+                retryPolicyScope,
                 queueCount = GetVisibleQueueCountLocked(session),
                 queuedWorkCount = GetSessionQueuedWorkCountLocked(session),
                 inputLength = text.Length
@@ -725,7 +828,7 @@ internal sealed class RuntimeEngine
             _stateLock.Release();
         }
 
-        CancelPageProcessing(pageKey);
+        await CancelPageProcessingAsync(pageKey);
 
         if (!string.IsNullOrWhiteSpace(responseId))
         {
@@ -750,6 +853,7 @@ internal sealed class RuntimeEngine
             session.RetryableItem = null;
             session.CanonicalContextJsonItems.Clear();
             session.CompactionPassCount = 0;
+            session.LastRejectedAutoCompactionAffectedTurnCount = 0;
             PromptCaching.ResetSessionState(session);
             session.OpenAiResponseId = null;
             session.LastSequenceNumber = null;
@@ -810,12 +914,13 @@ internal sealed class RuntimeEngine
             }
 
             restartProcessing = session.PendingQueue.Count > 0 || session.RetryableItem is not null;
-            CancelPageProcessing(pageKey);
         }
         finally
         {
             _stateLock.Release();
         }
+
+        await CancelPageProcessingAsync(pageKey);
 
         try
         {
@@ -973,6 +1078,11 @@ internal sealed class RuntimeEngine
         var resolvedInstructions = ResolveCompactionInstructions(config);
         var preservedTailItems = GetPreservedTailContextJson(session, config.Compaction.PreserveRecentTurns);
         var compactionInputItems = GetCompactionInputItems(session, preservedTailItems);
+        var preCompactionPromptTokens = EstimatePromptTokenCost(
+            session.CanonicalContextJsonItems,
+            pendingText: string.Empty,
+            _journal.AiConfig.Chat.Instructions
+        );
         if (compactionInputItems.Count == 0)
         {
             await EmitLogAsync(
@@ -1035,7 +1145,7 @@ internal sealed class RuntimeEngine
                     InstructionsText = resolvedInstructions
                 }
             };
-            session.Messages.Add(compactionRequestMessage);
+            InsertSessionMessageAfterAnchor(session, compactionRequestMessage, rangeEndMessageId);
             await _stateStore.SaveAsync(_journal, cancellationToken);
         }
         finally
@@ -1081,6 +1191,22 @@ internal sealed class RuntimeEngine
 
         try
         {
+            var providerPayload = OpenAiClient.BuildCompactPayload(
+                compactionSelection,
+                compactionInputItems,
+                resolvedInstructions,
+                promptCacheRequest
+            );
+            await EmitProviderRequestLogAsync(
+                "ai.provider.request.compaction",
+                "/v1/responses/compact",
+                pageKey,
+                requestId,
+                providerPayload,
+                cancellationToken,
+                correlationId
+            );
+
             var response = await _openAiClient.CompactAsync(
                 compactionSelection,
                 compactionInputItems,
@@ -1095,54 +1221,61 @@ internal sealed class RuntimeEngine
             {
                 session = GetOrCreatePageSessionLocked(pageKey, pageUrl);
                 var promptCacheUsage = PromptCaching.ReadUsage(response.Document.RootElement);
-                var compactedItems = GetOutputItemsAsJsonStrings(response.Document.RootElement);
-                var resultPreviewText = BuildCompactionResultPreview(compactedItems);
-                session.CanonicalContextJsonItems = MergeCanonicalContext(compactedItems, preservedTailItems);
-                session.CompactionPassCount += 1;
                 PromptCaching.RecordUsage(session, promptCacheRequest, promptCacheUsage, NowIso());
                 session.LastCheckpointAt = NowIso();
-
-                var persistedRequestMessage = session.Messages.FirstOrDefault(message => message.Id == compactionRequestMessage!.Id);
-                if (persistedRequestMessage is not null)
-                {
-                    persistedRequestMessage.State = "completed";
-                    persistedRequestMessage.Summary = $"Compacting {affectedMessageIds.Count} messages.";
-                    persistedRequestMessage.Meta = new AiCompactionRequestMeta
-                    {
-                        CompactionId = compactionId,
-                        AffectedMessageIds = [.. affectedMessageIds],
-                        RangeStartMessageId = rangeStartMessageId,
-                        RangeEndMessageId = rangeEndMessageId,
-                        InstructionsText = resolvedInstructions
-                    };
-                }
-
-                MarkMessagesCompacted(session, affectedMessageIds, compactionId);
-
-                var compactionResultMessage = new AiChatMessageRecord
-                {
-                    PageKey = session.PageKey,
-                    RequestId = requestId,
-                    Origin = "system",
-                    Role = "system",
-                    Kind = "compaction-result",
-                    Text = "Context compaction completed.",
-                    Summary = $"Compacted into {compactedItems.Count} items, preserved tail {preservedTailItems.Count}.",
-                    State = "completed",
-                    Meta = new AiCompactionResultMeta
-                    {
-                        CompactionId = compactionId,
-                        AffectedMessageIds = [.. affectedMessageIds],
-                        RangeStartMessageId = rangeStartMessageId,
-                        RangeEndMessageId = rangeEndMessageId,
-                        ResultPreviewText = resultPreviewText,
-                        CompactedItemCount = compactedItems.Count,
-                        PreservedTailCount = preservedTailItems.Count
-                    }
-                };
-                session.Messages.Add(compactionResultMessage);
+                var applyResult = ApplyCompactionResponseLocked(
+                    session,
+                    requestId,
+                    compactionRequestMessage!.Id,
+                    "Compacting context by explicit request.",
+                    compactionId,
+                    affectedMessageIds,
+                    rangeStartMessageId,
+                    rangeEndMessageId,
+                    resolvedInstructions,
+                    preservedTailItems,
+                    pendingText: string.Empty,
+                    chatInstructions: _journal.AiConfig.Chat.Instructions,
+                    preCompactionPromptTokens: preCompactionPromptTokens,
+                    responseElement: response.Document.RootElement
+                );
 
                 await _stateStore.SaveAsync(_journal, cancellationToken);
+
+                if (!applyResult.Applied)
+                {
+                    await EmitLogAsync(
+                        "warn",
+                        "ai.chat.compaction.rejected",
+                        "AI context compaction result was rejected.",
+                        new
+                        {
+                            pageKey,
+                            requestId,
+                            mode,
+                            compactionId,
+                            reason = applyResult.Reason,
+                            affectedMessageCount = affectedMessageIds.Count,
+                            prePromptTokens = applyResult.PrePromptTokens,
+                            postPromptTokens = applyResult.PostPromptTokens,
+                            compactedItemCount = applyResult.CompactedItemCount,
+                            preservedTailCount = applyResult.PreservedTailCount,
+                            resultPreviewText = applyResult.ResultPreviewText,
+                            promptCaching = BuildPromptCacheTelemetryDetails(session, promptCacheRequest.FallbackReason)
+                        },
+                        cancellationToken,
+                        correlationId
+                    );
+                    return new ManualCompactionResult(
+                        false,
+                        mode,
+                        compactionId,
+                        applyResult.Reason,
+                        affectedMessageIds.Count,
+                        applyResult.CompactedItemCount,
+                        applyResult.PreservedTailCount
+                    );
+                }
 
                 await EmitAiEventAsync(
                     "ai.chat.compaction.completed",
@@ -1157,11 +1290,13 @@ internal sealed class RuntimeEngine
                         affectedMessageCount = affectedMessageIds.Count,
                         rangeStartMessageId,
                         rangeEndMessageId,
-                        compactedItemCount = compactedItems.Count,
-                        preservedTailCount = preservedTailItems.Count,
+                        compactedItemCount = applyResult.CompactedItemCount,
+                        preservedTailCount = applyResult.PreservedTailCount,
+                        prePromptTokens = applyResult.PrePromptTokens,
+                        postPromptTokens = applyResult.PostPromptTokens,
                         promptCaching = BuildPromptCacheTelemetryDetails(session, promptCacheRequest.FallbackReason)
                     },
-                    messageRecord: compactionResultMessage,
+                    messageRecord: applyResult.ResultMessage,
                     correlationId: correlationId
                 );
 
@@ -1178,9 +1313,11 @@ internal sealed class RuntimeEngine
                         affectedMessageCount = affectedMessageIds.Count,
                         rangeStartMessageId,
                         rangeEndMessageId,
-                        compactedItemCount = compactedItems.Count,
-                        preservedTailCount = preservedTailItems.Count,
-                        resultPreviewText,
+                        compactedItemCount = applyResult.CompactedItemCount,
+                        preservedTailCount = applyResult.PreservedTailCount,
+                        prePromptTokens = applyResult.PrePromptTokens,
+                        postPromptTokens = applyResult.PostPromptTokens,
+                        resultPreviewText = applyResult.ResultPreviewText,
                         promptCaching = BuildPromptCacheTelemetryDetails(session, promptCacheRequest.FallbackReason)
                     },
                     cancellationToken,
@@ -1193,8 +1330,8 @@ internal sealed class RuntimeEngine
                     compactionId,
                     null,
                     affectedMessageIds.Count,
-                    compactedItems.Count,
-                    preservedTailItems.Count
+                    applyResult.CompactedItemCount,
+                    applyResult.PreservedTailCount
                 );
             }
             finally
@@ -1365,12 +1502,32 @@ internal sealed class RuntimeEngine
         _aiProcessingTasks[pageKey] = Task.Run(() => ProcessPageQueueAsync(pageKey, processingCts.Token));
     }
 
-    private void CancelPageProcessing(string pageKey)
+    private async Task CancelPageProcessingAsync(string pageKey)
     {
+        Task? processingTask = null;
+        if (_aiProcessingTasks.TryGetValue(pageKey, out var existingTask))
+        {
+            processingTask = existingTask;
+        }
+
         if (_aiProcessingTokens.Remove(pageKey, out var cts))
         {
             cts.Cancel();
             cts.Dispose();
+        }
+
+        if (processingTask is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await processingTask.WaitAsync(CancellationToken.None);
+        }
+        catch (OperationCanceledException)
+        {
+            // Normal cancellation path for reset/manual compaction.
         }
     }
 
@@ -1553,6 +1710,22 @@ internal sealed class RuntimeEngine
             activeItem.PromptCacheKey = promptCacheRequest.CacheKey;
             await PersistJournalAsync(cancellationToken);
 
+            var providerPayload = OpenAiClient.BuildResponsesPayload(
+                _journal.AiConfig,
+                inputItems,
+                background: true,
+                stream: _journal.AiConfig.Chat.StreamingEnabled,
+                promptCacheRequest
+            );
+            await EmitProviderRequestLogAsync(
+                "ai.provider.request.chat",
+                "/v1/responses",
+                session.PageKey,
+                activeItem.RequestId,
+                providerPayload,
+                cancellationToken
+            );
+
             if (!string.IsNullOrWhiteSpace(promptCacheRequest.FallbackReason))
             {
                 await EmitLogAsync(
@@ -1670,7 +1843,7 @@ internal sealed class RuntimeEngine
         AiPageSessionRecord session,
         AiQueueItemRecord activeItem,
         AiChatMessageRecord assistantMessage,
-        OpenAiStreamResponse streamResponse,
+        IOpenAiStreamResponse streamResponse,
         CancellationToken cancellationToken
     )
     {
@@ -1719,7 +1892,11 @@ internal sealed class RuntimeEngine
                     break;
 
                 case "response.failed":
-                    throw new OpenAiTerminalResponseException("failed");
+                    throw CreateTerminalResponseException(
+                        "failed",
+                        responseElement is { ValueKind: JsonValueKind.Object }
+                            ? responseElement.Value
+                            : streamEvent.Data);
             }
         }
 
@@ -1758,7 +1935,7 @@ internal sealed class RuntimeEngine
 
             if (responseStatus is "failed" or "cancelled" or "incomplete")
             {
-                throw new OpenAiTerminalResponseException(responseStatus);
+                throw CreateTerminalResponseException(responseStatus, response.Document.RootElement);
             }
 
             await Task.Delay(1500, cancellationToken);
@@ -1958,14 +2135,15 @@ internal sealed class RuntimeEngine
     )
     {
         var errorMessage = error.Message;
-        var retryHandling = DetermineRetryHandling(error, activeItem, _journal.AiConfig.Retries);
+        var retryConfig = GetRetryConfig(activeItem);
+        var retryHandling = DetermineRetryHandling(error, activeItem, retryConfig);
         if (retryHandling.Action == RetryHandlingDecision.ActionAutoRetry)
         {
-            await ScheduleAutomaticRetryAsync(pageKey, activeItem, errorMessage, retryHandling, cancellationToken);
+            await ScheduleAutomaticRetryAsync(pageKey, activeItem, errorMessage, retryHandling, retryConfig, cancellationToken);
             return;
         }
 
-        await MarkRetryableAsync(pageKey, activeItem, errorMessage, retryHandling, cancellationToken);
+        await MarkRetryableAsync(pageKey, activeItem, errorMessage, retryHandling, retryConfig, cancellationToken);
     }
 
     private async Task ScheduleAutomaticRetryAsync(
@@ -1973,6 +2151,7 @@ internal sealed class RuntimeEngine
         AiQueueItemRecord activeItem,
         string errorMessage,
         RetryHandlingDecision retryHandling,
+        AiRetryConfig retryConfig,
         CancellationToken cancellationToken
     )
     {
@@ -2014,7 +2193,7 @@ internal sealed class RuntimeEngine
                 activeItem.RequestId,
                 errorMessage,
                 attemptCount = activeItem.AttemptCount,
-                maxRetries = _journal.AiConfig.Retries.MaxRetries,
+                maxRetries = retryConfig.MaxRetries,
                 delayMs = retryHandling.DelayMs,
                 retryMode = retryHandling.RetryMode,
                 failureClassification = retryHandling.FailureClassification,
@@ -2033,7 +2212,7 @@ internal sealed class RuntimeEngine
                 requestId = activeItem.RequestId,
                 errorMessage,
                 attemptCount = activeItem.AttemptCount,
-                maxRetries = _journal.AiConfig.Retries.MaxRetries,
+                maxRetries = retryConfig.MaxRetries,
                 delayMs = retryHandling.DelayMs,
                 retryMode = retryHandling.RetryMode,
                 failureClassification = retryHandling.FailureClassification,
@@ -2050,6 +2229,7 @@ internal sealed class RuntimeEngine
         AiQueueItemRecord activeItem,
         string errorMessage,
         RetryHandlingDecision retryHandling,
+        AiRetryConfig retryConfig,
         CancellationToken cancellationToken
     )
     {
@@ -2089,7 +2269,7 @@ internal sealed class RuntimeEngine
                 activeItem.RequestId,
                 errorMessage,
                 attemptCount = activeItem.AttemptCount,
-                maxRetries = _journal.AiConfig.Retries.MaxRetries,
+                maxRetries = retryConfig.MaxRetries,
                 retryMode = retryHandling.RetryMode,
                 failureClassification = retryHandling.FailureClassification
             },
@@ -2106,7 +2286,7 @@ internal sealed class RuntimeEngine
                 requestId = activeItem.RequestId,
                 errorMessage,
                 attemptCount = activeItem.AttemptCount,
-                maxRetries = _journal.AiConfig.Retries.MaxRetries,
+                maxRetries = retryConfig.MaxRetries,
                 retryMode = retryHandling.RetryMode,
                 failureClassification = retryHandling.FailureClassification,
                 recoverable = session!.Recoverable,
@@ -2120,6 +2300,17 @@ internal sealed class RuntimeEngine
     {
         if (error is OpenAiTerminalResponseException terminal)
         {
+            if (string.Equals(terminal.ResponseStatus, "failed", StringComparison.OrdinalIgnoreCase) &&
+                IsRetryableTerminalFailure(terminal))
+            {
+                return new RetryDisposition(
+                    RetryDisposition.DecisionRestartFresh,
+                    string.IsNullOrWhiteSpace(terminal.ErrorCode)
+                        ? "openai_response_failed"
+                        : $"openai_response_failed_{terminal.ErrorCode}"
+                );
+            }
+
             return new RetryDisposition(
                 RetryDisposition.DecisionManualPause,
                 $"openai_response_{terminal.ResponseStatus}"
@@ -2194,6 +2385,14 @@ internal sealed class RuntimeEngine
             );
         }
 
+        if (LooksLikeWrappedTransientTransportFailure(error))
+        {
+            return new RetryDisposition(
+                RetryDisposition.DecisionAutoRetry,
+                "stream_disconnect"
+            );
+        }
+
         return new RetryDisposition(
             RetryDisposition.DecisionManualPause,
             "non_retryable_error"
@@ -2260,6 +2459,11 @@ internal sealed class RuntimeEngine
         }
     }
 
+    private AiRetryConfig GetRetryConfig(AiQueueItemRecord activeItem) =>
+        string.Equals(activeItem.RetryPolicyScope, "queue", StringComparison.Ordinal)
+            ? _journal.AiConfig.QueueRetries
+            : _journal.AiConfig.Retries;
+
     private static string ResolveRetryMode(
         AiQueueItemRecord activeItem,
         RetryDisposition disposition
@@ -2275,6 +2479,99 @@ internal sealed class RuntimeEngine
         return message.Contains("no longer be streamed", StringComparison.OrdinalIgnoreCase) &&
                message.Contains("more than 5 minutes old", StringComparison.OrdinalIgnoreCase);
     }
+
+    private static string NormalizeRetryPolicyScope(string? value) =>
+        string.Equals(value, "queue", StringComparison.OrdinalIgnoreCase)
+            ? "queue"
+            : "single";
+
+    private static bool LooksLikeWrappedTransientTransportFailure(Exception error)
+    {
+        if (error.InnerException is HttpRequestException or IOException or EndOfStreamException)
+        {
+            return true;
+        }
+
+        if (!string.IsNullOrWhiteSpace(error.Message) &&
+            (error.Message.Contains("response ended prematurely", StringComparison.OrdinalIgnoreCase) ||
+             error.Message.Contains("ResponseEnded", StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        return error.InnerException is not null &&
+               LooksLikeWrappedTransientTransportFailure(error.InnerException);
+    }
+
+    private static OpenAiTerminalResponseException CreateTerminalResponseException(
+        string responseStatus,
+        JsonElement responseSource)
+    {
+        var payload = responseSource;
+        var nestedResponse = GetOptionalElement(responseSource, "response");
+        if (nestedResponse is { ValueKind: JsonValueKind.Object })
+        {
+            payload = nestedResponse.Value;
+        }
+
+        string? errorCode = null;
+        string? errorMessage = null;
+
+        var errorElement = GetOptionalElement(payload, "error") ?? GetOptionalElement(responseSource, "error");
+        if (errorElement is { ValueKind: JsonValueKind.Object })
+        {
+            errorCode =
+                GetOptionalString(errorElement.Value, "code") ??
+                GetOptionalString(errorElement.Value, "type");
+            errorMessage = GetOptionalString(errorElement.Value, "message");
+        }
+
+        if (string.Equals(responseStatus, "incomplete", StringComparison.OrdinalIgnoreCase))
+        {
+            var incompleteDetails = GetOptionalElement(payload, "incomplete_details") ?? GetOptionalElement(responseSource, "incomplete_details");
+            if (incompleteDetails is { ValueKind: JsonValueKind.Object })
+            {
+                errorCode ??= GetOptionalString(incompleteDetails.Value, "reason");
+                errorMessage ??= GetOptionalString(incompleteDetails.Value, "message");
+            }
+        }
+
+        return new OpenAiTerminalResponseException(responseStatus, errorCode, errorMessage);
+    }
+
+    private static bool IsRetryableTerminalFailure(OpenAiTerminalResponseException terminal)
+    {
+        if (!string.IsNullOrWhiteSpace(terminal.ErrorCode))
+        {
+            if (ContainsAny(terminal.ErrorCode, "quota", "invalid", "policy", "safety", "authentication", "permission"))
+            {
+                return false;
+            }
+
+            if (ContainsAny(terminal.ErrorCode, "server", "internal", "overload", "tempor", "rate"))
+            {
+                return true;
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(terminal.TerminalErrorMessage))
+        {
+            if (ContainsAny(terminal.TerminalErrorMessage, "quota", "invalid", "policy", "safety", "authentication", "permission"))
+            {
+                return false;
+            }
+
+            if (ContainsAny(terminal.TerminalErrorMessage, "internal", "server", "tempor", "overload", "unavailable", "try again"))
+            {
+                return true;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool ContainsAny(string value, params string[] fragments) =>
+        fragments.Any(fragment => value.Contains(fragment, StringComparison.OrdinalIgnoreCase));
 
     private static AiChatMessageRecord? FindAssistantMessage(
         AiPageSessionRecord session,
@@ -2351,8 +2648,17 @@ internal sealed class RuntimeEngine
             return;
         }
 
+        var affectedTurns = GetCompactionAffectedTurns(session, config.Compaction.PreserveRecentTurns);
+        if (session.LastRejectedAutoCompactionAffectedTurnCount > 0 &&
+            affectedTurns.Count <= session.LastRejectedAutoCompactionAffectedTurnCount + 1)
+        {
+            return;
+        }
+
         var compactionId = Guid.NewGuid().ToString("D");
-        var affectedMessages = GetCompactionAffectedMessages(session, config.Compaction.PreserveRecentTurns);
+        var affectedMessages = affectedTurns
+            .SelectMany(turn => turn.Messages)
+            .ToList();
         if (affectedMessages.Count == 0)
         {
             return;
@@ -2364,6 +2670,7 @@ internal sealed class RuntimeEngine
         var resolvedInstructions = ResolveCompactionInstructions(config);
         var preservedTailItems = GetPreservedTailContextJson(session, config.Compaction.PreserveRecentTurns);
         var compactionInputItems = GetCompactionInputItems(session, preservedTailItems);
+        var preCompactionPromptTokens = estimatedPromptTokens;
         if (compactionInputItems.Count == 0)
         {
             return;
@@ -2395,7 +2702,7 @@ internal sealed class RuntimeEngine
                     InstructionsText = resolvedInstructions
                 }
             };
-            session.Messages.Add(compactionRequestMessage);
+            InsertSessionMessageAfterAnchor(session, compactionRequestMessage, rangeEndMessageId);
             await _stateStore.SaveAsync(_journal, cancellationToken);
         }
         finally
@@ -2438,6 +2745,21 @@ internal sealed class RuntimeEngine
             cancellationToken
         );
 
+        var providerPayload = OpenAiClient.BuildCompactPayload(
+            compactionSelection,
+            compactionInputItems,
+            resolvedInstructions,
+            promptCacheRequest
+        );
+        await EmitProviderRequestLogAsync(
+            "ai.provider.request.compaction",
+            "/v1/responses/compact",
+            session.PageKey,
+            activeItem.RequestId,
+            providerPayload,
+            cancellationToken
+        );
+
         var response = await _openAiClient.CompactAsync(
             compactionSelection,
             compactionInputItems,
@@ -2452,54 +2774,54 @@ internal sealed class RuntimeEngine
         {
             session = GetOrCreatePageSessionLocked(session.PageKey, session.PageUrlSample);
             var promptCacheUsage = PromptCaching.ReadUsage(response.Document.RootElement);
-            var compactedItems = GetOutputItemsAsJsonStrings(response.Document.RootElement);
-            var resultPreviewText = BuildCompactionResultPreview(compactedItems);
-            session.CanonicalContextJsonItems = MergeCanonicalContext(compactedItems, preservedTailItems);
-            session.CompactionPassCount += 1;
             PromptCaching.RecordUsage(session, promptCacheRequest, promptCacheUsage, NowIso());
             session.LastCheckpointAt = NowIso();
-
-            var persistedRequestMessage = session.Messages.FirstOrDefault(message => message.Id == compactionRequestMessage!.Id);
-            if (persistedRequestMessage is not null)
-            {
-                persistedRequestMessage.State = "completed";
-                persistedRequestMessage.Summary = $"Compacting {affectedMessageIds.Count} messages.";
-                persistedRequestMessage.Meta = new AiCompactionRequestMeta
-                {
-                    CompactionId = compactionId,
-                    AffectedMessageIds = [.. affectedMessageIds],
-                    RangeStartMessageId = rangeStartMessageId,
-                    RangeEndMessageId = rangeEndMessageId,
-                    InstructionsText = resolvedInstructions
-                };
-            }
-
-            MarkMessagesCompacted(session, affectedMessageIds, compactionId);
-
-            var compactionResultMessage = new AiChatMessageRecord
-            {
-                PageKey = session.PageKey,
-                RequestId = activeItem.RequestId,
-                Origin = "system",
-                Role = "system",
-                Kind = "compaction-result",
-                Text = "Context compaction completed.",
-                Summary = $"Compacted into {compactedItems.Count} items, preserved tail {preservedTailItems.Count}.",
-                State = "completed",
-                Meta = new AiCompactionResultMeta
-                {
-                    CompactionId = compactionId,
-                    AffectedMessageIds = [.. affectedMessageIds],
-                    RangeStartMessageId = rangeStartMessageId,
-                    RangeEndMessageId = rangeEndMessageId,
-                    ResultPreviewText = resultPreviewText,
-                    CompactedItemCount = compactedItems.Count,
-                    PreservedTailCount = preservedTailItems.Count
-                }
-            };
-            session.Messages.Add(compactionResultMessage);
+            var applyResult = ApplyCompactionResponseLocked(
+                session,
+                activeItem.RequestId,
+                compactionRequestMessage!.Id,
+                "Compacting context before the next AI request.",
+                compactionId,
+                affectedMessageIds,
+                rangeStartMessageId,
+                rangeEndMessageId,
+                resolvedInstructions,
+                preservedTailItems,
+                pendingText: activeItem.Text,
+                chatInstructions: _journal.AiConfig.Chat.Instructions,
+                preCompactionPromptTokens: preCompactionPromptTokens,
+                responseElement: response.Document.RootElement
+            );
 
             await _stateStore.SaveAsync(_journal, cancellationToken);
+
+            if (!applyResult.Applied)
+            {
+                await EmitLogAsync(
+                    "warn",
+                    "ai.chat.compaction.rejected",
+                    "AI context compaction result was rejected.",
+                    new
+                    {
+                        pageKey = session.PageKey,
+                        requestId = activeItem.RequestId,
+                        compactionId,
+                        reason = applyResult.Reason,
+                        affectedMessageCount = affectedMessageIds.Count,
+                        affectedTurnCount = affectedTurns.Count,
+                        prePromptTokens = applyResult.PrePromptTokens,
+                        postPromptTokens = applyResult.PostPromptTokens,
+                        compactedItemCount = applyResult.CompactedItemCount,
+                        preservedTailCount = applyResult.PreservedTailCount,
+                        resultPreviewText = applyResult.ResultPreviewText,
+                        promptCaching = BuildPromptCacheTelemetryDetails(session, promptCacheRequest.FallbackReason)
+                    },
+                    cancellationToken
+                );
+                session.LastRejectedAutoCompactionAffectedTurnCount = affectedTurns.Count;
+                await _stateStore.SaveAsync(_journal, cancellationToken);
+                return;
+            }
 
             await EmitAiEventAsync(
                 "ai.chat.compaction.completed",
@@ -2510,13 +2832,16 @@ internal sealed class RuntimeEngine
                 {
                     compactionId,
                     affectedMessageCount = affectedMessageIds.Count,
+                    affectedTurnCount = affectedTurns.Count,
                     rangeStartMessageId,
                     rangeEndMessageId,
-                    compactedItemCount = compactedItems.Count,
-                    preservedTailCount = preservedTailItems.Count,
+                    compactedItemCount = applyResult.CompactedItemCount,
+                    preservedTailCount = applyResult.PreservedTailCount,
+                    prePromptTokens = applyResult.PrePromptTokens,
+                    postPromptTokens = applyResult.PostPromptTokens,
                     promptCaching = BuildPromptCacheTelemetryDetails(session, promptCacheRequest.FallbackReason)
                 },
-                messageRecord: compactionResultMessage
+                messageRecord: applyResult.ResultMessage
             );
 
             await EmitLogAsync(
@@ -2529,11 +2854,14 @@ internal sealed class RuntimeEngine
                     requestId = activeItem.RequestId,
                     compactionId,
                     affectedMessageCount = affectedMessageIds.Count,
+                    affectedTurnCount = affectedTurns.Count,
                     rangeStartMessageId,
                     rangeEndMessageId,
-                    compactedItemCount = compactedItems.Count,
-                    preservedTailCount = preservedTailItems.Count,
-                    resultPreviewText,
+                    compactedItemCount = applyResult.CompactedItemCount,
+                    preservedTailCount = applyResult.PreservedTailCount,
+                    prePromptTokens = applyResult.PrePromptTokens,
+                    postPromptTokens = applyResult.PostPromptTokens,
+                    resultPreviewText = applyResult.ResultPreviewText,
                     promptCaching = BuildPromptCacheTelemetryDetails(session, promptCacheRequest.FallbackReason)
                 },
                 cancellationToken
@@ -2918,7 +3246,7 @@ internal sealed class RuntimeEngine
             queue.Add(session.RetryableItem);
         }
 
-        foreach (var item in session.PendingQueue)
+        foreach (var item in session.PendingQueue.ToArray())
         {
             if (item is not null)
             {
@@ -2952,8 +3280,12 @@ internal sealed class RuntimeEngine
         return delay > TimeSpan.Zero ? delay : fallbackDelay;
     }
 
-    private static string? GetSessionNextRetryAt(AiPageSessionRecord session) =>
-        NormalizeOptionalIsoTimestamp(session.PendingQueue.FirstOrDefault(item => item is not null && GetQueueItemNotBeforeAt(item) is not null)?.NotBeforeAt);
+    private static string? GetSessionNextRetryAt(AiPageSessionRecord session)
+    {
+        var pendingQueueSnapshot = session.PendingQueue.ToArray();
+        return NormalizeOptionalIsoTimestamp(
+            pendingQueueSnapshot.FirstOrDefault(item => item is not null && GetQueueItemNotBeforeAt(item) is not null)?.NotBeforeAt);
+    }
 
     private AiChatMessageRecord EnsureAssistantDraftMessage(AiPageSessionRecord session, AiQueueItemRecord activeItem)
     {
@@ -2966,17 +3298,11 @@ internal sealed class RuntimeEngine
             }
         }
 
-        var assistantMessage = new AiChatMessageRecord
-        {
-            PageKey = session.PageKey,
-            RequestId = activeItem.RequestId,
-            Origin = "assistant",
-            Role = "assistant",
-            Kind = "assistant",
-            Text = string.Empty,
-            State = _journal.AiConfig.Chat.StreamingEnabled ? "streaming" : "pending"
-        };
-        session.Messages.Add(assistantMessage);
+        var assistantMessage = CreateAssistantPlaceholderMessage(
+            session,
+            session.PageKey,
+            activeItem.RequestId,
+            activeItem.UserMessageId);
         activeItem.AssistantMessageId = assistantMessage.Id;
         return assistantMessage;
     }
@@ -3026,6 +3352,37 @@ internal sealed class RuntimeEngine
                 }
             }
         });
+
+    private static AiChatMessageRecord CreateAssistantPlaceholderMessage(
+        AiPageSessionRecord session,
+        string pageKey,
+        string requestId,
+        string userMessageId
+    )
+    {
+        var assistantMessage = new AiChatMessageRecord
+        {
+            PageKey = pageKey,
+            RequestId = requestId,
+            Origin = "assistant",
+            Role = "assistant",
+            Kind = "assistant",
+            Text = string.Empty,
+            State = "pending"
+        };
+
+        var userIndex = session.Messages.FindIndex(message => message.Id == userMessageId);
+        if (userIndex >= 0 && userIndex < session.Messages.Count)
+        {
+            session.Messages.Insert(userIndex + 1, assistantMessage);
+        }
+        else
+        {
+            session.Messages.Add(assistantMessage);
+        }
+
+        return assistantMessage;
+    }
 
     private static string SerializeCanonicalContextJson(object value) =>
         JsonSerializer.Serialize(value, CanonicalContextJsonSerializerOptions);
@@ -3135,21 +3492,142 @@ internal sealed class RuntimeEngine
         return merged;
     }
 
-    internal static List<AiChatMessageRecord> GetCompactionEligibleMessages(AiPageSessionRecord session) =>
-        session.Messages
-            .Where(message =>
-                message.State == "completed" &&
-                message.Kind is "user" or "assistant" or "code" &&
-                GetMessageCompactedBy(message) is null)
+    private static List<AiConversationTurn> GetConversationTurns(AiPageSessionRecord session)
+    {
+        var turns = new List<AiConversationTurn>();
+        var turnsByKey = new Dictionary<string, AiConversationTurn>(StringComparer.Ordinal);
+        for (var index = 0; index < session.Messages.Count; index++)
+        {
+            var message = session.Messages[index];
+            if (!IsConversationalMessage(message))
+            {
+                continue;
+            }
+
+            var hasRequestId = !string.IsNullOrWhiteSpace(message.RequestId);
+            AiConversationTurn? turn = null;
+            if (hasRequestId)
+            {
+                var turnKey = message.RequestId!;
+                if (!turnsByKey.TryGetValue(turnKey, out turn))
+                {
+                    turn = new AiConversationTurn
+                    {
+                        Key = turnKey,
+                        RequestId = turnKey,
+                        FirstMessageIndex = index
+                    };
+                    turnsByKey[turnKey] = turn;
+                    turns.Add(turn);
+                }
+            }
+            else if (message.Role == "assistant" || message.Kind == "assistant")
+            {
+                turn = turns.FirstOrDefault(candidate =>
+                    candidate.RequestId is null &&
+                    candidate.UserMessage is not null &&
+                    candidate.AssistantMessage is null);
+            }
+
+            if (turn is null)
+            {
+                turn = new AiConversationTurn
+                {
+                    Key = $"legacy:{message.Id}",
+                    RequestId = null,
+                    FirstMessageIndex = index
+                };
+                turns.Add(turn);
+            }
+
+            turn.FirstMessageIndex = Math.Min(turn.FirstMessageIndex, index);
+            if (message.Role == "assistant" || message.Kind == "assistant")
+            {
+                if (turn.AssistantMessage is null || ShouldReplaceAssistantTurnMessage(turn.AssistantMessage, message))
+                {
+                    turn.AssistantMessage = message;
+                }
+            }
+            else if (turn.UserMessage is null)
+            {
+                turn.UserMessage = message;
+            }
+        }
+
+        turns.Sort((left, right) => left.FirstMessageIndex.CompareTo(right.FirstMessageIndex));
+        return turns;
+    }
+
+    private static bool IsConversationalMessage(AiChatMessageRecord message) =>
+        message.Kind is "user" or "assistant" or "code";
+
+    private static bool ShouldReplaceAssistantTurnMessage(AiChatMessageRecord existing, AiChatMessageRecord candidate)
+    {
+        var existingScore = GetAssistantTurnMessageScore(existing);
+        var candidateScore = GetAssistantTurnMessageScore(candidate);
+        if (candidateScore != existingScore)
+        {
+            return candidateScore > existingScore;
+        }
+
+        return string.CompareOrdinal(candidate.Id, existing.Id) > 0;
+    }
+
+    private static int GetAssistantTurnMessageScore(AiChatMessageRecord message)
+    {
+        var hasText = !string.IsNullOrWhiteSpace(message.Text);
+        return message.State switch
+        {
+            "completed" when hasText => 5,
+            "completed" => 4,
+            "streaming" when hasText => 3,
+            "error" when hasText => 2,
+            "pending" when hasText => 1,
+            _ => 0
+        };
+    }
+
+    private static IEnumerable<string> GetCanonicalContextItemsForTurn(AiConversationTurn turn)
+    {
+        if (turn.UserMessage is not null)
+        {
+            yield return SerializeUserMessageInputJson(turn.UserMessage.Origin, turn.UserMessage.Text);
+        }
+
+        if (turn.AssistantMessage is not null)
+        {
+            yield return SerializeAssistantMessageOutputJson(turn.AssistantMessage.Text);
+        }
+    }
+
+    private static List<AiConversationTurn> GetCompactionEligibleTurns(AiPageSessionRecord session) =>
+        GetConversationTurns(session)
+            .Where(turn =>
+                turn.UserMessage is not null &&
+                turn.AssistantMessage is not null &&
+                turn.IsCompleted &&
+                turn.Messages.All(message => GetMessageCompactedBy(message) is null))
             .ToList();
 
-    internal static List<AiChatMessageRecord> GetCompactionAffectedMessages(AiPageSessionRecord session, int preserveRecentTurns)
+    private static List<AiConversationTurn> GetCompactionAffectedTurns(AiPageSessionRecord session, int preserveRecentTurns)
     {
-        var eligibleMessages = GetCompactionEligibleMessages(session);
-        var preservedTailCount = GetCompactionPreservedTailCount(eligibleMessages.Count, preserveRecentTurns);
-        var affectedCount = Math.Max(0, eligibleMessages.Count - preservedTailCount);
-        return eligibleMessages.Take(affectedCount).ToList();
+        var eligibleTurns = GetCompactionEligibleTurns(session);
+        var preservedTailCount = GetCompactionPreservedTailTurnCount(eligibleTurns.Count, preserveRecentTurns);
+        var affectedCount = Math.Max(0, eligibleTurns.Count - preservedTailCount);
+        return eligibleTurns
+            .Take(affectedCount)
+            .ToList();
     }
+
+    internal static List<AiChatMessageRecord> GetCompactionEligibleMessages(AiPageSessionRecord session) =>
+        GetCompactionEligibleTurns(session)
+            .SelectMany(turn => turn.Messages)
+            .ToList();
+
+    internal static List<AiChatMessageRecord> GetCompactionAffectedMessages(AiPageSessionRecord session, int preserveRecentTurns) =>
+        GetCompactionAffectedTurns(session, preserveRecentTurns)
+            .SelectMany(turn => turn.Messages)
+            .ToList();
 
     internal static string? GetMessageCompactedBy(AiChatMessageRecord message)
     {
@@ -3194,6 +3672,209 @@ internal sealed class RuntimeEngine
         }
     }
 
+    internal static void InsertSessionMessageAfterAnchor(
+        AiPageSessionRecord session,
+        AiChatMessageRecord message,
+        string? primaryAnchorMessageId,
+        string? fallbackAnchorMessageId = null
+    )
+    {
+        var insertAfterIndex = FindSessionMessageIndexById(session, primaryAnchorMessageId);
+        if (insertAfterIndex < 0)
+        {
+            insertAfterIndex = FindSessionMessageIndexById(session, fallbackAnchorMessageId);
+        }
+
+        if (insertAfterIndex < 0 || insertAfterIndex >= session.Messages.Count - 1)
+        {
+            session.Messages.Add(message);
+            return;
+        }
+
+        session.Messages.Insert(insertAfterIndex + 1, message);
+    }
+
+    private static int FindSessionMessageIndexById(AiPageSessionRecord session, string? messageId)
+    {
+        if (string.IsNullOrWhiteSpace(messageId))
+        {
+            return -1;
+        }
+
+        for (var index = 0; index < session.Messages.Count; index++)
+        {
+            if (string.Equals(session.Messages[index].Id, messageId, StringComparison.Ordinal))
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
+    private static void UpdateCompactionRequestMessage(
+        AiPageSessionRecord session,
+        string requestMessageId,
+        string state,
+        string text,
+        string summary,
+        string compactionId,
+        IReadOnlyList<string> affectedMessageIds,
+        string rangeStartMessageId,
+        string rangeEndMessageId,
+        string resolvedInstructions
+    )
+    {
+        var requestMessage = session.Messages.FirstOrDefault(message => message.Id == requestMessageId);
+        if (requestMessage is null)
+        {
+            return;
+        }
+
+        requestMessage.State = state;
+        requestMessage.Text = text;
+        requestMessage.Summary = summary;
+        requestMessage.Meta = new AiCompactionRequestMeta
+        {
+            CompactionId = compactionId,
+            AffectedMessageIds = [.. affectedMessageIds],
+            RangeStartMessageId = rangeStartMessageId,
+            RangeEndMessageId = rangeEndMessageId,
+            InstructionsText = resolvedInstructions
+        };
+    }
+
+    private static CompactionApplyResult ApplyCompactionResponseLocked(
+        AiPageSessionRecord session,
+        string requestId,
+        string requestMessageId,
+        string requestMessageText,
+        string compactionId,
+        IReadOnlyList<string> affectedMessageIds,
+        string rangeStartMessageId,
+        string rangeEndMessageId,
+        string resolvedInstructions,
+        IReadOnlyList<string> preservedTailItems,
+        string pendingText,
+        string chatInstructions,
+        int preCompactionPromptTokens,
+        JsonElement responseElement
+    )
+    {
+        var rawOutputItems = GetOutputItemsAsJsonStrings(responseElement);
+        var compactionItems = GetCompactionOutputItemsAsJsonStrings(responseElement);
+        var resultPreviewText = BuildCompactionResultPreview(rawOutputItems);
+        var preservedTailCount = preservedTailItems.Count;
+        var requestSummary = $"Compacting {affectedMessageIds.Count} messages.";
+
+        if (compactionItems.Count == 0)
+        {
+            UpdateCompactionRequestMessage(
+                session,
+                requestMessageId,
+                state: "error",
+                text: "Context compaction result was rejected.",
+                summary: requestSummary,
+                compactionId,
+                affectedMessageIds,
+                rangeStartMessageId,
+                rangeEndMessageId,
+                resolvedInstructions
+            );
+            return new CompactionApplyResult(
+                false,
+                "missing_compaction_output",
+                preCompactionPromptTokens,
+                preCompactionPromptTokens,
+                0,
+                preservedTailCount,
+                resultPreviewText,
+                ResultMessage: null
+            );
+        }
+
+        var mergedCanonicalContext = MergeCanonicalContext(compactionItems, preservedTailItems);
+        var postPromptTokens = EstimatePromptTokenCost(mergedCanonicalContext, pendingText, chatInstructions);
+        if (postPromptTokens >= preCompactionPromptTokens)
+        {
+            UpdateCompactionRequestMessage(
+                session,
+                requestMessageId,
+                state: "error",
+                text: "Context compaction result was rejected.",
+                summary: requestSummary,
+                compactionId,
+                affectedMessageIds,
+                rangeStartMessageId,
+                rangeEndMessageId,
+                resolvedInstructions
+            );
+            return new CompactionApplyResult(
+                false,
+                "ineffective_compaction",
+                preCompactionPromptTokens,
+                postPromptTokens,
+                compactionItems.Count,
+                preservedTailCount,
+                resultPreviewText,
+                ResultMessage: null
+            );
+        }
+
+        session.CanonicalContextJsonItems = mergedCanonicalContext;
+        session.CompactionPassCount += 1;
+        session.LastRejectedAutoCompactionAffectedTurnCount = 0;
+
+        UpdateCompactionRequestMessage(
+            session,
+            requestMessageId,
+            state: "completed",
+            text: requestMessageText,
+            summary: requestSummary,
+            compactionId,
+            affectedMessageIds,
+            rangeStartMessageId,
+            rangeEndMessageId,
+            resolvedInstructions
+        );
+
+        MarkMessagesCompacted(session, affectedMessageIds, compactionId);
+
+        var compactionResultMessage = new AiChatMessageRecord
+        {
+            PageKey = session.PageKey,
+            RequestId = requestId,
+            Origin = "system",
+            Role = "system",
+            Kind = "compaction-result",
+            Text = "Context compaction completed.",
+            Summary = $"Compacted into {compactionItems.Count} items, preserved tail {preservedTailCount}.",
+            State = "completed",
+            Meta = new AiCompactionResultMeta
+            {
+                CompactionId = compactionId,
+                AffectedMessageIds = [.. affectedMessageIds],
+                RangeStartMessageId = rangeStartMessageId,
+                RangeEndMessageId = rangeEndMessageId,
+                ResultPreviewText = resultPreviewText,
+                CompactedItemCount = compactionItems.Count,
+                PreservedTailCount = preservedTailCount
+            }
+        };
+        InsertSessionMessageAfterAnchor(session, compactionResultMessage, requestMessageId, rangeEndMessageId);
+
+        return new CompactionApplyResult(
+            true,
+            null,
+            preCompactionPromptTokens,
+            postPromptTokens,
+            compactionItems.Count,
+            preservedTailCount,
+            resultPreviewText,
+            compactionResultMessage
+        );
+    }
+
     private static List<string> GetPreservedTailContextJson(AiPageSessionRecord session, int preserveRecentTurns)
     {
         if (preserveRecentTurns <= 0)
@@ -3201,11 +3882,10 @@ internal sealed class RuntimeEngine
             return [];
         }
 
-        return GetCompactionEligibleMessages(session)
-            .TakeLast(Math.Max(1, preserveRecentTurns * 2))
-            .Select(message => message.Role == "assistant"
-                ? SerializeAssistantMessageOutputJson(message.Text)
-                : SerializeUserMessageInputJson(message.Origin, message.Text))
+        var eligibleTurns = GetCompactionEligibleTurns(session);
+        return eligibleTurns
+            .TakeLast(GetCompactionPreservedTailTurnCount(eligibleTurns.Count, preserveRecentTurns))
+            .SelectMany(GetCanonicalContextItemsForTurn)
             .ToList();
     }
 
@@ -3260,7 +3940,7 @@ internal sealed class RuntimeEngine
         string instructions
     )
     {
-        var promptBytes = canonicalContextJsonItems.Sum(item => item.Length) +
+        var promptBytes = canonicalContextJsonItems.Sum(EstimateCanonicalContextPromptBytes) +
                           pendingText.Length +
                           instructions.Length;
         return promptBytes <= 0 ? 0 : (int)Math.Ceiling(promptBytes / 4.0);
@@ -3271,15 +3951,50 @@ internal sealed class RuntimeEngine
 
     internal static int EstimateStatusContextPromptTokens(AiPageSessionRecord session, string instructions)
     {
+        var pendingQueueSnapshot = session.PendingQueue.ToArray();
         var pendingText = session.ActiveItem?.Text ??
                           session.RetryableItem?.Text ??
-                          session.PendingQueue.FirstOrDefault()?.Text ??
+                          pendingQueueSnapshot.FirstOrDefault()?.Text ??
                           string.Empty;
         return EstimatePromptTokenCost(session.CanonicalContextJsonItems, pendingText, instructions);
     }
 
     private static string ResolveCompactionInstructions(AiRuntimeConfig config) =>
         AiCompactionDefaults.ResolveInstructions(config.Compaction.Instructions);
+
+    private static int EstimateCanonicalContextPromptBytes(string itemJson)
+    {
+        if (string.IsNullOrWhiteSpace(itemJson))
+        {
+            return 0;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(itemJson);
+            var itemElement = document.RootElement;
+            return string.Equals(GetOptionalString(itemElement, "type"), "compaction", StringComparison.Ordinal)
+                ? EstimateCompactionPromptBytes(itemElement)
+                : itemJson.Length;
+        }
+        catch (JsonException)
+        {
+            return itemJson.Length;
+        }
+    }
+
+    private static int EstimateCompactionPromptBytes(JsonElement itemElement)
+    {
+        // `/responses/compact` returns an opaque encrypted checkpoint. Estimating it from raw
+        // ciphertext length drastically overstates the prompt cost and causes false rejections.
+        var encryptedContentLength = (GetOptionalString(itemElement, "encrypted_content") ?? string.Empty).Length;
+        if (encryptedContentLength <= 0)
+        {
+            return 0;
+        }
+
+        return Math.Max(256, encryptedContentLength / 2);
+    }
 
     private static List<string> GetOutputItemsAsJsonStrings(JsonElement responseElement)
     {
@@ -3289,6 +4004,23 @@ internal sealed class RuntimeEngine
             foreach (var item in outputProperty.EnumerateArray())
             {
                 outputItems.Add(NormalizeCanonicalContextItemJson(item));
+            }
+        }
+
+        return NormalizeCanonicalContextJsonItems(outputItems);
+    }
+
+    private static List<string> GetCompactionOutputItemsAsJsonStrings(JsonElement responseElement)
+    {
+        var outputItems = new List<string>();
+        if (responseElement.TryGetProperty("output", out var outputProperty) && outputProperty.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in outputProperty.EnumerateArray())
+            {
+                if (string.Equals(GetOptionalString(item, "type"), "compaction", StringComparison.Ordinal))
+                {
+                    outputItems.Add(NormalizeCanonicalContextItemJson(item));
+                }
             }
         }
 
@@ -3322,11 +4054,10 @@ internal sealed class RuntimeEngine
 
         if (textParts.Count > 0)
         {
-            return TrimPreviewText(string.Join(Environment.NewLine + Environment.NewLine, textParts), 1600);
+            return string.Join(Environment.NewLine + Environment.NewLine, textParts).Trim();
         }
 
         var prettyJsonItems = compactedItems
-            .Take(3)
             .Select(itemJson =>
             {
                 try
@@ -3343,7 +4074,7 @@ internal sealed class RuntimeEngine
                 }
             });
 
-        return TrimPreviewText(string.Join(Environment.NewLine + Environment.NewLine, prettyJsonItems), 1600);
+        return string.Join(Environment.NewLine + Environment.NewLine, prettyJsonItems).Trim();
     }
 
     private static string ExtractAssistantText(JsonElement responseElement)
@@ -3379,14 +4110,14 @@ internal sealed class RuntimeEngine
         return string.Concat(parts);
     }
 
-    private static int GetCompactionPreservedTailCount(int eligibleMessageCount, int preserveRecentTurns)
+    private static int GetCompactionPreservedTailTurnCount(int eligibleTurnCount, int preserveRecentTurns)
     {
-        if (eligibleMessageCount <= 0 || preserveRecentTurns <= 0)
+        if (eligibleTurnCount <= 0 || preserveRecentTurns <= 0)
         {
             return 0;
         }
 
-        return Math.Min(eligibleMessageCount, Math.Max(1, preserveRecentTurns * 2));
+        return Math.Min(eligibleTurnCount, preserveRecentTurns);
     }
 
     private static string ExtractOutputItemText(JsonElement outputItem)
@@ -3407,17 +4138,6 @@ internal sealed class RuntimeEngine
         }
 
         return string.Join(Environment.NewLine, parts);
-    }
-
-    private static string TrimPreviewText(string text, int maxLength)
-    {
-        var normalized = text.Trim();
-        if (normalized.Length <= maxLength)
-        {
-            return normalized;
-        }
-
-        return $"{normalized[..Math.Max(0, maxLength - 3)]}...";
     }
 
     private static string? GetResponseId(JsonElement responseElement) =>
@@ -3451,7 +4171,7 @@ internal sealed class RuntimeEngine
         return null;
     }
 
-    private static void ApplyAiConfig(HostJournal journal, OpenAiClient openAiClient, JsonElement payload)
+    private static void ApplyAiConfig(HostJournal journal, IOpenAiClient openAiClient, JsonElement payload)
     {
         if (payload.ValueKind != JsonValueKind.Object || !payload.TryGetProperty("config", out var configElement))
         {
@@ -3542,6 +4262,14 @@ internal sealed class RuntimeEngine
             journal.AiConfig.Retries.MaxDelayMs = GetOptionalInt(retriesElement, "maxDelayMs") ?? journal.AiConfig.Retries.MaxDelayMs;
         }
 
+        if (aiElement.TryGetProperty("queueRetries", out var queueRetriesElement) &&
+            queueRetriesElement.ValueKind == JsonValueKind.Object)
+        {
+            journal.AiConfig.QueueRetries.MaxRetries = GetOptionalInt(queueRetriesElement, "maxRetries") ?? journal.AiConfig.QueueRetries.MaxRetries;
+            journal.AiConfig.QueueRetries.BaseDelayMs = GetOptionalInt(queueRetriesElement, "baseDelayMs") ?? journal.AiConfig.QueueRetries.BaseDelayMs;
+            journal.AiConfig.QueueRetries.MaxDelayMs = GetOptionalInt(queueRetriesElement, "maxDelayMs") ?? journal.AiConfig.QueueRetries.MaxDelayMs;
+        }
+
         if (aiElement.TryGetProperty("rateLimits", out var rateLimitElement) && rateLimitElement.ValueKind == JsonValueKind.Object)
         {
             journal.AiConfig.RateLimits.ReserveOutputTokens = GetOptionalInt(rateLimitElement, "reserveOutputTokens") ?? journal.AiConfig.RateLimits.ReserveOutputTokens;
@@ -3576,6 +4304,7 @@ internal sealed class RuntimeEngine
     {
         var status = BuildAiStatusPayload(session);
         var queue = GetQueueSnapshot(session);
+        var messages = session.Messages.ToArray();
         return new
         {
             pageKey = session.PageKey,
@@ -3590,7 +4319,7 @@ internal sealed class RuntimeEngine
             recoverable = session.Recoverable,
             lastCheckpointAt = session.LastCheckpointAt,
             lastError = session.LastError,
-            messages = session.Messages.Select(BuildAiMessagePayload).ToArray(),
+            messages = messages.Select(BuildAiMessagePayload).ToArray(),
             queue = queue.Select(BuildAiQueuePayload).ToArray(),
             status
         };
@@ -3619,7 +4348,8 @@ internal sealed class RuntimeEngine
         var currentModelSelection = NormalizeModelSelection(_journal.AiConfig.Chat.Model);
         var currentModel = GetConfiguredModelId(currentModelSelection);
         var currentModelBudget = GetModelBudgetLocked(currentModel);
-        var modelBudgets = _journal.ModelBudgets.Values
+        var modelBudgetEntries = _journal.ModelBudgets.Values.ToArray();
+        var modelBudgets = modelBudgetEntries
             .OrderBy(entry => entry.Model, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(
                 entry => entry.Model,
@@ -3697,6 +4427,7 @@ internal sealed class RuntimeEngine
         createdAt = item?.CreatedAt ?? DateTimeOffset.UtcNow.ToString("O"),
         state = item?.State ?? "queued",
         attemptCount = item?.AttemptCount ?? 0,
+        retryPolicyScope = NormalizeRetryPolicyScope(item?.RetryPolicyScope),
         nextRetryAt = NormalizeOptionalIsoTimestamp(item?.NotBeforeAt)
     };
 
@@ -3906,13 +4637,42 @@ internal sealed class RuntimeEngine
         );
     }
 
+    private async Task EmitProviderRequestLogAsync(
+        string eventName,
+        string endpoint,
+        string pageKey,
+        string requestId,
+        object payload,
+        CancellationToken cancellationToken,
+        string? correlationId = null
+    )
+    {
+        await EmitLogAsync(
+            "info",
+            eventName,
+            "Outgoing OpenAI provider request payload.",
+            new
+            {
+                pageKey,
+                requestId,
+                method = "POST",
+                endpoint,
+                body = JsonSerializer.SerializeToElement(payload)
+            },
+            cancellationToken,
+            correlationId,
+            collapsedByDefault: true
+        );
+    }
+
     private async Task EmitLogAsync(
         string level,
         string eventName,
         string summary,
         object? details,
         CancellationToken cancellationToken,
-        string? correlationId = null
+        string? correlationId = null,
+        bool? collapsedByDefault = null
     )
     {
         var now = NowIso();
@@ -3943,7 +4703,7 @@ internal sealed class RuntimeEngine
                     summary,
                     details,
                     correlationId,
-                    collapsedByDefault = summary.Length > 160 || serializedDetails.Length > 160
+                    collapsedByDefault = collapsedByDefault ?? (summary.Length > 160 || serializedDetails.Length > 160)
                 }
             },
             cancellationToken

@@ -8,12 +8,15 @@ import {
   createEmptyAiModelBudgetState,
   formatAiPromptCachePercent,
   getAiCompactedBy,
+  getAiMessageDisplayText,
   getAiCompactionRequestMeta,
   getAiCompactionResultMeta,
   isAiConversationalKind,
+  isScrollPinnedToBottom,
   isAiTranscriptKind,
   normalizeAiModelSelection,
   normalizeAllowedModelRules,
+  orderAiTranscriptMessages,
   type AiChatMessage,
   type AiEventKind
 } from "../../extension/src/shared/ai";
@@ -257,6 +260,50 @@ describe("AI transcript builder", () => {
     expect(items.map((item) => item.type)).toEqual(["system-prompt", "message", "message"]);
   });
 
+  it("reorders broken queue history into request-aligned turns", () => {
+    const ordered = orderAiTranscriptMessages([
+      createMessage({
+        id: "user-1",
+        requestId: "req-1",
+        kind: "user",
+        origin: "user",
+        role: "user",
+        text: "question-1"
+      }),
+      createMessage({
+        id: "user-2",
+        requestId: "req-2",
+        kind: "user",
+        origin: "user",
+        role: "user",
+        text: "question-2"
+      }),
+      createMessage({
+        id: "assistant-1",
+        requestId: "req-1",
+        kind: "assistant",
+        origin: "assistant",
+        role: "assistant",
+        text: "answer-1"
+      }),
+      createMessage({
+        id: "assistant-2",
+        requestId: "req-2",
+        kind: "assistant",
+        origin: "assistant",
+        role: "assistant",
+        text: "answer-2"
+      })
+    ]);
+
+    expect(ordered.map((message) => message.id)).toEqual([
+      "user-1",
+      "assistant-1",
+      "user-2",
+      "assistant-2"
+    ]);
+  });
+
   it("drops non-transcript service events", () => {
     const items = buildAiChatTranscriptItems(
       [
@@ -420,6 +467,315 @@ describe("AI transcript builder", () => {
     ]);
   });
 
+  it("reanchors compaction events after the compacted range instead of leaving them at the transcript tail", () => {
+    const items = buildAiChatTranscriptItems(
+      [
+        createMessage({
+          id: "user-1",
+          requestId: "req-1",
+          kind: "user",
+          origin: "user",
+          role: "user",
+          text: "question-1",
+          meta: { compactedBy: "cmp-1" }
+        }),
+        createMessage({
+          id: "assistant-1",
+          requestId: "req-1",
+          kind: "assistant",
+          origin: "assistant",
+          role: "assistant",
+          text: "answer-1",
+          meta: { compactedBy: "cmp-1" }
+        }),
+        createMessage({
+          id: "user-2",
+          requestId: "req-2",
+          kind: "user",
+          origin: "user",
+          role: "user",
+          text: "question-2"
+        }),
+        createMessage({
+          id: "assistant-2",
+          requestId: "req-2",
+          kind: "assistant",
+          origin: "assistant",
+          role: "assistant",
+          text: "answer-2"
+        }),
+        createMessage({
+          id: "user-3",
+          requestId: "req-3",
+          kind: "user",
+          origin: "user",
+          role: "user",
+          text: "question-3"
+        }),
+        createMessage({
+          id: "assistant-3",
+          requestId: "req-3",
+          kind: "assistant",
+          origin: "assistant",
+          role: "assistant",
+          text: ""
+        }),
+        createMessage({
+          id: "cmp-req",
+          requestId: "req-3",
+          kind: "compaction-request",
+          origin: "system",
+          role: "system",
+          text: "compress",
+          meta: {
+            compactionId: "cmp-1",
+            affectedMessageIds: ["user-1", "assistant-1"],
+            rangeStartMessageId: "user-1",
+            rangeEndMessageId: "assistant-1",
+            instructionsText: "shrink"
+          }
+        }),
+        createMessage({
+          id: "cmp-res",
+          requestId: "req-3",
+          kind: "compaction-result",
+          origin: "system",
+          role: "system",
+          text: "done",
+          meta: {
+            compactionId: "cmp-1",
+            affectedMessageIds: ["user-1", "assistant-1"],
+            rangeStartMessageId: "user-1",
+            rangeEndMessageId: "assistant-1",
+            resultPreviewText: "full summary",
+            compactedItemCount: 1,
+            preservedTailCount: 2
+          }
+        })
+      ],
+      "prompt"
+    );
+
+    expect(items.map((item) => item.type)).toEqual([
+      "system-prompt",
+      "compacted-range",
+      "compaction-request",
+      "compaction-result",
+      "message",
+      "message",
+      "message",
+      "message"
+    ]);
+  });
+
+  it("keeps one compacted range when a rejected compaction attempt appears before the successful one", () => {
+    const items = buildAiChatTranscriptItems(
+      [
+        createMessage({
+          id: "user-1",
+          requestId: "req-1",
+          kind: "user",
+          origin: "user",
+          role: "user",
+          text: "question-1",
+          meta: { compactedBy: "cmp-success" }
+        }),
+        createMessage({
+          id: "assistant-1",
+          requestId: "req-1",
+          kind: "assistant",
+          origin: "assistant",
+          role: "assistant",
+          text: "answer-1",
+          meta: { compactedBy: "cmp-success" }
+        }),
+        createMessage({
+          id: "user-2",
+          requestId: "req-2",
+          kind: "user",
+          origin: "user",
+          role: "user",
+          text: "question-2",
+          meta: { compactedBy: "cmp-success" }
+        }),
+        createMessage({
+          id: "assistant-2",
+          requestId: "req-2",
+          kind: "assistant",
+          origin: "assistant",
+          role: "assistant",
+          text: "answer-2",
+          meta: { compactedBy: "cmp-success" }
+        }),
+        createMessage({
+          id: "user-3",
+          requestId: "req-3",
+          kind: "user",
+          origin: "user",
+          role: "user",
+          text: "question-3",
+          meta: { compactedBy: "cmp-success" }
+        }),
+        createMessage({
+          id: "assistant-3",
+          requestId: "req-3",
+          kind: "assistant",
+          origin: "assistant",
+          role: "assistant",
+          text: "answer-3",
+          meta: { compactedBy: "cmp-success" }
+        }),
+        createMessage({
+          id: "cmp-req-rejected",
+          requestId: "req-4",
+          kind: "compaction-request",
+          origin: "system",
+          role: "system",
+          text: "rejected",
+          meta: {
+            compactionId: "cmp-rejected",
+            affectedMessageIds: ["user-1", "assistant-1", "user-2", "assistant-2", "user-3", "assistant-3"],
+            rangeStartMessageId: "user-1",
+            rangeEndMessageId: "assistant-3",
+            instructionsText: "shrink"
+          }
+        }),
+        createMessage({
+          id: "user-4",
+          requestId: "req-4",
+          kind: "user",
+          origin: "user",
+          role: "user",
+          text: "question-4",
+          meta: { compactedBy: "cmp-success" }
+        }),
+        createMessage({
+          id: "assistant-4",
+          requestId: "req-4",
+          kind: "assistant",
+          origin: "assistant",
+          role: "assistant",
+          text: "answer-4",
+          meta: { compactedBy: "cmp-success" }
+        }),
+        createMessage({
+          id: "user-5",
+          requestId: "req-5",
+          kind: "user",
+          origin: "user",
+          role: "user",
+          text: "question-5",
+          meta: { compactedBy: "cmp-success" }
+        }),
+        createMessage({
+          id: "assistant-5",
+          requestId: "req-5",
+          kind: "assistant",
+          origin: "assistant",
+          role: "assistant",
+          text: "answer-5",
+          meta: { compactedBy: "cmp-success" }
+        }),
+        createMessage({
+          id: "cmp-req-success",
+          requestId: "req-6",
+          kind: "compaction-request",
+          origin: "system",
+          role: "system",
+          text: "compress",
+          meta: {
+            compactionId: "cmp-success",
+            affectedMessageIds: [
+              "user-1",
+              "assistant-1",
+              "user-2",
+              "assistant-2",
+              "user-3",
+              "assistant-3",
+              "user-4",
+              "assistant-4",
+              "user-5",
+              "assistant-5"
+            ],
+            rangeStartMessageId: "user-1",
+            rangeEndMessageId: "assistant-5",
+            instructionsText: "shrink"
+          }
+        }),
+        createMessage({
+          id: "cmp-res-success",
+          requestId: "req-6",
+          kind: "compaction-result",
+          origin: "system",
+          role: "system",
+          text: "done",
+          meta: {
+            compactionId: "cmp-success",
+            affectedMessageIds: [
+              "user-1",
+              "assistant-1",
+              "user-2",
+              "assistant-2",
+              "user-3",
+              "assistant-3",
+              "user-4",
+              "assistant-4",
+              "user-5",
+              "assistant-5"
+            ],
+            rangeStartMessageId: "user-1",
+            rangeEndMessageId: "assistant-5",
+            resultPreviewText: "full summary",
+            compactedItemCount: 1,
+            preservedTailCount: 0
+          }
+        }),
+        createMessage({
+          id: "user-6",
+          requestId: "req-6",
+          kind: "user",
+          origin: "user",
+          role: "user",
+          text: "question-6"
+        }),
+        createMessage({
+          id: "assistant-6",
+          requestId: "req-6",
+          kind: "assistant",
+          origin: "assistant",
+          role: "assistant",
+          text: "answer-6"
+        })
+      ],
+      "prompt"
+    );
+
+    expect(items.map((item) => item.type)).toEqual([
+      "system-prompt",
+      "compacted-range",
+      "compaction-request",
+      "compaction-request",
+      "compaction-result",
+      "message",
+      "message"
+    ]);
+
+    const compactedRanges = items.filter((item) => item.type === "compacted-range");
+    expect(compactedRanges).toHaveLength(1);
+    expect(compactedRanges[0]?.messages.map((message) => message.id)).toEqual([
+      "user-1",
+      "assistant-1",
+      "user-2",
+      "assistant-2",
+      "user-3",
+      "assistant-3",
+      "user-4",
+      "assistant-4",
+      "user-5",
+      "assistant-5"
+    ]);
+  });
+
   it("keeps legacy compaction messages visible as plain messages", () => {
     const items = buildAiChatTranscriptItems(
       [
@@ -435,6 +791,109 @@ describe("AI transcript builder", () => {
     );
 
     expect(items.map((item) => item.type)).toEqual(["system-prompt", "message"]);
+  });
+
+  it("groups compacted ranges by full turns even when raw messages are split", () => {
+    const items = buildAiChatTranscriptItems(
+      [
+        createMessage({
+          id: "user-1",
+          requestId: "req-1",
+          kind: "user",
+          origin: "user",
+          role: "user",
+          text: "question-1",
+          meta: { compactedBy: "cmp-1" }
+        }),
+        createMessage({
+          id: "user-2",
+          requestId: "req-2",
+          kind: "user",
+          origin: "user",
+          role: "user",
+          text: "question-2",
+          meta: { compactedBy: "cmp-2" }
+        }),
+        createMessage({
+          id: "assistant-1",
+          requestId: "req-1",
+          kind: "assistant",
+          origin: "assistant",
+          role: "assistant",
+          text: "answer-1",
+          meta: { compactedBy: "cmp-1" }
+        }),
+        createMessage({
+          id: "assistant-2",
+          requestId: "req-2",
+          kind: "assistant",
+          origin: "assistant",
+          role: "assistant",
+          text: "answer-2",
+          meta: { compactedBy: "cmp-2" }
+        })
+      ],
+      "prompt"
+    );
+
+    const ranges = items.filter((item) => item.type === "compacted-range");
+    expect(ranges).toHaveLength(2);
+    expect(ranges[0]?.type === "compacted-range" ? ranges[0].messages.map((message) => message.id) : []).toEqual([
+      "user-1",
+      "assistant-1"
+    ]);
+    expect(ranges[1]?.type === "compacted-range" ? ranges[1].messages.map((message) => message.id) : []).toEqual([
+      "user-2",
+      "assistant-2"
+    ]);
+  });
+});
+
+describe("AI assistant placeholders and scroll helpers", () => {
+  it("renders fallback text for empty assistant placeholders", () => {
+    expect(
+      getAiMessageDisplayText(
+        createMessage({
+          id: "assistant-pending",
+          kind: "assistant",
+          origin: "assistant",
+          role: "assistant",
+          text: "",
+          state: "pending"
+        })
+      )
+    ).toBe("Ожидание ответа…");
+
+    expect(
+      getAiMessageDisplayText(
+        createMessage({
+          id: "assistant-streaming",
+          kind: "assistant",
+          origin: "assistant",
+          role: "assistant",
+          text: "",
+          state: "streaming"
+        })
+      )
+    ).toBe("…");
+
+    expect(
+      getAiMessageDisplayText(
+        createMessage({
+          id: "assistant-error",
+          kind: "assistant",
+          origin: "assistant",
+          role: "assistant",
+          text: "",
+          state: "error"
+        })
+      )
+    ).toBe("Ответ не получен.");
+  });
+
+  it("detects whether the chat feed is pinned to the bottom", () => {
+    expect(isScrollPinnedToBottom(1000, 776, 200)).toBe(true);
+    expect(isScrollPinnedToBottom(1000, 700, 200)).toBe(false);
   });
 });
 

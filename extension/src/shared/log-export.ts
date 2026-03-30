@@ -47,6 +47,7 @@ export type SafeAiConfigSnapshot = {
   compaction: ExtensionConfig["ai"]["compaction"];
   promptCaching: ExtensionConfig["ai"]["promptCaching"];
   retries: ExtensionConfig["ai"]["retries"];
+  queueRetries: ExtensionConfig["ai"]["queueRetries"];
   rateLimits: ExtensionConfig["ai"]["rateLimits"];
 };
 
@@ -75,6 +76,9 @@ function cloneSafeAiConfig(config: ExtensionConfig | null): SafeAiConfigSnapshot
     },
     retries: {
       ...config.ai.retries
+    },
+    queueRetries: {
+      ...config.ai.queueRetries
     },
     rateLimits: {
       ...config.ai.rateLimits

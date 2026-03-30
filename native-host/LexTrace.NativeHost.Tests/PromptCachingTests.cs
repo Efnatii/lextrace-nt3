@@ -87,6 +87,22 @@ public sealed class PromptCachingTests
         Assert.Equal(explicitRequest.CacheKey, fallbackRequest.CacheKey);
     }
 
+    [Fact]
+    public void ResolveChatRequestChangesCacheKeyWhenStructuredDescriptionChanges()
+    {
+        var config = CreateConfig("gpt-5-mini", PromptCaching.RetentionInMemory);
+        var session = new AiPageSessionRecord
+        {
+            PageKey = "https://example.com/page"
+        };
+
+        var first = PromptCaching.ResolveChatRequest(config, session, config.Chat.Model);
+        config.Chat.StructuredOutput.Description = "Updated description that changes the prompt prefix.";
+        var second = PromptCaching.ResolveChatRequest(config, session, config.Chat.Model);
+
+        Assert.NotEqual(first.CacheKey, second.CacheKey);
+    }
+
     [Theory]
     [InlineData(512, 0, PromptCaching.StatusBelowThreshold)]
     [InlineData(2048, 0, PromptCaching.StatusMiss)]

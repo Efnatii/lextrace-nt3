@@ -7,6 +7,8 @@
   createDefaultAiStatus,
   formatAiEventKindLabel,
   formatAiMessageOriginLabel,
+  getAiMessageDisplayText,
+  isScrollPinnedToBottom,
   normalizeAllowedModelRules,
   type AiAllowedModelRule,
   type AiChatMessage,
@@ -18,7 +20,7 @@
 } from "../shared/ai";
 import { isAiModelTierAvailable } from "../shared/ai-model-catalog";
 import { parseAiQueueImportJson } from "../shared/ai-queue-import";
-import { COMMANDS } from "../shared/constants";
+import { COMMANDS, STORAGE_KEYS } from "../shared/constants";
 import { connectRuntimeStream, formatUserFacingCommandError, recordLog, sendCommand } from "../shared/client";
 import {
   buildConfigPatchFromPath,
@@ -28,7 +30,15 @@ import {
   parseConfigFieldDraft,
   readConfigValue
 } from "../shared/config-fields";
-import { defaultConfig, ExtensionConfigSchema, type ExtensionConfig, type ExtensionConfigPatch, type OverlayTab, type PopupTab } from "../shared/config";
+import {
+  defaultConfig,
+  ExtensionConfigSchema,
+  type ExtensionConfig,
+  type ExtensionConfigPatch,
+  type OverlayTab,
+  type PopupTab,
+  type TextAutoScanMode
+} from "../shared/config";
 import { LogEntrySchema, serializeLogDetails, type LogEntry } from "../shared/logging";
 import {
   buildChatLogExportPayload,
@@ -41,6 +51,14 @@ import {
   type OverlayConsoleEntryKind
 } from "../shared/overlay-feed";
 import {
+  clampOverlayGeometryToViewport,
+  getCenteredOverlayPosition,
+  resizeOverlayGeometry,
+  type OverlayGeometry,
+  type OverlayResizeHandle,
+  type OverlayViewport
+} from "../shared/overlay";
+import {
   createErrorResponse,
   createOkResponse,
   validateEnvelope,
@@ -49,6 +67,39 @@ import {
 } from "../shared/protocol";
 import { normalizePageKey, shortenPageKey } from "../shared/page";
 import { parseRuntimeWorkerStatus, type WorkerStatus } from "../shared/runtime-state";
+import {
+  areTextBindingListsEquivalentForPersistence,
+  areTextBindingsEquivalentForPersistence,
+  buildInlineTextEditorGeometry,
+  buildControlTextLayoutRects,
+  buildTextBindingId,
+  buildTextMapSummary,
+  buildTextRectUnion,
+  categorizeTextElement,
+  createEmptyTextPageMap,
+  createEmptyTextStorageEnvelope,
+  formatTextMapExportFileName,
+  mapBindingsToCandidateIndices,
+  matchBindingToCandidate,
+  mergeTextPageMapWithCandidates,
+  normalizeTextForBinding,
+  isTextBindingAttributeVisuallyRenderable,
+  removeBindingFromPageMap,
+  removePageMapFromEnvelope,
+  resetPageBindings,
+  resolveDisplayedBindingText,
+  sanitizeReplacementText,
+  TextBindingRecordSchema,
+  TextStorageEnvelopeSchema,
+  updateBindingReplacement,
+  upsertPageMapInEnvelope,
+  type TextBindingRecord,
+  type TextDisplayMode,
+  type TextPageMap,
+  type TextRectSnapshot,
+  type TextScanCandidate,
+  type TextStorageEnvelope
+} from "../shared/text-elements";
 import {
   buildStatusChipDescriptors,
   type StatusChipDescriptor,
@@ -89,6 +140,18 @@ type TerminalExecutionResult = {
 };
 
 const SVG_NS = "http://www.w3.org/2000/svg";
+const OVERLAY_MIN_WIDTH = 480;
+const OVERLAY_MIN_HEIGHT = 320;
+const RESIZE_HANDLE_CURSOR: Record<OverlayResizeHandle, string> = {
+  n: "ns-resize",
+  s: "ns-resize",
+  e: "ew-resize",
+  w: "ew-resize",
+  ne: "nesw-resize",
+  sw: "nesw-resize",
+  nw: "nwse-resize",
+  se: "nwse-resize"
+};
 const STATUS_DOWNLOAD_ICON: StatusChipIcon = {
   viewBox: "0 0 16 16",
   paths: [
@@ -187,6 +250,493 @@ function createStatusRowShell(
   return fragment;
 }
 
+function getStatusDescriptorSignature(descriptors: readonly StatusChipDescriptor[]): string {
+  return descriptors
+    .map((descriptor) =>
+      [descriptor.key, descriptor.value, descriptor.fullValue, descriptor.tooltipLabel, descriptor.width].join("\u001f")
+    )
+    .join("\u001e");
+}
+
+type TextRuntimeTarget = {
+  bindingId: string | null;
+  element: HTMLElement;
+  highlightElement: HTMLElement;
+  styleElement: HTMLElement;
+  attributeName: string | null;
+  textNode: Text | null;
+  readCurrentText: () => string;
+  applyRenderedText: (value: string) => void;
+  getOriginalText: () => string;
+  getClientRects: () => TextRectSnapshot[];
+  getBoundingClientRect: () => TextRectSnapshot | null;
+};
+
+type LiveTextCandidate = {
+  candidate: TextScanCandidate;
+  target: TextRuntimeTarget;
+};
+
+const TEXT_SCAN_ICON: StatusChipIcon = {
+  viewBox: "0 0 16 16",
+  paths: [
+    { d: "M13 13 10.5 10.5" },
+    { d: "M7.25 11.5a4.25 4.25 0 1 1 0-8.5 4.25 4.25 0 0 1 0 8.5Z" }
+  ]
+};
+
+const TEXT_RESET_ICON: StatusChipIcon = {
+  viewBox: "0 0 16 16",
+  paths: [
+    { d: "M5 3.75H2.5v2.5" },
+    { d: "M2.75 6.25A5.25 5.25 0 1 0 4.5 3.9" }
+  ]
+};
+
+const TEXT_EDIT_ICON: StatusChipIcon = {
+  viewBox: "0 0 16 16",
+  paths: [
+    { d: "M3 11.75 3.5 9.25 9.75 3 12.5 5.75 6.25 12 3 11.75Z" },
+    { d: "M8.75 4 11.5 6.75" }
+  ]
+};
+
+const TEXT_DELETE_ICON: StatusChipIcon = {
+  viewBox: "0 0 16 16",
+  paths: [
+    { d: "M3.25 4.5h9.5" },
+    { d: "M6 4.5V3.25h4v1.25" },
+    { d: "M4.5 4.5 5 13h6l.5-8.5" },
+    { d: "M6.5 6.5v4.5" },
+    { d: "M9.5 6.5v4.5" }
+  ]
+};
+
+const TEXT_DOWNLOAD_ICON = STATUS_DOWNLOAD_ICON;
+const TEXT_HOST_TAG_NAMES = new Set([
+  "a",
+  "button",
+  "caption",
+  "figcaption",
+  "h1",
+  "h2",
+  "h3",
+  "h4",
+  "h5",
+  "h6",
+  "label",
+  "legend",
+  "li",
+  "option",
+  "p",
+  "summary",
+  "td",
+  "th"
+]);
+const TEXT_INLINE_WRAPPER_TAG_NAMES = new Set([
+  "abbr",
+  "b",
+  "cite",
+  "code",
+  "em",
+  "i",
+  "kbd",
+  "mark",
+  "s",
+  "small",
+  "span",
+  "strong",
+  "sub",
+  "sup",
+  "time",
+  "u"
+]);
+
+function createToolIconButton(options: {
+  tooltip: string;
+  icon: StatusChipIcon;
+  dataRole: string;
+  disabled?: boolean;
+  onClick: () => void;
+}): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "tool-icon";
+  button.dataset.role = options.dataRole;
+  button.disabled = options.disabled ?? false;
+  button.setAttribute("data-tooltip", options.tooltip);
+  button.setAttribute("aria-label", options.tooltip);
+  button.append(createStatusChipIcon(options.icon));
+  button.addEventListener("click", options.onClick);
+  return button;
+}
+
+function truncateTextPreview(value: string, maxLength = 180): string {
+  const trimmed = value.trim();
+  if (trimmed.length <= maxLength) {
+    return trimmed;
+  }
+
+  return `${trimmed.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+}
+
+function isTextDebugSkippableElement(element: Element): boolean {
+  const tagName = element.tagName.toLowerCase();
+  return (
+    tagName === "script" ||
+    tagName === "style" ||
+    tagName === "noscript" ||
+    tagName === "template" ||
+    tagName === "iframe" ||
+    tagName === "svg"
+  );
+}
+
+function isTextDebugVisibleElement(element: HTMLElement): boolean {
+  if (!element.isConnected) {
+    return false;
+  }
+
+  if (element.hidden) {
+    return false;
+  }
+
+  if (element.closest("[hidden]")) {
+    return false;
+  }
+
+  if (typeof element.checkVisibility === "function") {
+    try {
+      if (
+        !element.checkVisibility({
+          checkOpacity: true,
+          checkVisibilityCSS: true,
+          contentVisibilityAuto: true
+        })
+      ) {
+        return false;
+      }
+    } catch {
+      // Ignore unsupported option sets and fall back to manual checks below.
+    }
+  }
+
+  const style = window.getComputedStyle(element);
+  if (
+    style.display === "none" ||
+    style.visibility === "hidden" ||
+    style.visibility === "collapse" ||
+    style.contentVisibility === "hidden" ||
+    Number.parseFloat(style.opacity || "1") <= 0.01
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function getTextDebugStableAttributeEntries(element: Element): Array<[string, string]> {
+  const stableAttributeNames = ["id", "data-testid", "data-test", "data-qa", "name", "role", "aria-label"];
+  return stableAttributeNames
+    .map((name) => [name, element.getAttribute(name)] as const)
+    .filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].trim().length > 0);
+}
+
+function getTextDebugStableAttributes(element: Element): Record<string, string> {
+  return Object.fromEntries(getTextDebugStableAttributeEntries(element));
+}
+
+function isUniqueTextSelector(element: Element, selector: string): boolean {
+  const rootNode = element.getRootNode();
+  const queryRoot =
+    rootNode instanceof Document || rootNode instanceof ShadowRoot
+      ? rootNode
+      : element.ownerDocument;
+  if (!queryRoot) {
+    return false;
+  }
+
+  try {
+    return queryRoot.querySelectorAll(selector).length === 1;
+  } catch {
+    return false;
+  }
+}
+
+function buildPreferredTextSelector(element: Element): string | null {
+  if (element.id) {
+    const idSelector = `#${CSS.escape(element.id)}`;
+    if (isUniqueTextSelector(element, idSelector)) {
+      return idSelector;
+    }
+  }
+
+  for (const stableAttribute of getTextDebugStableAttributeEntries(element)) {
+    const selector = `${element.tagName.toLowerCase()}[${stableAttribute[0]}="${CSS.escape(stableAttribute[1])}"]`;
+    if (isUniqueTextSelector(element, selector)) {
+      return selector;
+    }
+  }
+
+  return null;
+}
+
+function buildElementSelectorPath(element: Element, maxDepth = 6): string | null {
+  const segments: string[] = [];
+  let current: Element | null = element;
+
+  while (current && current instanceof HTMLElement && segments.length < maxDepth) {
+    const preferredSelector = buildPreferredTextSelector(current);
+    if (preferredSelector) {
+      segments.unshift(preferredSelector);
+      return segments.join(" > ");
+    }
+
+    const tagName = current.tagName.toLowerCase();
+    const parentElement: HTMLElement | null = current.parentElement;
+    if (!parentElement) {
+      segments.unshift(tagName);
+      return segments.join(" > ");
+    }
+
+    const siblings = Array.from(parentElement.children).filter(
+      (candidate: Element) => candidate.tagName.toLowerCase() === tagName
+    );
+    const siblingIndex = siblings.indexOf(current) + 1;
+    const segment = siblings.length > 1 ? `${tagName}:nth-of-type(${siblingIndex})` : tagName;
+    segments.unshift(segment);
+    current = parentElement;
+  }
+
+  return segments.length > 0 ? segments.join(" > ") : null;
+}
+
+function buildAncestorSelector(element: HTMLElement): string | null {
+  let current = element.parentElement;
+  while (current) {
+    const preferredSelector = buildPreferredTextSelector(current);
+    if (preferredSelector) {
+      return preferredSelector;
+    }
+    current = current.parentElement;
+  }
+
+  return buildElementSelectorPath(element.parentElement ?? element);
+}
+
+function isSemanticTextHostElement(element: HTMLElement): boolean {
+  const tagName = element.tagName.toLowerCase();
+  const role = element.getAttribute("role")?.trim().toLowerCase() ?? "";
+  return TEXT_HOST_TAG_NAMES.has(tagName) || role === "button" || role === "heading" || role === "link";
+}
+
+function resolveTextBindingHostElement(element: HTMLElement): HTMLElement {
+  let current = element;
+  let parent = current.parentElement;
+  while (parent) {
+    if (isSemanticTextHostElement(parent)) {
+      return parent;
+    }
+
+    if (!TEXT_INLINE_WRAPPER_TAG_NAMES.has(current.tagName.toLowerCase())) {
+      break;
+    }
+
+    if (!TEXT_INLINE_WRAPPER_TAG_NAMES.has(parent.tagName.toLowerCase())) {
+      break;
+    }
+
+    current = parent;
+    parent = current.parentElement;
+  }
+
+  return element;
+}
+
+function resolveTextHighlightElement(element: HTMLElement): HTMLElement {
+  let current = element;
+  while (current.parentElement) {
+    const rect = current.getBoundingClientRect();
+    const style = window.getComputedStyle(current);
+    const hasVisibleBox = rect.width >= 2 || rect.height >= 2;
+    if (hasVisibleBox && style.display !== "contents") {
+      return current;
+    }
+
+    current = current.parentElement;
+  }
+
+  return current;
+}
+
+function snapshotClientRect(rect: Pick<DOMRectReadOnly, "left" | "top" | "width" | "height">): TextRectSnapshot {
+  return {
+    left: rect.left,
+    top: rect.top,
+    width: rect.width,
+    height: rect.height
+  };
+}
+
+function isRenderableTextRect(rect: TextRectSnapshot | null | undefined): rect is TextRectSnapshot {
+  return Boolean(rect && rect.width > 0 && rect.height > 0);
+}
+
+function isViewportRenderableTextRect(rect: TextRectSnapshot, margin = 32): boolean {
+  return (
+    rect.left + rect.width >= -margin &&
+    rect.top + rect.height >= -margin &&
+    rect.left <= window.innerWidth + margin &&
+    rect.top <= window.innerHeight + margin
+  );
+}
+
+function getRenderableElementClientRects(element: HTMLElement): TextRectSnapshot[] {
+  return Array.from(element.getClientRects())
+    .map((rect) => snapshotClientRect(rect))
+    .filter((rect) => isRenderableTextRect(rect));
+}
+
+function getRenderableTextNodeClientRects(textNode: Text): TextRectSnapshot[] {
+  if (!textNode.isConnected) {
+    return [];
+  }
+
+  const range = document.createRange();
+  range.selectNodeContents(textNode);
+  const clientRects = Array.from(range.getClientRects())
+    .map((rect) => snapshotClientRect(rect))
+    .filter((rect) => isRenderableTextRect(rect));
+  if (clientRects.length > 0) {
+    return clientRects;
+  }
+
+  const boundingRect = snapshotClientRect(range.getBoundingClientRect());
+  return isRenderableTextRect(boundingRect) ? [boundingRect] : [];
+}
+
+function isRuntimeTargetVisuallyRenderable(target: TextRuntimeTarget): boolean {
+  return isTextBindingAttributeVisuallyRenderable(target.attributeName);
+}
+
+function parseCssPixelValue(value: string | null | undefined): number {
+  if (!value) {
+    return 0;
+  }
+
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+let textMeasureCanvasContext: CanvasRenderingContext2D | null = null;
+
+function getTextMeasureCanvasContext(): CanvasRenderingContext2D | null {
+  if (textMeasureCanvasContext) {
+    return textMeasureCanvasContext;
+  }
+
+  const canvas = document.createElement("canvas");
+  textMeasureCanvasContext = canvas.getContext("2d");
+  return textMeasureCanvasContext;
+}
+
+function measureRenderedTextWidth(text: string, style: CSSStyleDeclaration): number {
+  if (!text) {
+    return 0;
+  }
+
+  const context = getTextMeasureCanvasContext();
+  if (!context) {
+    return Math.max(1, text.length * 8);
+  }
+
+  context.font = style.font || `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+  const metrics = context.measureText(text);
+  const letterSpacing = parseCssPixelValue(style.letterSpacing);
+  return metrics.width + Math.max(0, text.length - 1) * Math.max(0, letterSpacing);
+}
+
+function mapTextAlignForControl(value: string): "left" | "center" | "right" {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "center") {
+    return "center";
+  }
+  if (normalized === "right" || normalized === "end") {
+    return "right";
+  }
+  return "left";
+}
+
+function measureFormControlTextRects(
+  element: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement,
+  attributeName: string,
+  text: string
+): TextRectSnapshot[] {
+  const controlRect = element.getBoundingClientRect();
+  if (!isRenderableTextRect(snapshotClientRect(controlRect))) {
+    return [];
+  }
+
+  if (attributeName === "placeholder" && element.value.length > 0) {
+    return [];
+  }
+
+  if (attributeName === "value" && element.value.length === 0) {
+    return [];
+  }
+
+  const style = window.getComputedStyle(element);
+  const fontSize = parseCssPixelValue(style.fontSize) || 13;
+  const lineHeight = parseCssPixelValue(style.lineHeight) || Math.round(fontSize * 1.2);
+  const lines = (element instanceof HTMLTextAreaElement ? text : text.replace(/\r?\n/g, " "))
+    .split(/\r?\n/)
+    .map((line) => line.length > 0 ? line : " ");
+  const lineWidths = lines.map((line) => measureRenderedTextWidth(line, style));
+
+  return buildControlTextLayoutRects({
+    elementRect: snapshotClientRect(controlRect),
+    borderLeft: parseCssPixelValue(style.borderLeftWidth),
+    borderTop: parseCssPixelValue(style.borderTopWidth),
+    borderRight: parseCssPixelValue(style.borderRightWidth),
+    borderBottom: parseCssPixelValue(style.borderBottomWidth),
+    paddingLeft: parseCssPixelValue(style.paddingLeft),
+    paddingTop: parseCssPixelValue(style.paddingTop),
+    paddingRight: parseCssPixelValue(style.paddingRight),
+    paddingBottom: parseCssPixelValue(style.paddingBottom),
+    lineHeight,
+    lineWidths,
+    multiline: element instanceof HTMLTextAreaElement,
+    textAlign: mapTextAlignForControl(style.textAlign),
+    scrollLeft: element.scrollLeft,
+    scrollTop: element.scrollTop
+  }).filter((rect) => isRenderableTextRect(rect));
+}
+
+function getElementTextNodeIndexWithinHost(hostElement: HTMLElement, node: Text): number {
+  const walker = document.createTreeWalker(hostElement, NodeFilter.SHOW_TEXT);
+  let index = 0;
+  let currentNode = walker.nextNode();
+  while (currentNode) {
+    if (currentNode instanceof Text) {
+      const parentElement = currentNode.parentElement;
+      if (
+        parentElement &&
+        !isTextDebugSkippableElement(parentElement) &&
+        isTextDebugVisibleElement(parentElement) &&
+        normalizeTextForBinding(currentNode.textContent ?? "").length > 0
+      ) {
+        if (currentNode === node) {
+          return index;
+        }
+        index += 1;
+      }
+    }
+    currentNode = walker.nextNode();
+  }
+
+  return index;
+}
+
 class OverlayTerminalController {
   private host: HTMLDivElement | null = null;
   private shadowRoot: ShadowRoot | null = null;
@@ -197,11 +747,15 @@ class OverlayTerminalController {
   private tabButtons: HTMLButtonElement[] = [];
   private consolePanel: HTMLElement | null = null;
   private chatPanel: HTMLElement | null = null;
+  private textsPanel: HTMLElement | null = null;
   private consoleStatusRow: HTMLElement | null = null;
   private chatStatusRow: HTMLElement | null = null;
+  private textsStatusRow: HTMLElement | null = null;
   private consoleToolRow: HTMLElement | null = null;
   private chatToolRow: HTMLElement | null = null;
+  private textsToolRow: HTMLElement | null = null;
   private chatFeed: HTMLElement | null = null;
+  private textsFeed: HTMLElement | null = null;
   private chatInput: HTMLInputElement | null = null;
   private chatForm: HTMLFormElement | null = null;
   private chatQueueFileInput: HTMLInputElement | null = null;
@@ -217,6 +771,36 @@ class OverlayTerminalController {
   private currentConfig: ExtensionConfig | null = null;
   private currentStatus: WorkerStatus | null = null;
   private aiSession: AiChatPageSession | null = null;
+  private textStorageEnvelope: TextStorageEnvelope = createEmptyTextStorageEnvelope();
+  private textPageMap: TextPageMap | null = null;
+  private readonly textTargetMap = new Map<string, TextRuntimeTarget>();
+  private readonly textNodeOriginalMap = new WeakMap<Text, string>();
+  private readonly textAttributeOriginalMap = new WeakMap<Element, Map<string, string>>();
+  private readonly highlightedTextElements = new Set<HTMLElement>();
+  private readonly textHighlightBoxes = new Map<string, HTMLDivElement>();
+  private readonly suppressedTextAutoScanPageKeys = new Set<string>();
+  private readonly textTrackedPageKeys = new Set<string>();
+  private textDebugStyleElement: HTMLStyleElement | null = null;
+  private textHighlightLayer: HTMLDivElement | null = null;
+  private textDebugRefreshFrame: number | null = null;
+  private textDebugScrollSettleTimer: number | null = null;
+  private textDebugAnchorScrollX = 0;
+  private textDebugAnchorScrollY = 0;
+  private textStatusSignature = "";
+  private textScanPromise: Promise<TextPageMap | null> | null = null;
+  private textScanTimer: number | null = null;
+  private readonly pendingTextMutationRoots = new Set<HTMLElement>();
+  private textMutationObserver: MutationObserver | null = null;
+  private textObserverSuppressionDepth = 0;
+  private textStateHydrated = false;
+  private inlineTextEditor:
+    | {
+        bindingId: string;
+        editor: HTMLTextAreaElement;
+        target: TextRuntimeTarget;
+        cleanup: () => void;
+      }
+    | null = null;
   private runtimeLogs: LogEntry[] = [];
   private consoleEntries: OverlayConsoleEntry[] = [];
   private runtimeLogSequences = new Map<string, number>();
@@ -229,6 +813,20 @@ class OverlayTerminalController {
   private chatQueueImportInProgress = false;
   private readonly pageViewId = crypto.randomUUID();
   private visible = false;
+  private consoleStatusSignature = "";
+  private chatStatusSignature = "";
+  private documentCursorRestoreValue: string | null = null;
+  private pendingOverlayGeometry: OverlayGeometry | null = null;
+  private resizeState:
+    | {
+        pointerId: number;
+        direction: OverlayResizeHandle;
+        originX: number;
+        originY: number;
+        startGeometry: OverlayGeometry;
+        moved: boolean;
+      }
+    | null = null;
   private dragState:
     | {
         pointerId: number;
@@ -259,6 +857,11 @@ class OverlayTerminalController {
     window.addEventListener("keydown", this.handleCapturedKeyboardEvent, true);
     window.addEventListener("keyup", this.handleCapturedKeyboardEvent, true);
     window.addEventListener("keypress", this.handleCapturedKeyboardEvent, true);
+    window.addEventListener("resize", this.handleTextDebugViewportChanged, true);
+    document.addEventListener("scroll", this.handleTextDebugViewportChanged, true);
+    document.addEventListener("dblclick", this.handleDocumentTextDoubleClick, true);
+    chrome.storage.onChanged.addListener(this.handleStorageChanged);
+    void this.bootstrapContentState();
   }
 
   async handleMessage(message: unknown) {
@@ -298,19 +901,38 @@ class OverlayTerminalController {
     });
     await this.ensureStream();
     await this.loadSnapshot();
+    const shouldCenterOnOpen = this.shouldCenterPanelOnOpen();
     await this.loadAiSnapshot();
-    this.centerPanelInViewport();
+    await this.ensureTextElementsHydrated({
+      reason: "overlay-open",
+      logSummary: false
+    });
+    if (shouldCenterOnOpen) {
+      const centeredGeometry = this.centerPanelInViewport();
+      if (centeredGeometry) {
+        await this.patchOverlayLocalConfig({
+          left: centeredGeometry.left,
+          top: centeredGeometry.top
+        });
+      }
+    } else {
+      await this.clampPanelIntoViewport();
+    }
     this.focusPreferredOverlayElement();
     await recordLog("content", "overlay.open", "Оверлейный терминал открыт.");
   }
 
   async close(recordClose = true): Promise<void> {
     this.visible = false;
+    this.resizeState = null;
+    this.panelWindow?.classList.remove("is-resizing");
+    this.setDocumentCursor(null);
     this.host?.style.setProperty("display", "none");
     this.disconnectStream();
     await this.patchOverlaySessionConfig({
       visible: false
     });
+    this.updateTextObservationState();
     if (recordClose) {
       await recordLog("content", "overlay.close", "Оверлейный терминал закрыт.");
     }
@@ -350,6 +972,7 @@ class OverlayTerminalController {
         <nav class="overlay-tab-strip" data-role="overlay-tabs">
           <button type="button" class="overlay-tab-button is-active" data-tab="console">Консоль</button>
           <button type="button" class="overlay-tab-button" data-tab="chat">Чат</button>
+          <button type="button" class="overlay-tab-button" data-tab="texts">Тексты</button>
         </nav>
         <div class="tab-surface is-active" data-panel="console">
           <div class="status-row" data-role="console-status-row"></div>
@@ -433,6 +1056,21 @@ class OverlayTerminalController {
             </form>
           </section>
         </div>
+        <div class="tab-surface texts-surface" data-panel="texts">
+          <div class="status-row" data-role="texts-status-row"></div>
+          <div class="tool-row" data-role="texts-tool-row"></div>
+          <section class="panel-body texts-body">
+            <div class="texts-feed" data-role="texts-feed"></div>
+          </section>
+        </div>
+        <div class="overlay-resize-handle overlay-resize-handle--n" data-resize-handle="n" aria-hidden="true"></div>
+        <div class="overlay-resize-handle overlay-resize-handle--s" data-resize-handle="s" aria-hidden="true"></div>
+        <div class="overlay-resize-handle overlay-resize-handle--e" data-resize-handle="e" aria-hidden="true"></div>
+        <div class="overlay-resize-handle overlay-resize-handle--w" data-resize-handle="w" aria-hidden="true"></div>
+        <div class="overlay-resize-handle overlay-resize-handle--ne" data-resize-handle="ne" aria-hidden="true"></div>
+        <div class="overlay-resize-handle overlay-resize-handle--nw" data-resize-handle="nw" aria-hidden="true"></div>
+        <div class="overlay-resize-handle overlay-resize-handle--se" data-resize-handle="se" aria-hidden="true"></div>
+        <div class="overlay-resize-handle overlay-resize-handle--sw" data-resize-handle="sw" aria-hidden="true"></div>
       </div>
     `;
 
@@ -443,12 +1081,16 @@ class OverlayTerminalController {
     this.panelHeader = wrapper.querySelector<HTMLElement>(".panel-header");
     this.consolePanel = wrapper.querySelector<HTMLElement>("[data-panel='console']");
     this.chatPanel = wrapper.querySelector<HTMLElement>("[data-panel='chat']");
+    this.textsPanel = wrapper.querySelector<HTMLElement>("[data-panel='texts']");
     this.consoleStatusRow = wrapper.querySelector<HTMLElement>("[data-role='console-status-row']");
     this.chatStatusRow = wrapper.querySelector<HTMLElement>("[data-role='chat-status-row']");
+    this.textsStatusRow = wrapper.querySelector<HTMLElement>("[data-role='texts-status-row']");
     this.consoleToolRow = wrapper.querySelector<HTMLElement>("[data-role='console-tool-row']");
     this.chatToolRow = wrapper.querySelector<HTMLElement>("[data-role='chat-tool-row']");
+    this.textsToolRow = wrapper.querySelector<HTMLElement>("[data-role='texts-tool-row']");
     this.activityFeed = wrapper.querySelector<HTMLElement>("[data-role='activity-feed']");
     this.chatFeed = wrapper.querySelector<HTMLElement>("[data-role='chat-feed']");
+    this.textsFeed = wrapper.querySelector<HTMLElement>("[data-role='texts-feed']");
     this.terminalSuggestionList = wrapper.querySelector<HTMLElement>("[data-role='terminal-suggestions']");
     this.terminalInput = wrapper.querySelector<HTMLInputElement>("[data-role='terminal-input']");
     this.chatInput = wrapper.querySelector<HTMLInputElement>("[data-role='chat-input']");
@@ -459,6 +1101,25 @@ class OverlayTerminalController {
     this.chatResumeButton = wrapper.querySelector<HTMLButtonElement>("[data-role='chat-resume']");
     this.chatResetButton = wrapper.querySelector<HTMLButtonElement>("[data-role='chat-reset']");
     this.tabButtons = Array.from(wrapper.querySelectorAll<HTMLButtonElement>(".overlay-tab-button"));
+    Array.from(wrapper.querySelectorAll<HTMLElement>("[data-resize-handle]")).forEach((handle) => {
+      const direction = handle.dataset.resizeHandle as OverlayResizeHandle | undefined;
+      if (!direction) {
+        return;
+      }
+
+      handle.addEventListener("pointerdown", (event) => {
+        this.beginResize(event, direction, handle);
+      });
+      handle.addEventListener("pointermove", (event) => {
+        this.updateResize(event);
+      });
+      handle.addEventListener("pointerup", (event) => {
+        void this.endResize(event, handle);
+      });
+      handle.addEventListener("pointercancel", (event) => {
+        void this.endResize(event, handle);
+      });
+    });
 
     if (this.panelWindow) {
       this.panelWindow.tabIndex = 0;
@@ -701,9 +1362,13 @@ class OverlayTerminalController {
     }
 
     if (message.event === "runtime.config" && message.config) {
-      this.currentConfig = ExtensionConfigSchema.parse(message.config);
+      this.currentConfig = this.reconcileIncomingOverlayGeometry(ExtensionConfigSchema.parse(message.config));
       this.applyGeometry(this.currentConfig);
       this.render();
+      void this.ensureTextElementsHydrated({
+        reason: "runtime-config",
+        logSummary: false
+      });
       return;
     }
 
@@ -719,6 +1384,13 @@ class OverlayTerminalController {
     if (!currentPageContext || message.pageKey !== currentPageContext.pageKey) {
       return;
     }
+
+    const shouldReloadTranscriptFromSnapshot =
+      message.event === "ai.chat.snapshot" ||
+      message.event === "ai.chat.completed" ||
+      message.event === "ai.chat.error" ||
+      message.event === "ai.chat.compaction.started" ||
+      message.event === "ai.chat.compaction.completed";
 
     if (message.session) {
       this.aiSession = AiChatPageSessionSchema.parse(message.session);
@@ -738,7 +1410,12 @@ class OverlayTerminalController {
         recoverable: message.status.recoverable,
         lastError: message.status.lastError
       };
-      this.renderChat();
+      if (shouldReloadTranscriptFromSnapshot) {
+        await this.loadAiSnapshot();
+        return;
+      }
+      this.renderChatStatus();
+      this.renderChatToolRow();
       return;
     }
 
@@ -746,11 +1423,12 @@ class OverlayTerminalController {
   }
 
   private applySnapshot(snapshot: RuntimeSnapshot): void {
-    this.currentConfig = snapshot.config;
+    this.currentConfig = this.reconcileIncomingOverlayGeometry(snapshot.config);
     this.currentStatus = snapshot.status;
     this.setRuntimeLogs(snapshot.logs);
-    this.applyGeometry(snapshot.config);
+    this.applyGeometry(this.currentConfig);
     this.render(true);
+    this.updateTextObservationState();
   }
 
   private render(forceActivityScroll = false): void {
@@ -761,11 +1439,13 @@ class OverlayTerminalController {
     this.renderConsoleToolRow();
     this.renderActivityFeed(forceActivityScroll);
     this.renderChat();
+    this.renderTexts();
     this.setActiveTab(this.activeTab, false);
   }
 
   private renderConsoleStatus(): void {
     if (!this.consoleStatusRow || !this.currentStatus) {
+      this.consoleStatusSignature = "";
       return;
     }
 
@@ -796,6 +1476,11 @@ class OverlayTerminalController {
         value: this.currentStatus.lastHeartbeatAt ?? "-"
       }
     ]);
+    const signature = getStatusDescriptorSignature(descriptors);
+    if (signature === this.consoleStatusSignature) {
+      return;
+    }
+    this.consoleStatusSignature = signature;
 
     this.consoleStatusRow.replaceChildren(
       createStatusRowShell(descriptors, [
@@ -827,6 +1512,7 @@ class OverlayTerminalController {
 
   private renderChatStatus(): void {
     if (!this.chatStatusRow) {
+      this.chatStatusSignature = "";
       return;
     }
 
@@ -834,6 +1520,7 @@ class OverlayTerminalController {
     const session = this.aiSession;
     const status = session?.status ?? (pageContext ? createDefaultAiStatus(pageContext.pageKey, pageContext.pageUrl, false) : null);
     if (!status) {
+      this.chatStatusSignature = "";
       this.chatStatusRow.replaceChildren();
       return;
     }
@@ -846,6 +1533,11 @@ class OverlayTerminalController {
         fullValue: value
       }))
     );
+    const signature = getStatusDescriptorSignature(descriptors);
+    if (signature === this.chatStatusSignature) {
+      return;
+    }
+    this.chatStatusSignature = signature;
 
     this.chatStatusRow.replaceChildren(
       createStatusRowShell(descriptors, [
@@ -975,6 +1667,8 @@ class OverlayTerminalController {
       return;
     }
 
+    const shouldStickToBottom = this.isChatFeedPinnedToBottom();
+    const previousScrollTop = this.chatFeed.scrollTop;
     const transcriptItems = buildAiChatTranscriptItems(
       this.aiSession?.messages ?? [],
       this.currentConfig?.ai.chat.instructions ?? ""
@@ -982,7 +1676,12 @@ class OverlayTerminalController {
     this.chatFeed.replaceChildren(
       ...transcriptItems.map((item) => this.createChatTranscriptElement(item))
     );
-    this.chatFeed.scrollTop = this.chatFeed.scrollHeight;
+    if (shouldStickToBottom) {
+      this.scrollChatFeedToEnd();
+      return;
+    }
+
+    this.chatFeed.scrollTop = previousScrollTop;
   }
 
   private createChatTranscriptElement(item: AiChatTranscriptItem): HTMLElement {
@@ -1087,7 +1786,7 @@ class OverlayTerminalController {
 
     const bodyText = document.createElement("div");
     bodyText.className = "chat-entry-content";
-    bodyText.textContent = message.text || (message.state === "streaming" ? "…" : "");
+    bodyText.textContent = getAiMessageDisplayText(message);
     baseCard.querySelector(".chat-entry-body")?.append(bodyText);
     return baseCard;
   }
@@ -1115,6 +1814,264 @@ class OverlayTerminalController {
     return card;
   }
 
+  private renderTexts(): void {
+    this.renderTextsStatus();
+    this.renderTextsToolRow();
+    if (this.activeTab === "texts") {
+      this.renderTextsFeed();
+    }
+  }
+
+  private renderTextsStatus(): void {
+    if (!this.textsStatusRow) {
+      this.textStatusSignature = "";
+      return;
+    }
+
+    const pageContext = this.getCurrentPageContext();
+    const pageMap = this.textPageMap;
+    const summary = buildTextMapSummary(pageMap);
+    const displayMode = this.getTextDisplayMode();
+    const descriptors = buildStatusChipDescriptors("texts", [
+      {
+        key: "page",
+        value: pageContext ? shortenPageKey(pageContext.pageKey) : "n/a",
+        fullValue: pageContext?.pageKey ?? window.location.href
+      },
+      {
+        key: "mode",
+        value: displayMode,
+        fullValue: displayMode
+      },
+      {
+        key: "items",
+        value: String(summary.total),
+        fullValue: `${summary.total} text bindings`
+      },
+      {
+        key: "changed",
+        value: String(summary.changed),
+        fullValue: `${summary.changed} changed bindings`
+      },
+      {
+        key: "scan",
+        value: pageMap?.lastScanAt ? new Date(pageMap.lastScanAt).toLocaleTimeString() : "-",
+        fullValue: pageMap?.lastScanAt ?? "not scanned"
+      }
+    ]);
+    const signature = getStatusDescriptorSignature(descriptors);
+    if (signature === this.textStatusSignature) {
+      return;
+    }
+    this.textStatusSignature = signature;
+
+    this.textsStatusRow.replaceChildren(
+      createStatusRowShell(descriptors, [
+        createStatusActionButton({
+          tooltip: "Скачать карту текстов JSON",
+          dataRole: "texts-export-json",
+          disabled: !pageContext || !pageMap,
+          onClick: () => {
+            void this.downloadTextMap();
+          }
+        })
+      ])
+    );
+  }
+
+  private renderTextsToolRow(): void {
+    if (!this.textsToolRow) {
+      return;
+    }
+
+    const pageContext = this.getCurrentPageContext();
+    const inlineEditingEnabled = this.currentConfig?.debug.textElements.inlineEditingEnabled ?? false;
+    const buttons: HTMLButtonElement[] = [];
+
+    if (pageContext) {
+      buttons.push(
+        createToolIconButton({
+          tooltip: "Пересканировать тексты страницы",
+          icon: TEXT_SCAN_ICON,
+          dataRole: "texts-scan",
+          onClick: () => {
+            void this.handleTextScanCommand(true);
+          }
+        }),
+        createToolIconButton({
+          tooltip: inlineEditingEnabled
+            ? "Inline-редактирование текстов включено"
+            : "Inline-редактирование выключено, включи debug.textElements.inlineEditingEnabled",
+          icon: TEXT_EDIT_ICON,
+          dataRole: "texts-inline-editing",
+          disabled: false,
+          onClick: () => {}
+        }),
+        createToolIconButton({
+          tooltip: "Скачать JSON карты текстов",
+          icon: TEXT_DOWNLOAD_ICON,
+          dataRole: "texts-download",
+          disabled: !this.textPageMap,
+          onClick: () => {
+            void this.downloadTextMap();
+          }
+        }),
+        createToolIconButton({
+          tooltip: "Сбросить изменения текущей страницы",
+          icon: TEXT_RESET_ICON,
+          dataRole: "texts-reset-page",
+          disabled: !this.textPageMap || this.textPageMap.bindings.every((binding) => !binding.changed),
+          onClick: () => {
+            void this.resetCurrentPageTextBindings();
+          }
+        }),
+        createToolIconButton({
+          tooltip: "Удалить карту текстов текущей страницы",
+          icon: TEXT_DELETE_ICON,
+          dataRole: "texts-delete-page",
+          disabled: !this.textPageMap,
+          onClick: () => {
+            void this.deleteCurrentPageTextMap();
+          }
+        })
+      );
+    }
+
+    this.textsToolRow.replaceChildren(...buttons);
+    this.textsToolRow.classList.toggle("is-collapsed", buttons.length === 0);
+  }
+
+  private renderTextsFeed(): void {
+    if (!this.textsFeed) {
+      return;
+    }
+
+    const pageContext = this.getCurrentPageContext();
+    if (!pageContext) {
+      const empty = document.createElement("div");
+      empty.className = "texts-empty-state";
+      empty.textContent = "Текстовая карта доступна только на обычных http(s)-страницах.";
+      this.textsFeed.replaceChildren(empty);
+      return;
+    }
+
+    if (!this.textPageMap) {
+      const empty = document.createElement("div");
+      empty.className = "texts-empty-state";
+      empty.textContent = "Карта текстов ещё не собрана. Используй text.scan или кнопку пересканирования.";
+      this.textsFeed.replaceChildren(empty);
+      return;
+    }
+
+    const summary = buildTextMapSummary(this.textPageMap);
+    const summaryCard = document.createElement("section");
+    summaryCard.className = "texts-summary-card";
+    summaryCard.innerHTML = `
+      <div class="texts-summary-title">Текстовая карта страницы</div>
+      <div class="texts-summary-meta">
+        <span>Всего: ${summary.total}</span>
+        <span>Изменено: ${summary.changed}</span>
+        <span>Режим: ${this.getTextDisplayMode()}</span>
+      </div>
+    `;
+
+    const bindings = [...this.textPageMap.bindings];
+    const feedChildren: HTMLElement[] = [summaryCard];
+    if (bindings.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "texts-empty-state";
+      empty.textContent = "На странице не найдено подходящих текстовых элементов.";
+      feedChildren.push(empty);
+    } else {
+      feedChildren.push(...bindings.map((binding) => this.createTextBindingElement(binding)));
+    }
+
+    this.textsFeed.replaceChildren(...feedChildren);
+  }
+
+  private createTextBindingElement(binding: TextBindingRecord): HTMLElement {
+    const article = document.createElement("article");
+    article.className = `text-binding-entry${binding.changed ? " is-changed" : " is-original"}`;
+    article.dataset.bindingId = binding.bindingId;
+    article.dataset.bindingCategory = binding.category;
+
+    const selectorPreview =
+      binding.context.selectorPreview ??
+      binding.locator.preferredSelector ??
+      binding.locator.elementSelector ??
+      binding.locator.ancestorSelector ??
+      binding.tagName;
+    const displayedText = resolveDisplayedBindingText(
+      {
+        originalText: binding.originalText,
+        replacementText: binding.replacementText
+      },
+      this.getTextDisplayMode()
+    );
+
+    const header = document.createElement("header");
+    header.className = "text-binding-header";
+
+    const titleRow = document.createElement("div");
+    titleRow.className = "text-binding-title-row";
+
+    const badge = document.createElement("span");
+    badge.className = "text-binding-badge";
+    badge.textContent = binding.category;
+
+    const bindingId = document.createElement("span");
+    bindingId.className = "text-binding-id";
+    bindingId.textContent = binding.bindingId;
+
+    const meta = document.createElement("div");
+    meta.className = "text-binding-meta";
+    meta.textContent = truncateTextPreview(selectorPreview ?? binding.tagName, 220);
+
+    titleRow.append(badge, bindingId);
+    header.append(titleRow, meta);
+
+    const grid = document.createElement("div");
+    grid.className = "text-binding-grid";
+    grid.append(
+      this.createTextBindingField("Исходный", binding.originalText),
+      this.createTextBindingField("Показывается", displayedText),
+      this.createTextBindingField("Замена", binding.replacementText ?? "—"),
+      this.createTextBindingField("Контекст", binding.context.ancestorText ?? "—")
+    );
+
+    article.append(header, grid);
+
+    return article;
+  }
+
+  private createTextBindingField(labelText: string, valueText: string): HTMLElement {
+    const field = document.createElement("div");
+    field.className = "text-binding-field";
+
+    const label = document.createElement("span");
+    label.className = "text-binding-label";
+    label.textContent = labelText;
+
+    const value = document.createElement("pre");
+    value.className = "text-binding-value";
+    value.textContent = valueText;
+
+    field.append(label, value);
+    return field;
+  }
+
+  private getTextDisplayMode(): TextDisplayMode {
+    return this.currentConfig?.debug.textElements.displayMode ?? "effective";
+  }
+
+  private getTextAutoScanMode(): TextAutoScanMode {
+    return this.currentConfig?.debug.textElements.autoScanMode ?? "off";
+  }
+
+  private isIncrementalTextAutoScanEnabled(): boolean {
+    return this.getTextAutoScanMode() === "incremental";
+  }
+
   private setActiveTab(tab: OverlayTab, focusInput = true, persist = false): void {
     this.activeTab = tab;
     if (this.currentConfig) {
@@ -1134,6 +2091,7 @@ class OverlayTerminalController {
     });
     this.consolePanel?.classList.toggle("is-active", tab === "console");
     this.chatPanel?.classList.toggle("is-active", tab === "chat");
+    this.textsPanel?.classList.toggle("is-active", tab === "texts");
     this.consoleToolRow?.classList.toggle("is-collapsed", tab === "console" && this.consoleToolRow.childElementCount === 0);
 
     if (persist) {
@@ -1145,9 +2103,22 @@ class OverlayTerminalController {
     if (focusInput) {
       if (tab === "chat") {
         this.chatInput?.focus();
+      } else if (tab === "texts") {
+        this.panelWindow?.focus();
       } else {
         this.terminalInput?.focus();
       }
+    }
+
+    if (tab === "texts") {
+      this.renderTexts();
+      this.updateTextDebugPresentation();
+      void this.ensureTextElementsHydrated({
+        reason: "texts-tab",
+        logSummary: false
+      });
+    } else {
+      this.updateTextObservationState();
     }
   }
 
@@ -1289,6 +2260,7 @@ class OverlayTerminalController {
         visible: this.visible,
         activeTab: this.activeTab
       },
+      texts: this.buildTextStatusResult(),
       chat: chatStatus
         ? {
             requestState: chatStatus.requestState,
@@ -1301,6 +2273,1793 @@ class OverlayTerminalController {
           }
         : null
     };
+  }
+
+  private async bootstrapContentState(): Promise<void> {
+    try {
+      await this.loadSnapshot();
+    } catch (error) {
+      this.currentConfig = defaultConfig;
+      await recordLog(
+        "content",
+        "text.bootstrap.snapshot.failed",
+        "Не удалось загрузить runtime snapshot для text debug.",
+        serializeLogDetails(error),
+        "warn"
+      );
+    }
+
+    await this.ensureTextElementsHydrated({
+      reason: "bootstrap",
+      logSummary: false
+    });
+  }
+
+  private readonly handleStorageChanged = (
+    changes: Record<string, chrome.storage.StorageChange>,
+    areaName: string
+  ): void => {
+    if (areaName !== "local") {
+      return;
+    }
+
+    if (STORAGE_KEYS.localConfig in changes) {
+      void (async () => {
+        try {
+          await this.loadSnapshot();
+          await this.ensureTextElementsHydrated({
+            reason: "storage-config-change",
+            logSummary: false
+          });
+        } catch (error) {
+          await recordLog(
+            "content",
+            "text.storage.config.failed",
+            "Не удалось синхронизировать debug-конфиг текстов после storage change.",
+            serializeLogDetails(error),
+            "warn"
+          );
+        }
+      })();
+    }
+
+    if (STORAGE_KEYS.textMaps in changes) {
+      void (async () => {
+        const nextEnvelope = this.parseStoredTextEnvelope(changes[STORAGE_KEYS.textMaps]?.newValue);
+        this.textStorageEnvelope = nextEnvelope;
+        await this.ensureTextElementsHydrated({
+          reason: "storage-text-change",
+          logSummary: false
+        });
+      })();
+    }
+  };
+
+  private buildTextStatusResult(): Record<string, unknown> | null {
+    const pageContext = this.getCurrentPageContext();
+    if (!pageContext) {
+      return null;
+    }
+
+    const pageMap = this.textPageMap;
+    const summary = buildTextMapSummary(pageMap);
+    return {
+      pageKey: pageContext.pageKey,
+      pageUrl: pageContext.pageUrl,
+      displayMode: this.getTextDisplayMode(),
+      lastScanAt: pageMap?.lastScanAt ?? null,
+      storedPages: Object.keys(this.textStorageEnvelope.pages).length,
+      summary
+    };
+  }
+
+  private async ensureTextElementsHydrated(options?: {
+    reason?: string;
+    persist?: boolean;
+    logSummary?: boolean;
+    forceScan?: boolean;
+  }): Promise<TextPageMap | null> {
+    const pageContext = this.getCurrentPageContext();
+    this.textStorageEnvelope = this.textStateHydrated
+      ? this.textStorageEnvelope
+      : await this.loadTextStorageEnvelope();
+    this.textStateHydrated = true;
+    this.textPageMap = pageContext ? this.textStorageEnvelope.pages[pageContext.pageKey] ?? null : null;
+
+    if (!pageContext) {
+      this.resetInlineTextEditor();
+      this.restoreAndClearAllTextTargets();
+      this.updateTextDebugPresentation();
+      this.updateTextObservationState();
+      this.renderTexts();
+      return null;
+    }
+
+    const autoScanSuppressed = this.suppressedTextAutoScanPageKeys.has(pageContext.pageKey);
+    if (options?.forceScan) {
+      return this.scanCurrentPageTextElements({
+        reason: options.reason ?? "manual-scan",
+        persist: options.persist,
+        logSummary: options.logSummary ?? false
+      });
+    }
+
+    if (autoScanSuppressed) {
+      this.resetInlineTextEditor();
+      this.restoreAndClearAllTextTargets();
+      this.updateTextObservationState();
+      this.renderTexts();
+      return this.textPageMap;
+    }
+
+    if (!this.shouldHydrateTextElements()) {
+      this.resetInlineTextEditor();
+      this.restoreAndClearAllTextTargets();
+      this.updateTextObservationState();
+      this.renderTexts();
+      return this.textPageMap;
+    }
+
+    if (!this.textPageMap) {
+      if (this.isIncrementalTextAutoScanEnabled()) {
+        return this.scanCurrentPageTextElements({
+          reason: options?.reason ?? "auto-scan-bootstrap",
+          persist: options?.persist,
+          logSummary: options?.logSummary ?? false
+        });
+      }
+
+      this.resetInlineTextEditor();
+      this.restoreAndClearAllTextTargets();
+      this.updateTextObservationState();
+      this.renderTexts();
+      return null;
+    }
+
+    if (this.isIncrementalTextAutoScanEnabled()) {
+      this.textTrackedPageKeys.add(pageContext.pageKey);
+    } else {
+      this.textTrackedPageKeys.delete(pageContext.pageKey);
+    }
+
+    this.materializeCurrentPageTextTargets(this.textPageMap);
+    this.renderTexts();
+    this.updateTextObservationState();
+    return this.textPageMap;
+  }
+
+  private shouldHydrateTextElements(): boolean {
+    const pageContext = this.getCurrentPageContext();
+    if (!pageContext) {
+      return false;
+    }
+
+    const textDebugConfig = this.currentConfig?.debug.textElements;
+    return (
+      (this.visible && this.activeTab === "texts") ||
+      (textDebugConfig?.highlightEnabled ?? false) ||
+      (textDebugConfig?.inlineEditingEnabled ?? false)
+    );
+  }
+
+  private parseStoredTextEnvelope(rawValue: unknown): TextStorageEnvelope {
+    try {
+      return TextStorageEnvelopeSchema.parse(rawValue ?? createEmptyTextStorageEnvelope());
+    } catch {
+      return createEmptyTextStorageEnvelope();
+    }
+  }
+
+  private async loadTextStorageEnvelope(): Promise<TextStorageEnvelope> {
+    const storedValues = await chrome.storage.local.get([STORAGE_KEYS.textMaps]);
+    return this.parseStoredTextEnvelope(storedValues[STORAGE_KEYS.textMaps]);
+  }
+
+  private async persistTextStorageEnvelope(envelope: TextStorageEnvelope): Promise<void> {
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.textMaps]: envelope
+    });
+  }
+
+  private createCurrentTextPageMap(now?: string): TextPageMap {
+    const pageContext = this.requireCurrentPageContext("text.scan");
+    return createEmptyTextPageMap({
+      pageKey: pageContext.pageKey,
+      pageUrl: pageContext.pageUrl,
+      pageTitle: document.title || null,
+      displayMode: this.getTextDisplayMode(),
+      now
+    });
+  }
+
+  private async scanCurrentPageTextElements(options?: {
+    reason?: string;
+    persist?: boolean;
+    logSummary?: boolean;
+  }): Promise<TextPageMap | null> {
+    if (this.textScanPromise) {
+      return this.textScanPromise;
+    }
+
+    this.textScanPromise = (async () => {
+      const pageContext = this.getCurrentPageContext();
+      if (!pageContext) {
+        return null;
+      }
+      this.suppressedTextAutoScanPageKeys.delete(pageContext.pageKey);
+      this.textTrackedPageKeys.add(pageContext.pageKey);
+
+      const now = new Date().toISOString();
+      const previousTargets = new Map(this.textTargetMap);
+      const existingPageMap =
+        this.textPageMap ??
+        this.textStorageEnvelope.pages[pageContext.pageKey] ??
+        this.createCurrentTextPageMap(now);
+      const liveCandidates = this.collectLiveTextCandidates();
+      const nextPageMap: TextPageMap = {
+        ...mergeTextPageMapWithCandidates(
+          {
+            ...existingPageMap,
+            pageUrl: pageContext.pageUrl,
+            pageTitle: document.title || null,
+            displayMode: this.getTextDisplayMode()
+          },
+          liveCandidates.map((entry) => entry.candidate),
+          {
+            pageTitle: document.title || null,
+            now
+          }
+        ),
+        pageUrl: pageContext.pageUrl,
+        pageTitle: document.title || null,
+        displayMode: this.getTextDisplayMode()
+      };
+
+      this.textTargetMap.clear();
+      nextPageMap.bindings.forEach((binding, index) => {
+        const liveTarget = liveCandidates[index]?.target;
+        if (!liveTarget) {
+          return;
+        }
+
+        liveTarget.bindingId = binding.bindingId;
+        this.textTargetMap.set(binding.bindingId, liveTarget);
+      });
+
+      this.restoreRemovedTextTargets(previousTargets, new Set(nextPageMap.bindings.map((binding) => binding.bindingId)));
+      this.textPageMap = nextPageMap;
+      this.textStorageEnvelope = upsertPageMapInEnvelope(this.textStorageEnvelope, nextPageMap);
+      if (options?.persist !== false) {
+        await this.persistTextStorageEnvelope(this.textStorageEnvelope);
+      }
+
+      this.applyTextBindingsToDom();
+      this.updateTextDebugPresentation();
+      this.renderTexts();
+      this.updateTextObservationState();
+
+      if (options?.logSummary) {
+        const summary = buildTextMapSummary(nextPageMap);
+        await recordLog(
+          "content",
+          "text.scan.completed",
+          "Карта текстовых элементов страницы обновлена.",
+          {
+            pageKey: pageContext.pageKey,
+            reason: options.reason ?? "manual",
+            totalBindings: summary.total,
+            changedBindings: summary.changed,
+            lastScanAt: nextPageMap.lastScanAt
+          }
+        );
+      }
+
+      return nextPageMap;
+    })();
+
+    try {
+      return await this.textScanPromise;
+    } finally {
+      this.textScanPromise = null;
+    }
+  }
+
+  private materializeCurrentPageTextTargets(pageMap: TextPageMap): void {
+    const liveCandidates = this.collectLiveTextCandidates();
+    const previousTargets = new Map(this.textTargetMap);
+    const matches = mapBindingsToCandidateIndices(
+      pageMap.bindings,
+      liveCandidates.map((entry) => entry.candidate)
+    );
+
+    this.textTargetMap.clear();
+    matches.forEach((match) => {
+      const target = liveCandidates[match.candidateIndex]?.target;
+      if (!target) {
+        return;
+      }
+
+      target.bindingId = match.bindingId;
+      this.textTargetMap.set(match.bindingId, target);
+    });
+
+    if (this.inlineTextEditor && !this.textTargetMap.has(this.inlineTextEditor.bindingId)) {
+      this.resetInlineTextEditor();
+    }
+
+    this.restoreRemovedTextTargets(previousTargets, new Set(this.textTargetMap.keys()));
+    this.applyTextBindingsToDom();
+  }
+
+  private async refreshTextBindingsIncrementally(reason: string): Promise<void> {
+    const pageContext = this.getCurrentPageContext();
+    const currentPageMap = this.textPageMap;
+    if (!pageContext || !currentPageMap || !this.isIncrementalTextAutoScanEnabled()) {
+      this.pendingTextMutationRoots.clear();
+      return;
+    }
+
+    if (this.textScanPromise) {
+      await this.textScanPromise.catch(() => {});
+    }
+
+    const mutationRoots = this.normalizeMutationRoots([...this.pendingTextMutationRoots]);
+    this.pendingTextMutationRoots.clear();
+
+    const previousTargets = new Map(this.textTargetMap);
+    const retainedTargets = new Map<string, TextRuntimeTarget>();
+    previousTargets.forEach((target, bindingId) => {
+      if (target.highlightElement.isConnected) {
+        retainedTargets.set(bindingId, target);
+        return;
+      }
+
+      this.highlightedTextElements.delete(target.styleElement);
+    });
+
+    const incrementalCandidates = this.collectLiveTextCandidatesFromRoots(mutationRoots);
+    if (incrementalCandidates.length === 0) {
+      this.textTargetMap.clear();
+      retainedTargets.forEach((target, bindingId) => {
+        this.textTargetMap.set(bindingId, target);
+      });
+      if (this.inlineTextEditor && !this.textTargetMap.has(this.inlineTextEditor.bindingId)) {
+        this.resetInlineTextEditor();
+      }
+      this.restoreRemovedTextTargets(previousTargets, new Set(this.textTargetMap.keys()));
+      this.applyTextBindingsToDom();
+      this.updateTextDebugPresentation();
+      this.updateTextObservationState();
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const matchedBindingIds = new Set<string>();
+    const updatedBindings = new Map<string, TextBindingRecord>();
+    const nextTargets = new Map(retainedTargets);
+    const newBindings: TextBindingRecord[] = [];
+
+    incrementalCandidates.forEach(({ candidate, target }) => {
+      let bestBinding: TextBindingRecord | null = null;
+      let bestScore = -1;
+      let bestStrategy: string | null = null;
+
+      currentPageMap.bindings.forEach((binding) => {
+        if (matchedBindingIds.has(binding.bindingId)) {
+          return;
+        }
+
+        const result = matchBindingToCandidate(binding, candidate);
+        if (result.score < 40 || result.score <= bestScore) {
+          return;
+        }
+
+        bestBinding = binding;
+        bestScore = result.score;
+        bestStrategy = result.strategy;
+      });
+
+      if (bestBinding) {
+        const matchedBinding = bestBinding as TextBindingRecord;
+        matchedBindingIds.add(matchedBinding.bindingId);
+        const nextBinding = TextBindingRecordSchema.parse({
+          ...matchedBinding,
+          category: candidate.category,
+          originalText: candidate.text,
+          originalNormalized: candidate.normalizedText,
+          effectiveText: resolveDisplayedBindingText(
+            {
+              originalText: candidate.text,
+              replacementText: matchedBinding.replacementText
+            },
+            "effective"
+          ),
+          currentText: candidate.text,
+          tagName: candidate.tagName,
+          attributeName: candidate.attributeName,
+          locator: candidate.locator,
+          context: candidate.context,
+          lastSeenAt: now,
+          lastMatchedAt: now,
+          matchStrategy: bestStrategy,
+          changed: matchedBinding.replacementText !== null && matchedBinding.replacementText !== candidate.text
+        });
+        if (!areTextBindingsEquivalentForPersistence(matchedBinding, nextBinding)) {
+          updatedBindings.set(matchedBinding.bindingId, nextBinding);
+        }
+        target.bindingId = matchedBinding.bindingId;
+        nextTargets.set(matchedBinding.bindingId, target);
+        return;
+      }
+
+      const bindingId = buildTextBindingId({
+        pageKey: currentPageMap.pageKey,
+        category: candidate.category,
+        normalizedText: candidate.normalizedText,
+        preferredSelector: candidate.locator.preferredSelector,
+        elementSelector: candidate.locator.elementSelector,
+        ancestorSelector: candidate.locator.ancestorSelector,
+        attributeName: candidate.attributeName,
+        nodeIndex: candidate.locator.nodeIndex
+      });
+
+      if (currentPageMap.bindings.some((binding) => binding.bindingId === bindingId) ||
+        newBindings.some((binding) => binding.bindingId === bindingId)) {
+        return;
+      }
+
+      const nextBinding = TextBindingRecordSchema.parse({
+        bindingId,
+        category: candidate.category,
+        originalText: candidate.text,
+        originalNormalized: candidate.normalizedText,
+        replacementText: null,
+        effectiveText: candidate.text,
+        currentText: candidate.text,
+        tagName: candidate.tagName,
+        attributeName: candidate.attributeName,
+        locator: candidate.locator,
+        context: candidate.context,
+        firstSeenAt: now,
+        lastSeenAt: now,
+        lastMatchedAt: now,
+        matchStrategy: "incremental-created",
+        changed: false
+      });
+
+      newBindings.push(nextBinding);
+      target.bindingId = bindingId;
+      nextTargets.set(bindingId, target);
+    });
+
+    const mergedBindings = currentPageMap.bindings.map((binding) => updatedBindings.get(binding.bindingId) ?? binding);
+    const nextBindings = this.sortTextBindingsByRuntimeOrder([...mergedBindings, ...newBindings], nextTargets);
+    const didBindingsChange = !areTextBindingListsEquivalentForPersistence(currentPageMap.bindings, nextBindings);
+    const nextPageMap: TextPageMap = {
+      ...currentPageMap,
+      pageUrl: pageContext.pageUrl,
+      pageTitle: document.title || null,
+      displayMode: this.getTextDisplayMode(),
+      updatedAt: now,
+      bindings: nextBindings
+    };
+
+    this.textTargetMap.clear();
+    nextTargets.forEach((target, bindingId) => {
+      this.textTargetMap.set(bindingId, target);
+    });
+    if (this.inlineTextEditor && !this.textTargetMap.has(this.inlineTextEditor.bindingId)) {
+      this.resetInlineTextEditor();
+    }
+    this.restoreRemovedTextTargets(previousTargets, new Set(this.textTargetMap.keys()));
+    this.applyTextBindingsToDom();
+    this.updateTextDebugPresentation();
+    this.updateTextObservationState();
+
+    if (!didBindingsChange) {
+      return;
+    }
+
+    this.textPageMap = nextPageMap;
+    this.textStorageEnvelope = upsertPageMapInEnvelope(this.textStorageEnvelope, nextPageMap);
+    await this.persistTextStorageEnvelope(this.textStorageEnvelope);
+    this.renderTexts();
+
+    await recordLog("content", "text.scan.incremental", "Карта текстов дополнена инкрементально.", {
+      pageKey: currentPageMap.pageKey,
+      reason,
+      newBindings: newBindings.length,
+      updatedBindings: updatedBindings.size,
+      affectedRoots: mutationRoots.length,
+      lastScanAt: currentPageMap.lastScanAt,
+      updatedAt: now
+    });
+  }
+
+  private sortTextBindingsByRuntimeOrder(
+    bindings: readonly TextBindingRecord[],
+    runtimeTargets: ReadonlyMap<string, TextRuntimeTarget>
+  ): TextBindingRecord[] {
+    const originalIndex = new Map(bindings.map((binding, index) => [binding.bindingId, index]));
+    const domOrderedBindingIds = bindings
+      .filter((binding) => runtimeTargets.has(binding.bindingId))
+      .sort((left, right) => {
+        const leftTarget = runtimeTargets.get(left.bindingId)?.highlightElement;
+        const rightTarget = runtimeTargets.get(right.bindingId)?.highlightElement;
+        if (!leftTarget || !rightTarget || leftTarget === rightTarget) {
+          return (originalIndex.get(left.bindingId) ?? 0) - (originalIndex.get(right.bindingId) ?? 0);
+        }
+
+        const position = leftTarget.compareDocumentPosition(rightTarget);
+        if (position & Node.DOCUMENT_POSITION_FOLLOWING) {
+          return -1;
+        }
+        if (position & Node.DOCUMENT_POSITION_PRECEDING) {
+          return 1;
+        }
+        return (originalIndex.get(left.bindingId) ?? 0) - (originalIndex.get(right.bindingId) ?? 0);
+      })
+      .map((binding) => binding.bindingId);
+    const domOrder = new Map(domOrderedBindingIds.map((bindingId, index) => [bindingId, index]));
+
+    return [...bindings].sort((left, right) => {
+      const leftDomIndex = domOrder.get(left.bindingId);
+      const rightDomIndex = domOrder.get(right.bindingId);
+      if (leftDomIndex !== undefined && rightDomIndex !== undefined) {
+        return leftDomIndex - rightDomIndex;
+      }
+      if (leftDomIndex !== undefined) {
+        return -1;
+      }
+      if (rightDomIndex !== undefined) {
+        return 1;
+      }
+      return (originalIndex.get(left.bindingId) ?? 0) - (originalIndex.get(right.bindingId) ?? 0);
+    });
+  }
+
+  private collectLiveTextCandidates(): LiveTextCandidate[] {
+    const candidates: LiveTextCandidate[] = [];
+    const root = document.body ?? document.documentElement;
+    if (!root) {
+      return candidates;
+    }
+
+    const textWalker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let currentTextNode = textWalker.nextNode();
+    while (currentTextNode) {
+      if (currentTextNode instanceof Text) {
+        const candidate = this.createTextNodeCandidate(currentTextNode);
+        if (candidate) {
+          candidates.push(candidate);
+        }
+      }
+      currentTextNode = textWalker.nextNode();
+    }
+
+    const attributeElements = root.querySelectorAll<HTMLElement>("input, textarea, select");
+    attributeElements.forEach((element) => {
+      candidates.push(...this.createAttributeCandidates(element));
+    });
+
+    return candidates;
+  }
+
+  private collectLiveTextCandidatesFromRoots(roots: readonly HTMLElement[]): LiveTextCandidate[] {
+    const dedupe = new Map<string, LiveTextCandidate>();
+    const addCandidate = (candidate: LiveTextCandidate | null) => {
+      if (!candidate) {
+        return;
+      }
+
+      const key = [
+        candidate.candidate.locator.preferredSelector ?? "",
+        candidate.candidate.locator.elementSelector ?? "",
+        candidate.candidate.attributeName ?? "",
+        candidate.candidate.normalizedText,
+        candidate.candidate.locator.nodeIndex ?? ""
+      ].join("\u001f");
+
+      if (!dedupe.has(key)) {
+        dedupe.set(key, candidate);
+      }
+    };
+
+    this.normalizeMutationRoots(roots).forEach((root) => {
+      if (isTextDebugSkippableElement(root) || !isTextDebugVisibleElement(root)) {
+        return;
+      }
+
+      const rootTextWalker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      let currentTextNode = rootTextWalker.nextNode();
+      while (currentTextNode) {
+        if (currentTextNode instanceof Text) {
+          addCandidate(this.createTextNodeCandidate(currentTextNode));
+        }
+        currentTextNode = rootTextWalker.nextNode();
+      }
+
+      if (root.matches("input, textarea, select")) {
+        this.createAttributeCandidates(root).forEach((candidate) => addCandidate(candidate));
+      }
+
+      root
+        .querySelectorAll<HTMLElement>("input, textarea, select")
+        .forEach((element) => {
+          this.createAttributeCandidates(element).forEach((candidate) => addCandidate(candidate));
+        });
+    });
+
+    return [...dedupe.values()];
+  }
+
+  private createTextNodeCandidate(textNode: Text): LiveTextCandidate | null {
+    const parentElement = textNode.parentElement;
+    if (!parentElement || isTextDebugSkippableElement(parentElement)) {
+      return null;
+    }
+
+    if (!isTextDebugVisibleElement(parentElement)) {
+      return null;
+    }
+
+    const originalText = this.textNodeOriginalMap.get(textNode) ?? (textNode.textContent ?? "");
+    this.textNodeOriginalMap.set(textNode, originalText);
+    const normalizedText = normalizeTextForBinding(originalText);
+    if (!normalizedText) {
+      return null;
+    }
+
+    if (getRenderableTextNodeClientRects(textNode).length === 0) {
+      return null;
+    }
+
+    const hostElement = resolveTextBindingHostElement(parentElement);
+    const highlightElement = resolveTextHighlightElement(hostElement);
+    const selectorPreview = buildElementSelectorPath(hostElement) ?? buildPreferredTextSelector(hostElement);
+    const ancestorText = normalizeTextForBinding(hostElement.parentElement?.textContent ?? "");
+    const locator = {
+      preferredSelector: buildPreferredTextSelector(hostElement),
+      ancestorSelector: buildAncestorSelector(hostElement),
+      elementSelector: buildElementSelectorPath(hostElement),
+      nodeIndex: getElementTextNodeIndexWithinHost(hostElement, textNode),
+      tagName: hostElement.tagName.toLowerCase(),
+      attributeName: null,
+      classNames: Array.from(hostElement.classList).slice(0, 8),
+      stableAttributes: getTextDebugStableAttributes(hostElement)
+    };
+
+    return {
+      candidate: {
+        category: categorizeTextElement({
+          tagName: hostElement.tagName,
+          role: hostElement.getAttribute("role")
+        }),
+        text: originalText,
+        normalizedText,
+        tagName: hostElement.tagName.toLowerCase(),
+        attributeName: null,
+        locator,
+        context: {
+          pageTitle: document.title || null,
+          selectorPreview,
+          ancestorText: ancestorText.length > 0 ? truncateTextPreview(ancestorText, 180) : null
+        }
+      },
+      target: {
+        bindingId: null,
+        element: hostElement,
+        highlightElement,
+        styleElement: parentElement,
+        attributeName: null,
+        textNode,
+        readCurrentText: () => textNode.textContent ?? "",
+        applyRenderedText: (value: string) => {
+          textNode.textContent = value;
+        },
+        getOriginalText: () => this.textNodeOriginalMap.get(textNode) ?? originalText,
+        getClientRects: () => getRenderableTextNodeClientRects(textNode),
+        getBoundingClientRect: () => buildTextRectUnion(getRenderableTextNodeClientRects(textNode))
+      }
+    };
+  }
+
+  private createAttributeCandidates(element: HTMLElement): LiveTextCandidate[] {
+    if (isTextDebugSkippableElement(element) || !isTextDebugVisibleElement(element)) {
+      return [];
+    }
+
+    const candidates: LiveTextCandidate[] = [];
+    if (element instanceof HTMLInputElement) {
+      if (element.type !== "hidden" && element.type !== "password") {
+        const valueCandidate = this.createElementAttributeCandidate(element, "value", element.value);
+        if (valueCandidate) {
+          candidates.push(valueCandidate);
+        }
+      }
+
+      if (element.value.length === 0) {
+        const placeholderCandidate = this.createElementAttributeCandidate(
+          element,
+          "placeholder",
+          element.getAttribute("placeholder") ?? ""
+        );
+        if (placeholderCandidate) {
+          candidates.push(placeholderCandidate);
+        }
+      }
+    } else if (element instanceof HTMLTextAreaElement) {
+      const valueCandidate = this.createElementAttributeCandidate(element, "value", element.value);
+      if (valueCandidate) {
+        candidates.push(valueCandidate);
+      }
+
+      if (element.value.length === 0) {
+        const placeholderCandidate = this.createElementAttributeCandidate(
+          element,
+          "placeholder",
+          element.getAttribute("placeholder") ?? ""
+        );
+        if (placeholderCandidate) {
+          candidates.push(placeholderCandidate);
+        }
+      }
+    } else if (element instanceof HTMLSelectElement) {
+      const selectedText = element.selectedOptions[0]?.textContent ?? "";
+      const valueCandidate = this.createElementAttributeCandidate(element, "value", selectedText);
+      if (valueCandidate) {
+        candidates.push(valueCandidate);
+      }
+    }
+
+    return candidates;
+  }
+
+  private createElementAttributeCandidate(
+    element: HTMLElement,
+    attributeName: string,
+    currentValue: string
+  ): LiveTextCandidate | null {
+    const originalText = this.getAttributeOriginalText(element, attributeName, currentValue);
+    const normalizedText = normalizeTextForBinding(originalText);
+    if (!normalizedText) {
+      return null;
+    }
+
+    if (!isTextBindingAttributeVisuallyRenderable(attributeName)) {
+      return null;
+    }
+
+    const selectorPreview = buildElementSelectorPath(element) ?? buildPreferredTextSelector(element);
+    const ancestorText = normalizeTextForBinding(element.parentElement?.textContent ?? "");
+    const tagName = element.tagName.toLowerCase();
+    const highlightElement = resolveTextHighlightElement(element);
+    const readCurrentAttributeText = () => {
+      if (attributeName === "value" && element instanceof HTMLSelectElement) {
+        return element.selectedOptions[0]?.textContent ?? "";
+      }
+      if (attributeName === "value" && (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) {
+        return element.value;
+      }
+      return element.getAttribute(attributeName) ?? "";
+    };
+    const applyRenderedAttributeText = (value: string) => {
+      if (attributeName === "value" && element instanceof HTMLSelectElement) {
+        const selectedOption = element.selectedOptions[0] ?? element.options[0];
+        if (selectedOption) {
+          selectedOption.textContent = value;
+          selectedOption.label = value;
+        }
+        return;
+      }
+      if (attributeName === "value" && (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) {
+        element.value = value;
+        element.setAttribute("value", value);
+        return;
+      }
+
+      element.setAttribute(attributeName, value);
+    };
+    const getRenderableAttributeRects = () => {
+      if (
+        (attributeName === "value" || attributeName === "placeholder") &&
+        (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement)
+      ) {
+        return measureFormControlTextRects(element, attributeName, readCurrentAttributeText());
+      }
+      return [];
+    };
+    if (getRenderableAttributeRects().length === 0) {
+      return null;
+    }
+    const locator = {
+      preferredSelector: buildPreferredTextSelector(element),
+      ancestorSelector: buildAncestorSelector(element),
+      elementSelector: buildElementSelectorPath(element),
+      nodeIndex: null,
+      tagName,
+      attributeName,
+      classNames: Array.from(element.classList).slice(0, 8),
+      stableAttributes: getTextDebugStableAttributes(element)
+    };
+
+    return {
+      candidate: {
+        category: categorizeTextElement({
+          tagName,
+          role: element.getAttribute("role"),
+          attributeName
+        }),
+        text: originalText,
+        normalizedText,
+        tagName,
+        attributeName,
+        locator,
+        context: {
+          pageTitle: document.title || null,
+          selectorPreview,
+          ancestorText: ancestorText.length > 0 ? truncateTextPreview(ancestorText, 180) : null
+        }
+      },
+      target: {
+        bindingId: null,
+        element,
+        highlightElement,
+        styleElement: element,
+        attributeName,
+        textNode: null,
+        readCurrentText: readCurrentAttributeText,
+        applyRenderedText: applyRenderedAttributeText,
+        getOriginalText: () => this.getAttributeOriginalText(element, attributeName, originalText),
+        getClientRects: () => getRenderableAttributeRects(),
+        getBoundingClientRect: () => buildTextRectUnion(getRenderableAttributeRects())
+      }
+    };
+  }
+
+  private getAttributeOriginalText(element: Element, attributeName: string, fallback: string): string {
+    const originalValues = this.textAttributeOriginalMap.get(element);
+    if (originalValues?.has(attributeName)) {
+      return originalValues.get(attributeName) ?? fallback;
+    }
+
+    const nextValues = originalValues ?? new Map<string, string>();
+    nextValues.set(attributeName, fallback);
+    this.textAttributeOriginalMap.set(element, nextValues);
+    return fallback;
+  }
+
+  private restoreRemovedTextTargets(
+    previousTargets: ReadonlyMap<string, TextRuntimeTarget>,
+    liveBindingIds: ReadonlySet<string>
+  ): void {
+    previousTargets.forEach((target, bindingId) => {
+      if (liveBindingIds.has(bindingId)) {
+        return;
+      }
+
+      this.restoreRuntimeTargetOriginalText(target);
+    });
+  }
+
+  private restoreRuntimeTargetOriginalText(target: TextRuntimeTarget): void {
+    this.withTextObserverSuppressed(() => {
+      target.applyRenderedText(target.getOriginalText());
+      target.highlightElement.removeAttribute("data-lextrace-text-binding-id");
+      target.highlightElement.removeAttribute("data-lextrace-text-debug");
+      target.highlightElement.removeAttribute("data-lextrace-text-editable");
+    });
+  }
+
+  private restoreAndClearAllTextTargets(): void {
+    this.textTargetMap.forEach((target) => {
+      this.restoreRuntimeTargetOriginalText(target);
+    });
+    this.textTargetMap.clear();
+    this.clearTextHighlights();
+  }
+
+  private withTextObserverSuppressed(action: () => void): void {
+    this.textObserverSuppressionDepth += 1;
+    try {
+      action();
+    } finally {
+      window.setTimeout(() => {
+        this.textObserverSuppressionDepth = Math.max(0, this.textObserverSuppressionDepth - 1);
+      }, 0);
+    }
+  }
+
+  private applyTextBindingsToDom(): void {
+    const pageMap = this.textPageMap;
+    if (!pageMap) {
+      this.clearTextHighlights();
+      return;
+    }
+
+    const displayMode = this.getTextDisplayMode();
+    this.withTextObserverSuppressed(() => {
+      pageMap.bindings.forEach((binding) => {
+        const target = this.textTargetMap.get(binding.bindingId);
+        if (!target) {
+          return;
+        }
+
+        const desiredText = resolveDisplayedBindingText(
+          {
+            originalText: target.getOriginalText(),
+            replacementText: binding.replacementText
+          },
+          displayMode
+        );
+        if (target.readCurrentText() !== desiredText) {
+          target.applyRenderedText(desiredText);
+        }
+      });
+    });
+  }
+
+  private ensureTextDebugStyleElement(): void {
+    if (this.textDebugStyleElement?.isConnected) {
+      return;
+    }
+
+    const style = document.createElement("style");
+    style.id = "lextrace-text-debug-style";
+    style.textContent = `
+      [data-lextrace-text-editable="true"] {
+        cursor: text !important;
+      }
+      .lextrace-text-highlight-layer {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483645;
+        pointer-events: none;
+        overflow: hidden;
+        will-change: transform;
+        contain: layout style paint;
+      }
+      .lextrace-text-highlight-box {
+        position: absolute;
+        box-sizing: border-box;
+        border-radius: 2px;
+        contain: paint;
+      }
+      .lextrace-text-highlight-box.is-source {
+        box-shadow:
+          inset 0 0 0 2px rgba(198, 84, 84, 0.98),
+          0 0 0 1px rgba(198, 84, 84, 0.28),
+          0 0 14px rgba(198, 84, 84, 0.18);
+        background: rgba(198, 84, 84, 0.08);
+      }
+      .lextrace-text-highlight-box.is-changed {
+        box-shadow:
+          inset 0 0 0 2px rgba(46, 148, 84, 0.98),
+          0 0 0 1px rgba(46, 148, 84, 0.24),
+          0 0 14px rgba(46, 148, 84, 0.18);
+        background: rgba(46, 148, 84, 0.08);
+      }
+      .lextrace-inline-text-editor {
+        position: fixed;
+        z-index: 2147483646;
+        box-sizing: border-box;
+        min-width: 1px;
+        min-height: 1px;
+        margin: 0;
+        padding: 0;
+        border: none;
+        outline: 1px solid #111111;
+        outline-offset: 0;
+        border-radius: 0;
+        background: rgba(255, 253, 247, 0.96);
+        color: #111111;
+        caret-color: #111111;
+        font: 13px/1.4 "Bahnschrift", "Segoe UI Variable Text", "Segoe UI", sans-serif;
+        resize: both;
+        box-shadow: 0 12px 28px rgba(17, 17, 17, 0.18);
+        overflow: hidden;
+      }
+    `;
+    document.documentElement.appendChild(style);
+    this.textDebugStyleElement = style;
+  }
+
+  private ensureTextHighlightLayer(): HTMLDivElement {
+    if (this.textHighlightLayer?.isConnected) {
+      return this.textHighlightLayer;
+    }
+
+    const layer = document.createElement("div");
+    layer.className = "lextrace-text-highlight-layer";
+    document.documentElement.appendChild(layer);
+    this.textHighlightLayer = layer;
+    return layer;
+  }
+
+  private clearTextHighlightBoxes(): void {
+    this.textHighlightBoxes.forEach((element) => {
+      element.remove();
+    });
+    this.textHighlightBoxes.clear();
+  }
+
+  private renderTextHighlightBoxes(): void {
+    const pageMap = this.textPageMap;
+    if (!pageMap || !(this.currentConfig?.debug.textElements.highlightEnabled ?? false)) {
+      this.clearTextHighlightBoxes();
+      return;
+    }
+
+    this.ensureTextDebugStyleElement();
+    const layer = this.ensureTextHighlightLayer();
+    layer.style.transform = "translate(0px, 0px)";
+    this.textDebugAnchorScrollX = window.scrollX;
+    this.textDebugAnchorScrollY = window.scrollY;
+    const nextKeys = new Set<string>();
+    const renderableRects: Array<{
+      bindingId: string;
+      changed: boolean;
+      rect: TextRectSnapshot;
+      rectIndex: number;
+    }> = [];
+
+    pageMap.bindings.forEach((binding) => {
+      const target = this.textTargetMap.get(binding.bindingId);
+      if (!target || !isRuntimeTargetVisuallyRenderable(target)) {
+        return;
+      }
+
+      const rects = target
+        .getClientRects()
+        .filter((rect) => isRenderableTextRect(rect) && isViewportRenderableTextRect(rect));
+      if (rects.length === 0) {
+        return;
+      }
+
+      rects.forEach((rect, index) => {
+        renderableRects.push({
+          bindingId: binding.bindingId,
+          changed: binding.changed,
+          rect,
+          rectIndex: index
+        });
+      });
+    });
+
+    renderableRects
+      .sort((left, right) => {
+        if (left.rect.top !== right.rect.top) {
+          return left.rect.top - right.rect.top;
+        }
+        if (left.rect.left !== right.rect.left) {
+          return left.rect.left - right.rect.left;
+        }
+        return (left.rect.width * left.rect.height) - (right.rect.width * right.rect.height);
+      })
+      .slice(0, 1600)
+      .forEach((entry) => {
+        const key = `${entry.bindingId}:${entry.rectIndex}`;
+        nextKeys.add(key);
+
+        const box =
+          this.textHighlightBoxes.get(key) ??
+          (() => {
+            const nextBox = document.createElement("div");
+            nextBox.setAttribute("data-lextrace-text-highlight-box", "true");
+            this.textHighlightBoxes.set(key, nextBox);
+            layer.appendChild(nextBox);
+            return nextBox;
+          })();
+        const nextDebugKind = entry.changed ? "changed" : "source";
+        const nextRectSignature = `${entry.rect.left}:${entry.rect.top}:${entry.rect.width}:${entry.rect.height}`;
+        if (box.className !== `lextrace-text-highlight-box ${entry.changed ? "is-changed" : "is-source"}`) {
+          box.className = `lextrace-text-highlight-box ${entry.changed ? "is-changed" : "is-source"}`;
+        }
+        if (box.getAttribute("data-lextrace-text-binding-id") !== entry.bindingId) {
+          box.setAttribute("data-lextrace-text-binding-id", entry.bindingId);
+        }
+        if (box.getAttribute("data-lextrace-text-debug") !== nextDebugKind) {
+          box.setAttribute("data-lextrace-text-debug", nextDebugKind);
+        }
+        if (box.getAttribute("data-lextrace-text-rect-index") !== String(entry.rectIndex)) {
+          box.setAttribute("data-lextrace-text-rect-index", String(entry.rectIndex));
+        }
+        if (box.getAttribute("data-lextrace-text-rect-signature") !== nextRectSignature) {
+          box.setAttribute("data-lextrace-text-rect-signature", nextRectSignature);
+          box.style.left = `${entry.rect.left}px`;
+          box.style.top = `${entry.rect.top}px`;
+          box.style.width = `${entry.rect.width}px`;
+          box.style.height = `${entry.rect.height}px`;
+        }
+      });
+
+    this.textHighlightBoxes.forEach((box, key) => {
+      if (nextKeys.has(key)) {
+        return;
+      }
+      box.remove();
+      this.textHighlightBoxes.delete(key);
+    });
+
+    if (nextKeys.size === 0) {
+      layer.replaceChildren();
+      return;
+    }
+  }
+
+  private readonly handleTextDebugViewportChanged = (event?: Event): void => {
+    if (event?.type === "scroll") {
+      if (this.isElementInsideOverlay(event.target)) {
+        return;
+      }
+
+      this.applyTextDebugScrollCompensation();
+      if (this.textDebugScrollSettleTimer !== null) {
+        window.clearTimeout(this.textDebugScrollSettleTimer);
+      }
+      this.textDebugScrollSettleTimer = window.setTimeout(() => {
+        this.textDebugScrollSettleTimer = null;
+        this.scheduleTextDebugRefresh();
+      }, 80);
+      return;
+    }
+
+    this.scheduleTextDebugRefresh();
+  };
+
+  private applyTextDebugScrollCompensation(): void {
+    const deltaX = this.textDebugAnchorScrollX - window.scrollX;
+    const deltaY = this.textDebugAnchorScrollY - window.scrollY;
+    if (this.textHighlightLayer?.isConnected) {
+      this.textHighlightLayer.style.transform = `translate(${deltaX}px, ${deltaY}px)`;
+    }
+
+    if (this.inlineTextEditor?.editor.isConnected) {
+      this.positionInlineTextEditor(this.inlineTextEditor.target, this.inlineTextEditor.editor);
+    }
+  }
+
+  private scheduleTextDebugRefresh(): void {
+    if (!(this.currentConfig?.debug.textElements.highlightEnabled ?? false) && !this.inlineTextEditor) {
+      return;
+    }
+
+    if (this.textDebugRefreshFrame !== null) {
+      return;
+    }
+
+    this.textDebugRefreshFrame = window.requestAnimationFrame(() => {
+      this.textDebugRefreshFrame = null;
+      if (this.textDebugScrollSettleTimer !== null) {
+        window.clearTimeout(this.textDebugScrollSettleTimer);
+        this.textDebugScrollSettleTimer = null;
+      }
+      if (this.currentConfig?.debug.textElements.highlightEnabled ?? false) {
+        this.renderTextHighlightBoxes();
+      }
+      if (this.inlineTextEditor) {
+        this.positionInlineTextEditor(this.inlineTextEditor.target, this.inlineTextEditor.editor);
+      }
+    });
+  }
+
+  private clearTextHighlights(): void {
+    this.clearTextHighlightAttributes();
+    this.clearTextHighlightBoxes();
+  }
+
+  private clearTextHighlightAttributes(): void {
+    this.highlightedTextElements.forEach((element) => {
+      element.removeAttribute("data-lextrace-text-binding-id");
+      element.removeAttribute("data-lextrace-text-debug");
+      element.removeAttribute("data-lextrace-text-editable");
+    });
+    this.highlightedTextElements.clear();
+  }
+
+  private updateTextDebugPresentation(): void {
+    this.applyTextBindingsToDom();
+    this.clearTextHighlightAttributes();
+
+    const pageMap = this.textPageMap;
+    if (!pageMap) {
+      this.clearTextHighlightBoxes();
+      this.resetInlineTextEditor();
+      return;
+    }
+
+    const highlightEnabled = this.currentConfig?.debug.textElements.highlightEnabled ?? false;
+    const inlineEditingEnabled = this.currentConfig?.debug.textElements.inlineEditingEnabled ?? false;
+    if (!inlineEditingEnabled) {
+      this.resetInlineTextEditor();
+    }
+    if (!highlightEnabled && !inlineEditingEnabled) {
+      this.clearTextHighlightBoxes();
+      return;
+    }
+
+    this.ensureTextDebugStyleElement();
+    pageMap.bindings.forEach((binding) => {
+      const target = this.textTargetMap.get(binding.bindingId);
+      if (!target) {
+        return;
+      }
+
+      const interactiveElement = target.styleElement;
+      if (isRuntimeTargetVisuallyRenderable(target)) {
+        interactiveElement.setAttribute("data-lextrace-text-binding-id", binding.bindingId);
+        if (inlineEditingEnabled) {
+          interactiveElement.setAttribute("data-lextrace-text-editable", "true");
+        }
+      }
+      this.highlightedTextElements.add(interactiveElement);
+    });
+
+    if (highlightEnabled) {
+      this.renderTextHighlightBoxes();
+    }
+  }
+
+  private shouldObserveTextElements(): boolean {
+    const pageContext = this.getCurrentPageContext();
+    if (!pageContext || !this.textPageMap) {
+      return false;
+    }
+
+    return this.isIncrementalTextAutoScanEnabled() &&
+      this.textTrackedPageKeys.has(pageContext.pageKey) &&
+      this.shouldHydrateTextElements();
+  }
+
+  private updateTextObservationState(): void {
+    const shouldObserve = this.shouldObserveTextElements();
+    const root = document.body ?? document.documentElement;
+    if (shouldObserve && root && !this.textMutationObserver) {
+      this.textMutationObserver = new MutationObserver((records) => {
+        if (this.textObserverSuppressionDepth > 0) {
+          return;
+        }
+        this.scheduleIncrementalTextRefresh(records, "mutation");
+      });
+      this.textMutationObserver.observe(root, {
+        childList: true,
+        characterData: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["placeholder", "value", "hidden", "aria-hidden"]
+      });
+      return;
+    }
+
+    if (!shouldObserve && this.textMutationObserver) {
+      this.textMutationObserver.disconnect();
+      this.textMutationObserver = null;
+    }
+
+    if (!shouldObserve) {
+      this.pendingTextMutationRoots.clear();
+      if (this.textScanTimer !== null) {
+        window.clearTimeout(this.textScanTimer);
+        this.textScanTimer = null;
+      }
+    }
+  }
+
+  private scheduleIncrementalTextRefresh(records: MutationRecord[], reason: string): void {
+    records.forEach((record) => {
+      this.collectMutationRoots(record).forEach((root) => {
+        this.pendingTextMutationRoots.add(root);
+      });
+    });
+
+    if (this.textScanTimer !== null) {
+      window.clearTimeout(this.textScanTimer);
+    }
+
+    this.textScanTimer = window.setTimeout(() => {
+      this.textScanTimer = null;
+      void this.refreshTextBindingsIncrementally(reason);
+    }, 90);
+  }
+
+  private collectMutationRoots(record: MutationRecord): HTMLElement[] {
+    const roots = new Set<HTMLElement>();
+    const addRoot = (value: Node | null | undefined) => {
+      if (!value) {
+        return;
+      }
+
+      if (value instanceof HTMLElement) {
+        roots.add(value);
+        return;
+      }
+
+      if (value instanceof Text && value.parentElement) {
+        roots.add(value.parentElement);
+      }
+    };
+
+    addRoot(record.target);
+    if (record.type === "childList") {
+      record.addedNodes.forEach((node) => addRoot(node));
+      record.removedNodes.forEach((node) => addRoot(node.parentNode));
+    }
+
+    return this.normalizeMutationRoots([...roots]);
+  }
+
+  private normalizeMutationRoots(roots: readonly HTMLElement[]): HTMLElement[] {
+    const uniqueRoots = roots.filter((root, index, array) => array.indexOf(root) === index);
+    return uniqueRoots.filter((root) => !uniqueRoots.some((candidate) => candidate !== root && root.contains(candidate)));
+  }
+
+  private async handleTextScanCommand(logSummary = true): Promise<TextPageMap | null> {
+    try {
+      return await this.ensureTextElementsHydrated({
+        reason: "manual-scan",
+        logSummary,
+        forceScan: true
+      });
+    } catch (error) {
+      this.pushConsole("error", formatUserFacingCommandError(error, "Не удалось пересканировать тексты страницы."));
+      await recordLog(
+        "content",
+        "text.scan.failed",
+        "Не удалось пересканировать тексты страницы.",
+        serializeLogDetails(error),
+        "error"
+      );
+      return null;
+    }
+  }
+
+  private buildTextBindingOutput(binding: TextBindingRecord): Record<string, unknown> {
+    return {
+      bindingId: binding.bindingId,
+      category: binding.category,
+      changed: binding.changed,
+      originalText: binding.originalText,
+      replacementText: binding.replacementText,
+      displayedText: resolveDisplayedBindingText(
+        {
+          originalText: binding.originalText,
+          replacementText: binding.replacementText
+        },
+        this.getTextDisplayMode()
+      ),
+      currentText: binding.currentText,
+      selector:
+        binding.context.selectorPreview ??
+        binding.locator.preferredSelector ??
+        binding.locator.elementSelector ??
+        binding.locator.ancestorSelector,
+      attributeName: binding.attributeName,
+      matchStrategy: binding.matchStrategy
+    };
+  }
+
+  private async downloadTextMap(): Promise<void> {
+    const pageContext = this.requireCurrentPageContext("text.download");
+    await this.ensureTextElementsHydrated({
+      reason: "download",
+      logSummary: false
+    });
+    const pageMap = this.textPageMap ?? this.textStorageEnvelope.pages[pageContext.pageKey] ?? null;
+    if (!pageMap) {
+      throw new Error("Карта текстов ещё не собрана. Сначала запусти text.scan.");
+    }
+
+    const exportedAt = new Date().toISOString();
+    const payload = {
+      schemaVersion: 1,
+      scope: "text-map",
+      exportedAt,
+      pageKey: pageContext.pageKey,
+      pageUrl: pageContext.pageUrl,
+      summary: buildTextMapSummary(pageMap),
+      pageMap
+    };
+    const fileName = formatTextMapExportFileName(pageContext.pageKey, exportedAt);
+    this.downloadJsonFile(fileName, payload);
+    await recordLog("content", "text.map.export", "Карта текстов выгружена в JSON.", {
+      fileName,
+      pageKey: pageContext.pageKey,
+      bindingCount: pageMap.bindings.length
+    });
+  }
+
+  private async updateCurrentPageTextBinding(
+    bindingId: string,
+    replacementText: string | null
+  ): Promise<TextBindingRecord> {
+    const currentPageMap =
+      (await this.ensureTextElementsHydrated({
+        reason: "binding-update",
+        logSummary: false
+      })) ?? this.textPageMap;
+    if (!currentPageMap) {
+      throw new Error("Карта текстов текущей страницы недоступна.");
+    }
+
+    const existingBinding = currentPageMap.bindings.find((binding) => binding.bindingId === bindingId);
+    if (!existingBinding) {
+      throw new Error(`Текстовая привязка не найдена: ${bindingId}`);
+    }
+
+    const normalizedReplacement = replacementText === null
+      ? null
+      : sanitizeReplacementText(replacementText) === existingBinding.originalText
+        ? null
+        : sanitizeReplacementText(replacementText);
+    const nextPageMap = {
+      ...updateBindingReplacement(currentPageMap, bindingId, normalizedReplacement, {
+        now: new Date().toISOString()
+      }),
+      displayMode: this.getTextDisplayMode()
+    };
+    this.textPageMap = nextPageMap;
+    this.textStorageEnvelope = upsertPageMapInEnvelope(this.textStorageEnvelope, nextPageMap);
+    await this.persistTextStorageEnvelope(this.textStorageEnvelope);
+    this.updateTextDebugPresentation();
+    this.renderTexts();
+
+    const updatedBinding = nextPageMap.bindings.find((binding) => binding.bindingId === bindingId);
+    if (!updatedBinding) {
+      throw new Error(`Не удалось обновить текстовую привязку ${bindingId}.`);
+    }
+
+    await recordLog("content", "text.binding.updated", "Текстовая привязка обновлена.", {
+      bindingId,
+      changed: updatedBinding.changed,
+      category: updatedBinding.category
+    });
+
+    return updatedBinding;
+  }
+
+  private async resetCurrentPageTextBindings(): Promise<TextPageMap> {
+    const currentPageMap =
+      (await this.ensureTextElementsHydrated({
+        reason: "page-reset",
+        logSummary: false
+      })) ?? this.textPageMap;
+    if (!currentPageMap) {
+      throw new Error("Карта текстов текущей страницы недоступна.");
+    }
+
+    const nextPageMap = {
+      ...resetPageBindings(currentPageMap, {
+        now: new Date().toISOString()
+      }),
+      displayMode: this.getTextDisplayMode()
+    };
+    this.textPageMap = nextPageMap;
+    this.textStorageEnvelope = upsertPageMapInEnvelope(this.textStorageEnvelope, nextPageMap);
+    await this.persistTextStorageEnvelope(this.textStorageEnvelope);
+    this.updateTextDebugPresentation();
+    this.renderTexts();
+
+    await recordLog("content", "text.page.reset", "Изменения текстов текущей страницы сброшены.", {
+      pageKey: nextPageMap.pageKey,
+      bindingCount: nextPageMap.bindings.length
+    });
+
+    return nextPageMap;
+  }
+
+  private async deleteCurrentTextBinding(bindingId: string): Promise<{ bindingId: string; remainingBindings: number }> {
+    const pageContext = this.requireCurrentPageContext("text.delete");
+    await this.ensureTextElementsHydrated({
+      reason: "binding-delete",
+      logSummary: false
+    });
+    const currentPageMap = this.textPageMap ?? this.textStorageEnvelope.pages[pageContext.pageKey] ?? null;
+    if (!currentPageMap) {
+      throw new Error("Карта текстов текущей страницы недоступна.");
+    }
+
+    const existingBinding = currentPageMap.bindings.find((binding) => binding.bindingId === bindingId);
+    if (!existingBinding) {
+      throw new Error(`Текстовая привязка не найдена: ${bindingId}`);
+    }
+
+    if (this.inlineTextEditor?.bindingId === bindingId) {
+      this.resetInlineTextEditor();
+    }
+
+    const runtimeTarget = this.textTargetMap.get(bindingId);
+    if (runtimeTarget) {
+      this.restoreRuntimeTargetOriginalText(runtimeTarget);
+      this.textTargetMap.delete(bindingId);
+      this.highlightedTextElements.delete(runtimeTarget.styleElement);
+    }
+
+    const nextPageMap = removeBindingFromPageMap(currentPageMap, bindingId, {
+      now: new Date().toISOString()
+    });
+
+    if (nextPageMap.bindings.length > 0) {
+      this.textPageMap = nextPageMap;
+      this.textStorageEnvelope = upsertPageMapInEnvelope(this.textStorageEnvelope, nextPageMap);
+    } else {
+      this.suppressedTextAutoScanPageKeys.add(currentPageMap.pageKey);
+      this.textTrackedPageKeys.delete(currentPageMap.pageKey);
+      this.textPageMap = null;
+      this.textStorageEnvelope = removePageMapFromEnvelope(this.textStorageEnvelope, currentPageMap.pageKey);
+    }
+
+    await this.persistTextStorageEnvelope(this.textStorageEnvelope);
+    this.renderTexts();
+    this.updateTextObservationState();
+
+    await recordLog("content", "text.binding.deleted", "Текстовая привязка удалена из карты.", {
+      bindingId,
+      pageKey: currentPageMap.pageKey,
+      remainingBindings: nextPageMap.bindings.length
+    });
+
+    return {
+      bindingId,
+      remainingBindings: nextPageMap.bindings.length
+    };
+  }
+
+  private async deleteCurrentPageTextMap(): Promise<{ pageKey: string; removedBindings: number }> {
+    const pageContext = this.requireCurrentPageContext("text.delete");
+    await this.ensureTextElementsHydrated({
+      reason: "page-delete",
+      logSummary: false
+    });
+    const currentPageMap = this.textPageMap ?? this.textStorageEnvelope.pages[pageContext.pageKey] ?? null;
+    if (!currentPageMap) {
+      throw new Error("Для текущей страницы нет сохранённой карты текстов.");
+    }
+
+    this.resetInlineTextEditor();
+    this.restoreAndClearAllTextTargets();
+    this.suppressedTextAutoScanPageKeys.add(currentPageMap.pageKey);
+    this.textTrackedPageKeys.delete(currentPageMap.pageKey);
+    this.textPageMap = null;
+    this.textStorageEnvelope = removePageMapFromEnvelope(this.textStorageEnvelope, currentPageMap.pageKey);
+    await this.persistTextStorageEnvelope(this.textStorageEnvelope);
+    this.renderTexts();
+    this.updateTextObservationState();
+
+    await recordLog("content", "text.page.deleted", "Карта текстов текущей страницы удалена.", {
+      pageKey: currentPageMap.pageKey,
+      removedBindings: currentPageMap.bindings.length
+    });
+
+    return {
+      pageKey: currentPageMap.pageKey,
+      removedBindings: currentPageMap.bindings.length
+    };
+  }
+
+  private async resetAllTextStorage(): Promise<{ clearedPages: number }> {
+    await this.ensureTextElementsHydrated({
+      reason: "storage-reset",
+      logSummary: false
+    });
+    const clearedPages = Object.keys(this.textStorageEnvelope.pages).length;
+    const now = new Date().toISOString();
+    const currentPageContext = this.getCurrentPageContext();
+    this.resetInlineTextEditor();
+    this.withTextObserverSuppressed(() => {
+      if (this.textPageMap) {
+        this.textPageMap = {
+          ...resetPageBindings(this.textPageMap, {
+            now
+          }),
+          displayMode: this.getTextDisplayMode()
+        };
+        this.applyTextBindingsToDom();
+      }
+
+      this.restoreAndClearAllTextTargets();
+    });
+    if (currentPageContext) {
+      this.suppressedTextAutoScanPageKeys.add(currentPageContext.pageKey);
+    }
+    this.textTrackedPageKeys.clear();
+    this.textStorageEnvelope = createEmptyTextStorageEnvelope();
+    this.textPageMap = null;
+    await this.persistTextStorageEnvelope(this.textStorageEnvelope);
+    this.renderTexts();
+    this.updateTextObservationState();
+
+    await recordLog("content", "text.storage.reset", "Все сохранённые карты текстов удалены.", {
+      clearedPages
+    });
+
+    return {
+      clearedPages
+    };
+  }
+
+  private readonly handleDocumentTextDoubleClick = (event: MouseEvent): void => {
+    if (!(this.currentConfig?.debug.textElements.inlineEditingEnabled ?? false)) {
+      return;
+    }
+
+    if (this.isElementInsideOverlay(event.target)) {
+      return;
+    }
+
+    const bindingIdAtPoint = this.resolveEditableTextBindingIdAtPoint(event.clientX, event.clientY);
+    const targetElement = event.target instanceof Element
+      ? event.target.closest<HTMLElement>("[data-lextrace-text-editable='true']")
+      : null;
+    const bindingId = bindingIdAtPoint ?? targetElement?.getAttribute("data-lextrace-text-binding-id");
+    if (!bindingId || !this.textPageMap) {
+      return;
+    }
+
+    const binding = this.textPageMap.bindings.find((candidate) => candidate.bindingId === bindingId);
+    const runtimeTarget = this.textTargetMap.get(bindingId);
+    if (!binding || !runtimeTarget) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    this.openInlineTextEditor(binding, runtimeTarget);
+  };
+
+  private resolveEditableTextBindingIdAtPoint(clientX: number, clientY: number): string | null {
+    const pageMap = this.textPageMap;
+    if (!pageMap) {
+      return null;
+    }
+
+    const matches = pageMap.bindings
+      .map((binding) => {
+        const target = this.textTargetMap.get(binding.bindingId);
+        if (!target || !isRuntimeTargetVisuallyRenderable(target)) {
+          return null;
+        }
+
+        const matchingRect = target.getClientRects().find(
+          (rect) =>
+            clientX >= rect.left &&
+            clientX <= rect.left + rect.width &&
+            clientY >= rect.top &&
+            clientY <= rect.top + rect.height
+        );
+        if (!matchingRect) {
+          return null;
+        }
+
+        return {
+          bindingId: binding.bindingId,
+          area: matchingRect.width * matchingRect.height,
+          prefersTextNode: target.textNode ? 0 : 1
+        };
+      })
+      .filter((entry): entry is { bindingId: string; area: number; prefersTextNode: number } => entry !== null)
+      .sort((left, right) => {
+        if (left.prefersTextNode !== right.prefersTextNode) {
+          return left.prefersTextNode - right.prefersTextNode;
+        }
+        return left.area - right.area;
+      });
+
+    return matches[0]?.bindingId ?? null;
+  }
+
+  private openInlineTextEditor(binding: TextBindingRecord, target: TextRuntimeTarget): void {
+    this.resetInlineTextEditor();
+    this.ensureTextDebugStyleElement();
+
+    const editor = document.createElement("textarea");
+    editor.className = "lextrace-inline-text-editor";
+    editor.value = target.readCurrentText();
+    editor.spellcheck = false;
+    this.applyInlineTextEditorTextStyle(target, editor);
+
+    const bindingId = binding.bindingId;
+    editor.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        this.resetInlineTextEditor();
+        return;
+      }
+
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        void this.commitInlineTextEditor(bindingId);
+      }
+    });
+    editor.addEventListener("blur", () => {
+      void this.commitInlineTextEditor(bindingId);
+    });
+
+    const reposition = () => {
+      this.positionInlineTextEditor(target, editor);
+    };
+    const resizeObserver =
+      typeof ResizeObserver === "function"
+        ? new ResizeObserver(() => {
+            reposition();
+          })
+        : null;
+    resizeObserver?.observe(target.styleElement);
+    window.addEventListener("resize", reposition, true);
+
+    document.documentElement.appendChild(editor);
+    reposition();
+    editor.focus();
+    editor.select();
+    this.inlineTextEditor = {
+      bindingId,
+      editor,
+      target,
+      cleanup: () => {
+        window.removeEventListener("resize", reposition, true);
+        resizeObserver?.disconnect();
+      }
+    };
+  }
+
+  private applyInlineTextEditorTextStyle(target: TextRuntimeTarget, editor: HTMLTextAreaElement): void {
+    const sourceElement = target.textNode?.parentElement ?? target.styleElement;
+    const style = window.getComputedStyle(sourceElement);
+    editor.style.font = style.font;
+    editor.style.fontSize = style.fontSize;
+    editor.style.fontFamily = style.fontFamily;
+    editor.style.fontWeight = style.fontWeight;
+    editor.style.fontStyle = style.fontStyle;
+    editor.style.lineHeight = style.lineHeight;
+    editor.style.letterSpacing = style.letterSpacing;
+    editor.style.textTransform = style.textTransform;
+    editor.style.textAlign = style.textAlign;
+    editor.style.whiteSpace = "pre-wrap";
+  }
+
+  private positionInlineTextEditor(target: TextRuntimeTarget, editor: HTMLTextAreaElement): void {
+    if (!target.highlightElement.isConnected || !editor.isConnected) {
+      return;
+    }
+
+    const targetRect = target.getBoundingClientRect();
+    if (!targetRect) {
+      return;
+    }
+
+    const geometry = buildInlineTextEditorGeometry({
+      targetRect,
+      scrollX: 0,
+      scrollY: 0,
+      viewportWidth: window.innerWidth,
+      documentWidth: window.innerWidth
+    });
+
+    editor.style.left = `${geometry.left}px`;
+    editor.style.top = `${geometry.top}px`;
+    editor.style.width = `${geometry.width}px`;
+    editor.style.height = `${geometry.height}px`;
+    editor.style.transform = "translate(0px, 0px)";
+  }
+
+  private async commitInlineTextEditor(bindingId: string): Promise<void> {
+    if (!this.inlineTextEditor || this.inlineTextEditor.bindingId !== bindingId) {
+      return;
+    }
+
+    const { editor } = this.inlineTextEditor;
+    const nextValue = editor.value;
+    this.resetInlineTextEditor();
+    await this.updateCurrentPageTextBinding(bindingId, nextValue);
+  }
+
+  private resetInlineTextEditor(): void {
+    if (!this.inlineTextEditor) {
+      return;
+    }
+
+    this.inlineTextEditor.cleanup();
+    this.inlineTextEditor.editor.remove();
+    this.inlineTextEditor = null;
   }
 
   private buildOverlayTargetPayload(target: TerminalOverlayTarget): { tabId?: number; expectedUrl?: string } {
@@ -1733,7 +4492,11 @@ class OverlayTerminalController {
       return true;
     }
 
-    return this.activityFeed.scrollHeight - this.activityFeed.scrollTop - this.activityFeed.clientHeight <= 24;
+    return isScrollPinnedToBottom(
+      this.activityFeed.scrollHeight,
+      this.activityFeed.scrollTop,
+      this.activityFeed.clientHeight
+    );
   }
 
   private scrollActivityFeedToEnd(): void {
@@ -1742,6 +4505,26 @@ class OverlayTerminalController {
     }
 
     this.activityFeed.scrollTop = this.activityFeed.scrollHeight;
+  }
+
+  private isChatFeedPinnedToBottom(): boolean {
+    if (!this.chatFeed) {
+      return true;
+    }
+
+    return isScrollPinnedToBottom(
+      this.chatFeed.scrollHeight,
+      this.chatFeed.scrollTop,
+      this.chatFeed.clientHeight
+    );
+  }
+
+  private scrollChatFeedToEnd(): void {
+    if (!this.chatFeed) {
+      return;
+    }
+
+    this.chatFeed.scrollTop = this.chatFeed.scrollHeight;
   }
 
   private createTerminalActivityElement(
@@ -2241,6 +5024,118 @@ class OverlayTerminalController {
             };
         }
         break;
+      case "text":
+        switch (parsed.action) {
+          case "status":
+            await this.ensureTextElementsHydrated({
+              reason: "text-status",
+              logSummary: false
+            });
+            return {
+              output: this.buildTextStatusResult()
+            };
+          case "scan": {
+            const pageMap = await this.handleTextScanCommand(true);
+            return {
+              output: {
+                ...this.buildTextStatusResult(),
+                pageMap
+              }
+            };
+          }
+          case "list": {
+            const pageMap =
+              (await this.ensureTextElementsHydrated({
+                reason: "text-list",
+                logSummary: false
+              })) ?? this.textPageMap;
+            return {
+              output: {
+                ...this.buildTextStatusResult(),
+                bindings: (pageMap?.bindings ?? [])
+                  .filter((binding) => parsed.filter === "all" || binding.changed)
+                  .map((binding) => this.buildTextBindingOutput(binding))
+              }
+            };
+          }
+          case "set": {
+            const binding = await this.updateCurrentPageTextBinding(parsed.bindingId, parsed.text);
+            return {
+              output: {
+                ...this.buildTextStatusResult(),
+                binding: this.buildTextBindingOutput(binding)
+              },
+              logDetails: {
+                bindingId: parsed.bindingId
+              }
+            };
+          }
+          case "revert": {
+            const binding = await this.updateCurrentPageTextBinding(parsed.bindingId, null);
+            return {
+              output: {
+                ...this.buildTextStatusResult(),
+                binding: this.buildTextBindingOutput(binding)
+              },
+              logDetails: {
+                bindingId: parsed.bindingId,
+                reverted: true
+              }
+            };
+          }
+          case "mode":
+            await this.sendConfigPatch("local", buildConfigPatchFromPath("debug.textElements.displayMode", parsed.mode));
+            await this.ensureTextElementsHydrated({
+              reason: "text-mode",
+              logSummary: false
+            });
+            return {
+              output: this.buildTextStatusResult(),
+              logDetails: {
+                displayMode: parsed.mode
+              }
+            };
+          case "download":
+            await this.downloadTextMap();
+            return {
+              output: {
+                ...this.buildTextStatusResult(),
+                downloaded: true
+              }
+            };
+          case "reset":
+            if (parsed.scope === "page") {
+              const pageMap = await this.resetCurrentPageTextBindings();
+              return {
+                output: {
+                  ...this.buildTextStatusResult(),
+                  pageMap
+                }
+              };
+            }
+            return {
+              output: await this.resetAllTextStorage()
+            };
+          case "delete":
+            if ("scope" in parsed) {
+              if (parsed.scope === "page") {
+                return {
+                  output: await this.deleteCurrentPageTextMap()
+                };
+              }
+              return {
+                output: await this.resetAllTextStorage()
+              };
+            }
+            return {
+              output: await this.deleteCurrentTextBinding(parsed.bindingId),
+              logDetails: {
+                bindingId: parsed.bindingId,
+                deleted: true
+              }
+            };
+        }
+        break;
       case "models":
         switch (parsed.action) {
           case "list":
@@ -2534,13 +5429,15 @@ class OverlayTerminalController {
   }
 
   private applyRuntimeCommandResult(result: RuntimeSnapshotResponse): RuntimeSnapshotResponse {
-    const parsedConfig = ExtensionConfigSchema.parse(result.config);
+    const parsedConfig = this.reconcileIncomingOverlayGeometry(ExtensionConfigSchema.parse(result.config));
     const parsedLogs = result.logs.map((entry) => LogEntrySchema.parse(entry));
     this.currentConfig = parsedConfig;
     this.currentStatus = parseRuntimeWorkerStatus(result);
     this.setRuntimeLogs(parsedLogs);
     this.applyGeometry(parsedConfig);
     this.render(true);
+    this.updateTextObservationState();
+    this.updateTextDebugPresentation();
     return {
       config: parsedConfig,
       workerStatus: this.currentStatus,
@@ -2576,6 +5473,21 @@ class OverlayTerminalController {
   }
 
   private async patchOverlayLocalConfig(patch: Partial<ExtensionConfig["ui"]["overlay"]>): Promise<void> {
+    if (
+      patch.left !== undefined ||
+      patch.top !== undefined ||
+      patch.width !== undefined ||
+      patch.height !== undefined
+    ) {
+      const currentGeometry = this.readCurrentGeometry();
+      this.pendingOverlayGeometry = {
+        left: patch.left ?? currentGeometry.left,
+        top: patch.top ?? currentGeometry.top,
+        width: patch.width ?? currentGeometry.width,
+        height: patch.height ?? currentGeometry.height
+      };
+    }
+
     try {
       await this.sendConfigPatch("local", {
         ui: {
@@ -2583,8 +5495,42 @@ class OverlayTerminalController {
         }
       });
     } catch {
+      this.pendingOverlayGeometry = null;
       // Ignore drag persistence failures. The window already moved locally.
     }
+  }
+
+  private reconcileIncomingOverlayGeometry(config: ExtensionConfig): ExtensionConfig {
+    if (!this.pendingOverlayGeometry) {
+      return config;
+    }
+
+    const pending = this.pendingOverlayGeometry;
+    const overlay = config.ui.overlay;
+    const matchesPendingGeometry =
+      overlay.left === pending.left &&
+      overlay.top === pending.top &&
+      overlay.width === pending.width &&
+      overlay.height === pending.height;
+
+    if (matchesPendingGeometry) {
+      this.pendingOverlayGeometry = null;
+      return config;
+    }
+
+    return {
+      ...config,
+      ui: {
+        ...config.ui,
+        overlay: {
+          ...overlay,
+          left: pending.left,
+          top: pending.top,
+          width: pending.width,
+          height: pending.height
+        }
+      }
+    };
   }
 
   private applyGeometry(config: ExtensionConfig): void {
@@ -2605,17 +5551,56 @@ class OverlayTerminalController {
     };
   }
 
-  private centerPanelInViewport(): void {
+  private getViewportSize(): OverlayViewport {
+    return {
+      width: window.innerWidth,
+      height: window.innerHeight
+    };
+  }
+
+  private shouldCenterPanelOnOpen(): boolean {
+    const overlay = this.currentConfig?.ui.overlay;
+    const defaults = defaultConfig.ui.overlay;
+    return (
+      !overlay ||
+      (overlay.width === defaults.width &&
+        overlay.height === defaults.height &&
+        overlay.left === defaults.left &&
+        overlay.top === defaults.top)
+    );
+  }
+
+  private centerPanelInViewport(): OverlayGeometry | null {
+    if (!this.panelWindow) {
+      return null;
+    }
+
+    const geometry = this.readCurrentGeometry();
+    const centeredPosition = getCenteredOverlayPosition(this.getViewportSize(), geometry);
+    const nextGeometry = {
+      ...geometry,
+      ...centeredPosition
+    };
+    this.applyLocalGeometry(nextGeometry);
+    return nextGeometry;
+  }
+
+  private async clampPanelIntoViewport(): Promise<void> {
     if (!this.panelWindow) {
       return;
     }
 
-    const panelWidth = this.panelWindow.offsetWidth || this.currentConfig?.ui.overlay.width || 0;
-    const panelHeight = this.panelWindow.offsetHeight || this.currentConfig?.ui.overlay.height || 0;
-    const centeredLeft = this.clampLeft(Math.round((window.innerWidth - panelWidth) / 2));
-    const centeredTop = this.clampTop(Math.round((window.innerHeight - panelHeight) / 2));
+    const currentGeometry = this.readCurrentGeometry();
+    const clampedGeometry = clampOverlayGeometryToViewport(currentGeometry, this.getViewportSize());
+    if (clampedGeometry.left === currentGeometry.left && clampedGeometry.top === currentGeometry.top) {
+      return;
+    }
 
-    this.applyLocalPosition(centeredLeft, centeredTop);
+    this.applyLocalGeometry(clampedGeometry);
+    await this.patchOverlayLocalConfig({
+      left: clampedGeometry.left,
+      top: clampedGeometry.top
+    });
   }
 
   private beginDrag(event: PointerEvent): void {
@@ -2623,7 +5608,7 @@ class OverlayTerminalController {
       return;
     }
 
-    if (event.button !== 0 || this.isInteractiveElement(event.target)) {
+    if (this.resizeState || event.button !== 0 || this.isInteractiveElement(event.target)) {
       return;
     }
 
@@ -2689,13 +5674,110 @@ class OverlayTerminalController {
     });
   }
 
-  private applyLocalPosition(left: number, top: number): void {
+  private beginResize(event: PointerEvent, direction: OverlayResizeHandle, handle: HTMLElement): void {
+    if (!this.visible || !this.panelWindow || event.button !== 0 || this.dragState) {
+      return;
+    }
+
+    this.resizeState = {
+      pointerId: event.pointerId,
+      direction,
+      originX: event.clientX,
+      originY: event.clientY,
+      startGeometry: this.readCurrentGeometry(),
+      moved: false
+    };
+
+    handle.setPointerCapture(event.pointerId);
+    this.panelWindow.classList.add("is-resizing");
+    this.setDocumentCursor(RESIZE_HANDLE_CURSOR[direction]);
+    this.panelWindow.focus();
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
+  private updateResize(event: PointerEvent): void {
+    if (!this.resizeState || event.pointerId !== this.resizeState.pointerId) {
+      return;
+    }
+
+    const deltaX = event.clientX - this.resizeState.originX;
+    const deltaY = event.clientY - this.resizeState.originY;
+    const nextGeometry = resizeOverlayGeometry(
+      this.resizeState.startGeometry,
+      this.resizeState.direction,
+      deltaX,
+      deltaY,
+      this.getViewportSize(),
+      {
+        minWidth: OVERLAY_MIN_WIDTH,
+        minHeight: OVERLAY_MIN_HEIGHT
+      }
+    );
+
+    this.resizeState.moved = this.resizeState.moved || deltaX !== 0 || deltaY !== 0;
+    this.applyLocalGeometry(nextGeometry);
+    this.setDocumentCursor(RESIZE_HANDLE_CURSOR[this.resizeState.direction]);
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
+  private async endResize(event: PointerEvent, handle: HTMLElement): Promise<void> {
+    if (!this.resizeState || event.pointerId !== this.resizeState.pointerId || !this.panelWindow) {
+      return;
+    }
+
+    const finishedState = this.resizeState;
+    this.resizeState = null;
+
+    if (handle.hasPointerCapture(event.pointerId)) {
+      handle.releasePointerCapture(event.pointerId);
+    }
+
+    this.panelWindow.classList.remove("is-resizing");
+    this.setDocumentCursor(null);
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (!finishedState.moved) {
+      return;
+    }
+
+    const geometry = this.readCurrentGeometry();
+    await this.patchOverlayLocalConfig({
+      left: geometry.left,
+      top: geometry.top,
+      width: geometry.width,
+      height: geometry.height
+    });
+    await recordLog("content", "overlay.resize", "Оверлейный терминал изменён по размеру.", geometry);
+  }
+
+  private setDocumentCursor(cursor: string | null): void {
+    const style = document.documentElement.style;
+    if (cursor) {
+      if (this.documentCursorRestoreValue === null) {
+        this.documentCursorRestoreValue = style.cursor;
+      }
+      style.cursor = cursor;
+      return;
+    }
+
+    if (this.documentCursorRestoreValue !== null) {
+      style.cursor = this.documentCursorRestoreValue;
+      this.documentCursorRestoreValue = null;
+    }
+  }
+
+  private applyLocalGeometry(geometry: OverlayGeometry): void {
     if (!this.panelWindow) {
       return;
     }
 
-    this.panelWindow.style.left = `${left}px`;
-    this.panelWindow.style.top = `${top}px`;
+    this.panelWindow.style.left = `${geometry.left}px`;
+    this.panelWindow.style.top = `${geometry.top}px`;
+    this.panelWindow.style.width = `${geometry.width}px`;
+    this.panelWindow.style.height = `${geometry.height}px`;
 
     if (this.currentConfig) {
       this.currentConfig = {
@@ -2704,42 +5786,81 @@ class OverlayTerminalController {
           ...this.currentConfig.ui,
           overlay: {
             ...this.currentConfig.ui.overlay,
-            left,
-            top
+            left: geometry.left,
+            top: geometry.top,
+            width: geometry.width,
+            height: geometry.height
           }
         }
       };
     }
   }
 
+  private applyLocalPosition(left: number, top: number): void {
+    const geometry = this.readCurrentGeometry();
+    this.applyLocalGeometry({
+      ...geometry,
+      left,
+      top
+    });
+  }
+
   private readCurrentPosition(): { left: number; top: number } {
+    const geometry = this.readCurrentGeometry();
+    return {
+      left: geometry.left,
+      top: geometry.top
+    };
+  }
+
+  private readCurrentGeometry(): OverlayGeometry {
     const fallbackLeft = this.currentConfig?.ui.overlay.left ?? 32;
     const fallbackTop = this.currentConfig?.ui.overlay.top ?? 32;
+    const fallbackWidth = this.currentConfig?.ui.overlay.width ?? defaultConfig.ui.overlay.width;
+    const fallbackHeight = this.currentConfig?.ui.overlay.height ?? defaultConfig.ui.overlay.height;
 
     if (!this.panelWindow) {
       return {
         left: fallbackLeft,
-        top: fallbackTop
+        top: fallbackTop,
+        width: fallbackWidth,
+        height: fallbackHeight
       };
     }
 
     const parsedLeft = Number.parseInt(this.panelWindow.style.left || "", 10);
     const parsedTop = Number.parseInt(this.panelWindow.style.top || "", 10);
+    const parsedWidth = Number.parseInt(this.panelWindow.style.width || "", 10);
+    const parsedHeight = Number.parseInt(this.panelWindow.style.height || "", 10);
 
     return {
       left: Number.isFinite(parsedLeft) ? parsedLeft : fallbackLeft,
-      top: Number.isFinite(parsedTop) ? parsedTop : fallbackTop
+      top: Number.isFinite(parsedTop) ? parsedTop : fallbackTop,
+      width: Number.isFinite(parsedWidth) ? parsedWidth : (this.panelWindow.offsetWidth || fallbackWidth),
+      height: Number.isFinite(parsedHeight) ? parsedHeight : (this.panelWindow.offsetHeight || fallbackHeight)
     };
   }
 
   private clampLeft(candidateLeft: number): number {
-    const panelWidth = this.panelWindow?.offsetWidth ?? this.currentConfig?.ui.overlay.width ?? 0;
-    return Math.min(Math.max(0, candidateLeft), Math.max(0, window.innerWidth - panelWidth));
+    const geometry = this.readCurrentGeometry();
+    return clampOverlayGeometryToViewport(
+      {
+        ...geometry,
+        left: candidateLeft
+      },
+      this.getViewportSize()
+    ).left;
   }
 
   private clampTop(candidateTop: number): number {
-    const panelHeight = this.panelWindow?.offsetHeight ?? this.currentConfig?.ui.overlay.height ?? 0;
-    return Math.min(Math.max(0, candidateTop), Math.max(0, window.innerHeight - panelHeight));
+    const geometry = this.readCurrentGeometry();
+    return clampOverlayGeometryToViewport(
+      {
+        ...geometry,
+        top: candidateTop
+      },
+      this.getViewportSize()
+    ).top;
   }
 
   private readonly handleCapturedKeyboardEvent = (event: KeyboardEvent): void => {
@@ -2826,6 +5947,8 @@ class OverlayTerminalController {
   private focusPreferredOverlayElement(): void {
     if (this.activeTab === "chat") {
       this.chatInput?.focus();
+    } else if (this.activeTab === "texts") {
+      this.panelWindow?.focus();
     } else {
       this.terminalInput?.focus();
     }
@@ -2898,7 +6021,7 @@ class OverlayTerminalController {
       return null;
     }
 
-    const scrollContainer = candidate.closest<HTMLElement>(".activity-feed, .chat-feed");
+    const scrollContainer = candidate.closest<HTMLElement>(".activity-feed, .chat-feed, .texts-feed");
     if (scrollContainer) {
       return scrollContainer;
     }
@@ -3024,6 +6147,81 @@ const overlayStyles = `
     gap: 0;
     overflow: hidden;
     overscroll-behavior: contain;
+  }
+
+  .panel-shell.is-resizing {
+    user-select: none;
+  }
+
+  .overlay-resize-handle {
+    position: absolute;
+    z-index: 9;
+    background: transparent;
+    touch-action: none;
+  }
+
+  .overlay-resize-handle--n {
+    top: 0;
+    left: 10px;
+    right: 10px;
+    height: 6px;
+    cursor: ns-resize;
+  }
+
+  .overlay-resize-handle--s {
+    left: 10px;
+    right: 10px;
+    bottom: 0;
+    height: 6px;
+    cursor: ns-resize;
+  }
+
+  .overlay-resize-handle--e {
+    top: 10px;
+    right: 0;
+    bottom: 10px;
+    width: 6px;
+    cursor: ew-resize;
+  }
+
+  .overlay-resize-handle--w {
+    top: 10px;
+    left: 0;
+    bottom: 10px;
+    width: 6px;
+    cursor: ew-resize;
+  }
+
+  .overlay-resize-handle--ne {
+    top: 0;
+    right: 0;
+    width: 12px;
+    height: 12px;
+    cursor: nesw-resize;
+  }
+
+  .overlay-resize-handle--nw {
+    top: 0;
+    left: 0;
+    width: 12px;
+    height: 12px;
+    cursor: nwse-resize;
+  }
+
+  .overlay-resize-handle--se {
+    right: 0;
+    bottom: 0;
+    width: 12px;
+    height: 12px;
+    cursor: nwse-resize;
+  }
+
+  .overlay-resize-handle--sw {
+    left: 0;
+    bottom: 0;
+    width: 12px;
+    height: 12px;
+    cursor: nesw-resize;
   }
 
   .panel-header {
@@ -3343,7 +6541,7 @@ const overlayStyles = `
     text-transform: uppercase;
     box-shadow: 2px 2px 0 rgba(17, 17, 17, 0.08);
     transform: translate(-50%, 4px);
-    z-index: 1;
+    z-index: 12;
   }
 
   .tool-icon::after,
@@ -3367,6 +6565,7 @@ const overlayStyles = `
     background: #111111;
     color: #ffffff;
     outline: none;
+    z-index: 10;
   }
 
   .tool-icon:focus-visible {
@@ -3378,6 +6577,7 @@ const overlayStyles = `
     background: #111111;
     color: #ffffff;
     outline: none;
+    z-index: 10;
   }
 
   .status-action:focus-visible {
@@ -3414,6 +6614,11 @@ const overlayStyles = `
     color: #ffffff;
   }
 
+  .status-chip:hover,
+  .status-chip:focus-visible {
+    z-index: 10;
+  }
+
   .panel-body {
     min-height: 0;
     display: grid;
@@ -3436,6 +6641,132 @@ const overlayStyles = `
     overflow-x: hidden;
     background: #ffffff;
     overscroll-behavior: contain;
+  }
+
+  .texts-body {
+    grid-template-rows: 1fr;
+  }
+
+  .texts-feed {
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 10px;
+    background: #fcfcfc;
+    display: grid;
+    align-content: start;
+    gap: 10px;
+    overscroll-behavior: contain;
+  }
+
+  .texts-empty-state,
+  .texts-summary-card,
+  .text-binding-entry {
+    border: 1px solid #111111;
+    background: #ffffff;
+  }
+
+  .texts-empty-state {
+    padding: 12px 14px;
+    font-size: 13px;
+    line-height: 1.45;
+  }
+
+  .texts-summary-card {
+    display: grid;
+    gap: 6px;
+    padding: 10px 12px;
+  }
+
+  .texts-summary-title {
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+  }
+
+  .texts-summary-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 12px;
+    font-size: 12px;
+  }
+
+  .text-binding-entry {
+    display: grid;
+    gap: 0;
+  }
+
+  .text-binding-entry.is-changed {
+    border-color: #1f7d49;
+    box-shadow: inset 0 0 0 1px rgba(31, 125, 73, 0.22);
+  }
+
+  .text-binding-header {
+    display: grid;
+    gap: 6px;
+    padding: 10px 12px;
+    border-bottom: 1px solid rgba(17, 17, 17, 0.12);
+  }
+
+  .text-binding-title-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .text-binding-badge,
+  .text-binding-id {
+    display: inline-flex;
+    align-items: center;
+    min-height: 22px;
+    padding: 0 8px;
+    border: 1px solid #111111;
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
+
+  .text-binding-badge {
+    background: #111111;
+    color: #ffffff;
+  }
+
+  .text-binding-meta {
+    font-size: 12px;
+    line-height: 1.45;
+    color: #353535;
+    word-break: break-word;
+  }
+
+  .text-binding-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 0;
+  }
+
+  .text-binding-field {
+    display: grid;
+    gap: 6px;
+    padding: 10px 12px;
+    border-top: 1px solid rgba(17, 17, 17, 0.12);
+    border-right: 1px solid rgba(17, 17, 17, 0.12);
+  }
+
+  .text-binding-label {
+    font-size: 10px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: #4f4f4f;
+  }
+
+  .text-binding-value {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: "Bahnschrift", "Segoe UI Variable Text", "Segoe UI", sans-serif;
+    font-size: 12px;
+    line-height: 1.45;
   }
 
   .activity-entry {

@@ -28,6 +28,17 @@ describe("terminal alias helpers", () => {
       "chat.compact [current|url <url>|key <pageKey> [pageUrl <url>]]",
       "chat.compact.force [current|url <url>|key <pageKey> [pageUrl <url>]]",
       "",
+      "[text]",
+      "text.status",
+      "text.scan",
+      "text.list [all|changed]",
+      "text.set <bindingId> -- <text>",
+      "text.revert <bindingId>",
+      "text.mode <effective|original>",
+      "text.download",
+      "text.reset <page|all>",
+      "text.delete <bindingId|page|all>",
+      "",
       "[models]",
       "models.list",
       "models.allow list",
@@ -140,6 +151,28 @@ describe("terminal alias helpers", () => {
       tab: "control",
       raw: "popup.tab control"
     });
+    expect(parseTerminalAliasCommand("text.mode original")).toEqual({
+      kind: "alias",
+      namespace: "text",
+      action: "mode",
+      mode: "original",
+      raw: "text.mode original"
+    });
+    expect(parseTerminalAliasCommand("text.set txt_123 -- hello")).toEqual({
+      kind: "alias",
+      namespace: "text",
+      action: "set",
+      bindingId: "txt_123",
+      text: "hello",
+      raw: "text.set txt_123 -- hello"
+    });
+    expect(parseTerminalAliasCommand("text.delete txt_123")).toEqual({
+      kind: "alias",
+      namespace: "text",
+      action: "delete",
+      bindingId: "txt_123",
+      raw: "text.delete txt_123"
+    });
   });
 
   it("returns null for raw protocol-looking payloads", () => {
@@ -155,6 +188,8 @@ describe("terminal alias helpers", () => {
     expect(() => parseTerminalAliasCommand("logs.tail 0")).toThrow(/limit/i);
     expect(() => parseTerminalAliasCommand("logs.subscribe since")).toThrow(/logs\.subscribe since/i);
     expect(() => parseTerminalAliasCommand("chat.send --   ")).toThrow(/chat\.send/i);
+    expect(() => parseTerminalAliasCommand("text.set txt_123")).toThrow(/text\.set/i);
+    expect(() => parseTerminalAliasCommand("text.delete ")).toThrow(/text\.delete/i);
     expect(parseTerminalAliasCommand("logs.note")).toBeNull();
   });
 });

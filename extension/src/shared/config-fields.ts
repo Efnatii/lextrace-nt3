@@ -248,9 +248,46 @@ export const editableConfigFields = [
   createDescriptor("ai.retries.maxRetries", "local", "number", NonNegativeIntegerSchema),
   createDescriptor("ai.retries.baseDelayMs", "local", "number", AiPositiveIntegerSchema),
   createDescriptor("ai.retries.maxDelayMs", "local", "number", AiPositiveIntegerSchema),
+  createDescriptor("ai.queueRetries.maxRetries", "local", "number", NonNegativeIntegerSchema),
+  createDescriptor("ai.queueRetries.baseDelayMs", "local", "number", AiPositiveIntegerSchema),
+  createDescriptor("ai.queueRetries.maxDelayMs", "local", "number", AiPositiveIntegerSchema),
   createDescriptor("ai.rateLimits.reserveOutputTokens", "local", "number", AiPositiveIntegerSchema),
   createDescriptor("ai.rateLimits.maxQueuedPerPage", "local", "number", AiPositiveIntegerSchema),
   createDescriptor("ai.rateLimits.maxQueuedGlobal", "local", "number", AiPositiveIntegerSchema),
+  createDescriptor(
+    "debug.textElements.highlightEnabled",
+    "local",
+    "boolean",
+    z.boolean(),
+    createBooleanOptions()
+  ),
+  createDescriptor(
+    "debug.textElements.inlineEditingEnabled",
+    "local",
+    "boolean",
+    z.boolean(),
+    createBooleanOptions()
+  ),
+  createDescriptor(
+    "debug.textElements.displayMode",
+    "local",
+    "enum",
+    z.enum(["effective", "original"]),
+    createNamedOptions({
+      effective: "effective/current",
+      original: "original"
+    })
+  ),
+  createDescriptor(
+    "debug.textElements.autoScanMode",
+    "local",
+    "enum",
+    z.enum(["off", "incremental"]),
+    createNamedOptions({
+      off: "off/manual",
+      incremental: "incremental"
+    })
+  ),
   createDescriptor("test.demoHeartbeatMs", "local", "number", RuntimeDelaySchema),
   createDescriptor(
     "test.allowHostCrashCommand",
@@ -260,6 +297,20 @@ export const editableConfigFields = [
     createBooleanOptions()
   )
 ] as const satisfies readonly EditableConfigFieldDescriptor[];
+
+const overlayActiveTabFieldDescriptor = editableConfigFields.find(
+  (descriptor) => descriptor.path === "ui.overlay.activeTab"
+);
+if (overlayActiveTabFieldDescriptor) {
+  const nextOptions = [...(overlayActiveTabFieldDescriptor.options ?? [])];
+  if (!nextOptions.some((option) => option.value === "texts")) {
+    nextOptions.push({
+      label: "texts",
+      value: "texts"
+    });
+    overlayActiveTabFieldDescriptor.options = nextOptions;
+  }
+}
 
 const editableConfigFieldMap = new Map<string, EditableConfigFieldDescriptor>(
   editableConfigFields.map((descriptor) => [descriptor.path, descriptor])
@@ -292,15 +343,18 @@ export function isSensitiveConfigPath(path: string): boolean {
 }
 
 const configKeyOrderRegistry = new Map<string, readonly string[]>([
-  ["", ["ui", "ai", "logging", "runtime", "protocol", "test"]],
+  ["", ["ui", "debug", "ai", "logging", "runtime", "protocol", "test"]],
   ["ui", ["popupActiveTab", "overlay"]],
   ["ui.overlay", ["activeTab", "visible", "width", "height", "left", "top"]],
-  ["ai", ["openAiApiKey", "allowedModels", "chat", "compaction", "promptCaching", "rateLimits", "retries"]],
+  ["debug", ["textElements"]],
+  ["debug.textElements", ["highlightEnabled", "inlineEditingEnabled", "displayMode", "autoScanMode"]],
+  ["ai", ["openAiApiKey", "allowedModels", "chat", "compaction", "promptCaching", "retries", "queueRetries", "rateLimits"]],
   ["ai.chat", ["model", "streamingEnabled", "instructions", "structuredOutput"]],
   ["ai.chat.structuredOutput", ["name", "description", "schema", "strict"]],
   ["ai.compaction", ["enabled", "streamingEnabled", "modelOverride", "instructions", "triggerPromptTokens", "preserveRecentTurns", "maxPassesPerPage"]],
   ["ai.promptCaching", ["routing", "retention"]],
   ["ai.retries", ["maxRetries", "baseDelayMs", "maxDelayMs"]],
+  ["ai.queueRetries", ["maxRetries", "baseDelayMs", "maxDelayMs"]],
   ["ai.rateLimits", ["reserveOutputTokens", "maxQueuedPerPage", "maxQueuedGlobal"]],
   ["logging", ["level", "maxEntries", "collapseThreshold"]],
   ["runtime", ["nativeHostName", "reconnectPolicy", "heartbeatMs", "commandTimeoutMs"]],

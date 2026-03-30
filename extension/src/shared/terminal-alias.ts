@@ -5,6 +5,7 @@ import type { OverlayTab, PopupTab } from "./config";
 export const TERMINAL_HELP_TOPICS = [
   "config",
   "chat",
+  "text",
   "models",
   "logs",
   "overlay",
@@ -121,6 +122,62 @@ export type TerminalAliasCommand =
       kind: "alias";
       namespace: "chat";
       action: "list";
+      raw: string;
+    }
+  | {
+      kind: "alias";
+      namespace: "text";
+      action: "status" | "scan" | "download";
+      raw: string;
+    }
+  | {
+      kind: "alias";
+      namespace: "text";
+      action: "list";
+      filter: "all" | "changed";
+      raw: string;
+    }
+  | {
+      kind: "alias";
+      namespace: "text";
+      action: "set";
+      bindingId: string;
+      text: string;
+      raw: string;
+    }
+  | {
+      kind: "alias";
+      namespace: "text";
+      action: "revert";
+      bindingId: string;
+      raw: string;
+    }
+  | {
+      kind: "alias";
+      namespace: "text";
+      action: "mode";
+      mode: "effective" | "original";
+      raw: string;
+    }
+  | {
+      kind: "alias";
+      namespace: "text";
+      action: "reset";
+      scope: "page" | "all";
+      raw: string;
+    }
+  | {
+      kind: "alias";
+      namespace: "text";
+      action: "delete";
+      scope: "page" | "all";
+      raw: string;
+    }
+  | {
+      kind: "alias";
+      namespace: "text";
+      action: "delete";
+      bindingId: string;
       raw: string;
     }
   | {
@@ -251,7 +308,7 @@ type TerminalHelpEntrySpec = {
   coversActions?: string[];
 };
 
-const HELP_ENTRY_REGISTRY = [
+const HELP_ENTRY_REGISTRY: readonly TerminalHelpEntrySpec[] = [
   {
     topic: "runtime",
     command: "host.connect",
@@ -478,6 +535,60 @@ const HELP_ENTRY_REGISTRY = [
     coversActions: [COMMANDS.aiChatCompact]
   },
   {
+    topic: "text",
+    command: "text.status",
+    description: "Показывает summary по найденным текстовым элементам текущей страницы и режиму отображения.",
+    examples: ["text.status"]
+  },
+  {
+    topic: "text",
+    command: "text.scan",
+    description: "Пересканирует страницу, обновляет binding-map и переприменяет сохранённые замены.",
+    examples: ["text.scan"]
+  },
+  {
+    topic: "text",
+    command: "text.list [all|changed]",
+    description: "Показывает JSON-список найденных текстовых binding-элементов, при changed только изменённые.",
+    examples: ["text.list", "text.list changed"]
+  },
+  {
+    topic: "text",
+    command: "text.set <bindingId> -- <text>",
+    description: "Сохраняет замену для binding и немедленно применяет её на странице.",
+    examples: ["text.set txt_ab12cd34 -- New text"]
+  },
+  {
+    topic: "text",
+    command: "text.revert <bindingId>",
+    description: "Убирает замену для binding и возвращает исходный текст.",
+    examples: ["text.revert txt_ab12cd34"]
+  },
+  {
+    topic: "text",
+    command: "text.mode <effective|original>",
+    description: "Переключает режим показа: исходные тексты или изменённые/текущие.",
+    examples: ["text.mode effective", "text.mode original"]
+  },
+  {
+    topic: "text",
+    command: "text.download",
+    description: "Скачивает текущую JSON-карту текстовых binding-элементов.",
+    examples: ["text.download"]
+  },
+  {
+    topic: "text",
+    command: "text.reset <page|all>",
+    description: "Сбрасывает замены и сохранённую карту для текущей страницы или полностью для всех страниц.",
+    examples: ["text.reset page", "text.reset all"]
+  },
+  {
+    topic: "text",
+    command: "text.delete <bindingId|page|all>",
+    description: "РЈРґР°Р»СЏРµС‚ binding-Р·Р°РїРёСЃРё РёР· РєР°СЂС‚С‹ С‚РµРєСЃС‚РѕРІ РёР»Рё РїРѕР»РЅРѕСЃС‚СЊСЋ РѕС‡РёС‰Р°РµС‚ С…СЂР°РЅРёРјС‹Рµ РґР°РЅРЅС‹Рµ.",
+    examples: ["text.delete txt_ab12cd34", "text.delete page", "text.delete all"]
+  },
+  {
     topic: "models",
     command: "models.list",
     description: "Загружает каталог моделей OpenAI с доступностью и ценами.",
@@ -567,11 +678,12 @@ const HELP_ENTRY_REGISTRY = [
     gate: "host-crash",
     coversActions: [COMMANDS.testHostCrash]
   }
-] as const satisfies readonly TerminalHelpEntrySpec[];
+] as const;
 
 const TOPIC_ORDER = [
   "config",
   "chat",
+  "text",
   "models",
   "logs",
   "overlay",
@@ -865,6 +977,100 @@ export function parseTerminalAliasCommand(rawInput: string): TerminalAliasComman
       kind: "alias",
       namespace: "chat",
       action: "list",
+      raw
+    };
+  }
+
+  if (raw === "text.status" || raw === "text.scan" || raw === "text.download") {
+    return {
+      kind: "alias",
+      namespace: "text",
+      action: raw.slice("text.".length) as "status" | "scan" | "download",
+      raw
+    };
+  }
+  if (raw === "text.list" || raw === "text.list all" || raw === "text.list changed") {
+    return {
+      kind: "alias",
+      namespace: "text",
+      action: "list",
+      filter: raw.endsWith("changed") ? "changed" : "all",
+      raw
+    };
+  }
+  if (raw === "text.reset page" || raw === "text.reset all") {
+    return {
+      kind: "alias",
+      namespace: "text",
+      action: "reset",
+      scope: raw.endsWith("all") ? "all" : "page",
+      raw
+    };
+  }
+  if (raw === "text.delete page" || raw === "text.delete all") {
+    return {
+      kind: "alias",
+      namespace: "text",
+      action: "delete",
+      scope: raw.endsWith("all") ? "all" : "page",
+      raw
+    };
+  }
+  if (raw === "text.mode effective" || raw === "text.mode original") {
+    return {
+      kind: "alias",
+      namespace: "text",
+      action: "mode",
+      mode: raw.endsWith("original") ? "original" : "effective",
+      raw
+    };
+  }
+  if (raw.startsWith("text.revert ")) {
+    const bindingId = raw.slice("text.revert ".length).trim();
+    if (!bindingId) {
+      throw new Error("text.revert requires a bindingId.");
+    }
+    return {
+      kind: "alias",
+      namespace: "text",
+      action: "revert",
+      bindingId,
+      raw
+    };
+  }
+  if (raw === "text.delete") {
+    throw new Error("text.delete requires a bindingId, page, or all.");
+  }
+  if (raw.startsWith("text.delete ")) {
+    const bindingId = raw.slice("text.delete ".length).trim();
+    if (!bindingId) {
+      throw new Error("text.delete requires a bindingId, page, or all.");
+    }
+    return {
+      kind: "alias",
+      namespace: "text",
+      action: "delete",
+      bindingId,
+      raw
+    };
+  }
+  if (raw.startsWith("text.set ")) {
+    const remainder = raw.slice("text.set ".length).trim();
+    const delimiterIndex = remainder.indexOf(" -- ");
+    if (delimiterIndex === -1) {
+      throw new Error("text.set requires <bindingId> -- <text>.");
+    }
+    const bindingId = remainder.slice(0, delimiterIndex).trim();
+    const text = remainder.slice(delimiterIndex + " -- ".length);
+    if (!bindingId || !text.trim()) {
+      throw new Error("text.set requires <bindingId> -- <text>.");
+    }
+    return {
+      kind: "alias",
+      namespace: "text",
+      action: "set",
+      bindingId,
+      text,
       raw
     };
   }

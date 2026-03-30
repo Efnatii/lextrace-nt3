@@ -2,7 +2,7 @@ using System.Text.Json;
 
 namespace LexTrace.NativeHost;
 
-internal sealed class HostStateStore
+internal sealed class HostStateStore : IHostStateStore
 {
     private readonly string _stateFilePath;
     private readonly JsonSerializerOptions _serializerOptions = new()
@@ -45,13 +45,28 @@ internal sealed class HostStateStore
 
     public async Task SaveAsync(HostJournal journal, CancellationToken cancellationToken)
     {
-        var tempFilePath = $"{_stateFilePath}.tmp";
+        var stateDirectory = Path.GetDirectoryName(_stateFilePath)
+            ?? throw new InvalidOperationException("Native host state directory is unavailable.");
+        var tempFilePath = Path.Combine(
+            stateDirectory,
+            $"{Path.GetFileName(_stateFilePath)}.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp");
+
         await using (var stream = File.Create(tempFilePath))
         {
             await JsonSerializer.SerializeAsync(stream, journal, _serializerOptions, cancellationToken);
         }
 
-        File.Move(tempFilePath, _stateFilePath, overwrite: true);
+        try
+        {
+            File.Move(tempFilePath, _stateFilePath, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(tempFilePath))
+            {
+                File.Delete(tempFilePath);
+            }
+        }
     }
 }
 

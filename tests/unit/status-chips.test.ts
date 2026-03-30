@@ -41,6 +41,16 @@ describe("status chip catalog", () => {
     ]);
   });
 
+  it("covers text debug status chips", () => {
+    expect(getStatusChipKeys("texts")).toEqual([
+      "changed",
+      "items",
+      "mode",
+      "page",
+      "scan"
+    ]);
+  });
+
   it("preserves page full value while allowing a shortened display value", () => {
     const [descriptor] = buildStatusChipDescriptors("chat", [
       {

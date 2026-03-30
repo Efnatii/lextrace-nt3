@@ -9,7 +9,8 @@ export const STORAGE_KEYS = {
   sessionConfig: "lextrace.config.session",
   runtimeState: "lextrace.runtime.state",
   logs: "lextrace.runtime.logs",
-  aiSessions: "lextrace.ai.sessions"
+  aiSessions: "lextrace.ai.sessions",
+  textMaps: "lextrace.page.textMaps"
 } as const;
 
 export const MAX_LOG_DETAILS_PREVIEW = 240;

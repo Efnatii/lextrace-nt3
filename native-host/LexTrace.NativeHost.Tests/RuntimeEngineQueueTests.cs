@@ -147,6 +147,27 @@ public sealed class RuntimeEngineQueueTests
     }
 
     [Fact]
+    public void DetermineRetryHandlingResumesWrappedResponseEndedTransportFailures()
+    {
+        var activeItem = new AiQueueItemRecord
+        {
+            OpenAiResponseId = "resp_123"
+        };
+
+        var decision = RuntimeEngine.DetermineRetryHandling(
+            new InvalidOperationException("The response ended prematurely. (ResponseEnded)"),
+            activeItem,
+            new AiRetryConfig()
+        );
+
+        Assert.Equal(RuntimeEngine.RetryHandlingDecision.ActionAutoRetry, decision.Action);
+        Assert.Equal("stream_disconnect", decision.FailureClassification);
+        Assert.Equal("resume", decision.RetryMode);
+        Assert.False(decision.ClearResponseState);
+        Assert.Equal(1000, decision.DelayMs);
+    }
+
+    [Fact]
     public void DetermineRetryHandlingStopsAutoRetryWhenBudgetIsExhausted()
     {
         var activeItem = new AiQueueItemRecord

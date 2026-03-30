@@ -1,4 +1,4 @@
-export type StatusChipKind = "chat" | "console";
+export type StatusChipKind = "chat" | "console" | "texts";
 
 export type StatusChipWidth = "default" | "short" | "wide" | "page";
 
@@ -314,9 +314,57 @@ const chatStatusChipMeta: Readonly<Record<string, StatusChipMeta>> = {
   }
 };
 
+const textsStatusChipMeta: Readonly<Record<string, StatusChipMeta>> = {
+  page: chatStatusChipMeta.page,
+  mode: {
+    tooltipLabel: "Text mode",
+    icon: {
+      viewBox: DEFAULT_VIEWBOX,
+      paths: [
+        { d: "M4 4.5h8" },
+        { d: "M6.5 4.5v7" },
+        { d: "M9.5 4.5v7" },
+        { d: "M4.5 11.5h7" }
+      ]
+    }
+  },
+  items: {
+    tooltipLabel: "Text bindings",
+    icon: {
+      viewBox: DEFAULT_VIEWBOX,
+      paths: [
+        { d: "M4 4.5h8" },
+        { d: "M4 8h8" },
+        { d: "M4 11.5h8" }
+      ]
+    }
+  },
+  changed: {
+    tooltipLabel: "Changed bindings",
+    icon: {
+      viewBox: DEFAULT_VIEWBOX,
+      paths: [
+        { d: "M4.5 8 7 10.5l4.5-5" }
+      ]
+    }
+  },
+  scan: {
+    tooltipLabel: "Last scan",
+    width: "wide",
+    icon: {
+      viewBox: DEFAULT_VIEWBOX,
+      paths: [
+        { d: "M8 13a5 5 0 1 0 0-10 5 5 0 0 0 0 10Z" },
+        { d: "M8 5.25V8l2 1.25" }
+      ]
+    }
+  }
+};
+
 const statusChipMetaByKind: Readonly<Record<StatusChipKind, Readonly<Record<string, StatusChipMeta>>>> = {
   console: consoleStatusChipMeta,
-  chat: chatStatusChipMeta
+  chat: chatStatusChipMeta,
+  texts: textsStatusChipMeta
 };
 
 function createFallbackMeta(key: string): StatusChipMeta {

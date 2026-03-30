@@ -57,6 +57,7 @@ internal sealed class AiRuntimeConfig
     public AiPromptCachingConfig PromptCaching { get; set; } = new();
     public AiRateLimitConfig RateLimits { get; set; } = new();
     public AiRetryConfig Retries { get; set; } = new();
+    public AiRetryConfig QueueRetries { get; set; } = new();
 
     public static AiRuntimeConfig CreateDefault() => new();
 }
@@ -203,6 +204,7 @@ internal sealed class AiQueueItemRecord
     public int AttemptCount { get; set; }
     public int AutoRetryCount { get; set; }
     public string? NotBeforeAt { get; set; }
+    public string RetryPolicyScope { get; set; } = "single";
     public string PromptCacheRoutingApplied { get; set; } = PromptCaching.RoutingStableSessionPrefix;
     public string PromptCacheRetentionApplied { get; set; } = PromptCaching.RetentionInMemory;
     public string? PromptCacheKey { get; set; }
@@ -248,6 +250,7 @@ internal sealed class AiPageSessionRecord
     public int? LastSequenceNumber { get; set; }
     public string? LastResolvedServiceTier { get; set; }
     public int CompactionPassCount { get; set; }
+    public int LastRejectedAutoCompactionAffectedTurnCount { get; set; }
     public List<AiChatMessageRecord> Messages { get; set; } = [];
     public List<AiQueueItemRecord> PendingQueue { get; set; } = [];
     public AiQueueItemRecord? ActiveItem { get; set; }

@@ -11,7 +11,7 @@ import {
   type AiStreamMessage
 } from "../shared/ai";
 import { COMMANDS, RECONNECT_ALARM_NAME, RUNTIME_STREAM_PORT, STORAGE_KEYS, STREAM_EVENTS } from "../shared/constants";
-import { buildEffectiveConfig, defaultConfig, mergeConfigPatch, normalizeConfigPatch, type ExtensionConfig, type ExtensionConfigPatch } from "../shared/config";
+import { buildEffectiveConfig, defaultConfig, mergeConfigPatch, normalizeConfigPatch, normalizePersistedConfigPatch, type ExtensionConfig, type ExtensionConfigPatch } from "../shared/config";
 import { createLogEntry, isLogLevelEnabled, LogEntryInputSchema, LogEntrySchema, serializeError, type LogEntry } from "../shared/logging";
 import {
   OverlayProbeResultSchema,
@@ -351,8 +351,8 @@ async function bootstrap(reason: string): Promise<void> {
         STORAGE_KEYS.aiSessions
       ]);
 
-      localConfigPatch = normalizeConfigPatch(localValues[STORAGE_KEYS.localConfig] ?? {});
-      sessionConfigPatch = normalizeConfigPatch(sessionValues[STORAGE_KEYS.sessionConfig] ?? {});
+      localConfigPatch = normalizePersistedConfigPatch(localValues[STORAGE_KEYS.localConfig] ?? {});
+      sessionConfigPatch = normalizePersistedConfigPatch(sessionValues[STORAGE_KEYS.sessionConfig] ?? {});
       configCache = buildEffectiveConfig(localConfigPatch, sessionConfigPatch);
 
       const storedLogs = sessionValues[STORAGE_KEYS.logs];

@@ -116,6 +116,7 @@ describe("config field parsing and formatting", () => {
     ["ai.promptCaching.routing", "provider_default", "provider_default"],
     ["ai.promptCaching.retention", "24h", "24h"],
     ["ai.retries.maxRetries", "2", 2],
+    ["ai.queueRetries.maxRetries", "4", 4],
     ["ai.chat.model", '{"model":"gpt-5","tier":"flex"}', { model: "gpt-5", tier: "flex" }],
     ["ai.chat.model", "null", null],
     ["ai.allowedModels", '["gpt-5","gpt-5-mini"]', [
@@ -279,6 +280,9 @@ describe("config normalization and patch composition", () => {
             },
             retries: {
               maxRetries: 2
+            },
+            queueRetries: {
+              maxRetries: 2
             }
           }
         }
@@ -295,6 +299,9 @@ describe("config normalization and patch composition", () => {
             streamingEnabled: false
           },
           retries: {
+            maxRetries: 2
+          },
+          queueRetries: {
             maxRetries: 2
           },
           rateLimits: {

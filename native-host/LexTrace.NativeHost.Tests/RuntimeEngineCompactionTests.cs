@@ -78,6 +78,61 @@ public sealed class RuntimeEngineCompactionTests
     }
 
     [Fact]
+    public void CompactionAffectedMessagesPreserveWholeTurnsWhenRawMessagesAreStoredOutOfOrder()
+    {
+        var session = new AiPageSessionRecord
+        {
+            Messages =
+            [
+                new AiChatMessageRecord
+                {
+                    Id = "user-1",
+                    RequestId = "req-1",
+                    Kind = "user",
+                    Origin = "user",
+                    Role = "user",
+                    Text = "first queued user",
+                    State = "completed"
+                },
+                new AiChatMessageRecord
+                {
+                    Id = "user-2",
+                    RequestId = "req-2",
+                    Kind = "user",
+                    Origin = "user",
+                    Role = "user",
+                    Text = "second queued user",
+                    State = "completed"
+                },
+                new AiChatMessageRecord
+                {
+                    Id = "assistant-1",
+                    RequestId = "req-1",
+                    Kind = "assistant",
+                    Origin = "assistant",
+                    Role = "assistant",
+                    Text = "first queued assistant",
+                    State = "completed"
+                },
+                new AiChatMessageRecord
+                {
+                    Id = "assistant-2",
+                    RequestId = "req-2",
+                    Kind = "assistant",
+                    Origin = "assistant",
+                    Role = "assistant",
+                    Text = "second queued assistant",
+                    State = "completed"
+                }
+            ]
+        };
+
+        var affected = RuntimeEngine.GetCompactionAffectedMessages(session, preserveRecentTurns: 1);
+
+        Assert.Equal(["user-1", "assistant-1"], affected.Select(message => message.Id).ToArray());
+    }
+
+    [Fact]
     public void GetMessageCompactedByReadsPersistedJsonMeta()
     {
         var message = new AiChatMessageRecord
@@ -107,6 +162,21 @@ public sealed class RuntimeEngineCompactionTests
     }
 
     [Fact]
+    public void BuildCompactionResultPreviewDoesNotTruncateLongExtractedText()
+    {
+        var longText = new string('x', 2200);
+        var preview = RuntimeEngine.BuildCompactionResultPreview(
+        [
+            $$"""
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"{{longText}}"}]}
+            """
+        ]);
+
+        Assert.Equal(longText, preview);
+        Assert.DoesNotContain("...", preview);
+    }
+
+    [Fact]
     public void BuildCompactionResultPreviewFallsBackToPrettyJson()
     {
         var preview = RuntimeEngine.BuildCompactionResultPreview(
@@ -117,6 +187,71 @@ public sealed class RuntimeEngineCompactionTests
         ]);
 
         Assert.Contains("\"type\": \"reasoning\"", preview);
+    }
+
+    [Fact]
+    public void InsertSessionMessageAfterAnchorPlacesCompactionEventsBeforeLaterQueuedTurns()
+    {
+        var session = new AiPageSessionRecord
+        {
+            Messages =
+            [
+                new AiChatMessageRecord
+                {
+                    Id = "user-1",
+                    Kind = "user",
+                    Origin = "user",
+                    Role = "user",
+                    Text = "first",
+                    State = "completed"
+                },
+                new AiChatMessageRecord
+                {
+                    Id = "assistant-1",
+                    Kind = "assistant",
+                    Origin = "assistant",
+                    Role = "assistant",
+                    Text = "answer-1",
+                    State = "completed"
+                },
+                new AiChatMessageRecord
+                {
+                    Id = "user-2",
+                    Kind = "user",
+                    Origin = "user",
+                    Role = "user",
+                    Text = "second",
+                    State = "pending"
+                }
+            ]
+        };
+
+        var requestMessage = new AiChatMessageRecord
+        {
+            Id = "cmp-request",
+            Kind = "compaction-request",
+            Origin = "system",
+            Role = "system",
+            Text = "compacting",
+            State = "pending"
+        };
+        RuntimeEngine.InsertSessionMessageAfterAnchor(session, requestMessage, "assistant-1");
+
+        var resultMessage = new AiChatMessageRecord
+        {
+            Id = "cmp-result",
+            Kind = "compaction-result",
+            Origin = "system",
+            Role = "system",
+            Text = "done",
+            State = "completed"
+        };
+        RuntimeEngine.InsertSessionMessageAfterAnchor(session, resultMessage, "cmp-request", "assistant-1");
+
+        Assert.Equal(
+            ["user-1", "assistant-1", "cmp-request", "cmp-result", "user-2"],
+            session.Messages.Select(message => message.Id).ToArray()
+        );
     }
 
     [Fact]

@@ -25,6 +25,7 @@ describe("editable config fields", () => {
       valueType: "enum",
       editorType: "select"
     });
+    expect(getEditableConfigField("ui.overlay.activeTab")?.options?.some((option) => option.value === "texts")).toBe(true);
 
     expect(getEditableConfigField("runtime.nativeHostName")).toMatchObject({
       scope: "local",
@@ -104,6 +105,24 @@ describe("editable config fields", () => {
       valueType: "number",
       editorType: "inline"
     });
+
+    expect(getEditableConfigField("ai.queueRetries.maxRetries")).toMatchObject({
+      scope: "local",
+      valueType: "number",
+      editorType: "inline"
+    });
+
+    expect(getEditableConfigField("debug.textElements.highlightEnabled")).toMatchObject({
+      scope: "local",
+      valueType: "boolean",
+      editorType: "select"
+    });
+
+    expect(getEditableConfigField("debug.textElements.autoScanMode")).toMatchObject({
+      scope: "local",
+      valueType: "enum",
+      editorType: "select"
+    });
   });
 
   it("builds nested config patches from field paths", () => {
@@ -123,6 +142,9 @@ describe("editable config fields", () => {
     expect(parseConfigFieldDraft("protocol.testCommandsEnabled", "true")).toBe(true);
     expect(parseConfigFieldDraft("ai.promptCaching.retention", "24h")).toBe("24h");
     expect(parseConfigFieldDraft("ai.retries.maxRetries", "4")).toBe(4);
+    expect(parseConfigFieldDraft("ai.queueRetries.maxRetries", "5")).toBe(5);
+    expect(parseConfigFieldDraft("debug.textElements.displayMode", "original")).toBe("original");
+    expect(parseConfigFieldDraft("debug.textElements.autoScanMode", "incremental")).toBe("incremental");
     expect(parseConfigFieldDraft("ai.chat.model", '{"model":"gpt-5","tier":"priority"}')).toEqual({
       model: "gpt-5",
       tier: "priority"
@@ -168,6 +190,21 @@ describe("editable config fields", () => {
     expect(
       getOrderedConfigEntries(
         {
+          ai: {},
+          debug: {},
+          logging: {},
+          protocol: {},
+          runtime: {},
+          test: {},
+          ui: {}
+        },
+        ""
+      ).map(([key]) => key)
+    ).toEqual(["ui", "debug", "ai", "logging", "runtime", "protocol", "test"]);
+
+    expect(
+      getOrderedConfigEntries(
+        {
           width: 920,
           top: 12,
           visible: false,
@@ -178,6 +215,18 @@ describe("editable config fields", () => {
         "ui.overlay"
       ).map(([key]) => key)
     ).toEqual(["activeTab", "visible", "width", "height", "left", "top"]);
+
+    expect(
+      getOrderedConfigEntries(
+        {
+          inlineEditingEnabled: false,
+          displayMode: "effective",
+          autoScanMode: "incremental",
+          highlightEnabled: true
+        },
+        "debug.textElements"
+      ).map(([key]) => key)
+    ).toEqual(["highlightEnabled", "inlineEditingEnabled", "displayMode", "autoScanMode"]);
 
     expect(
       getOrderedConfigEntries(
@@ -208,6 +257,7 @@ describe("editable config fields", () => {
       getOrderedConfigEntries(
         {
           retries: {},
+          queueRetries: {},
           allowedModels: [],
           chat: {},
           openAiApiKey: null,
@@ -217,7 +267,7 @@ describe("editable config fields", () => {
         },
         "ai"
       ).map(([key]) => key)
-    ).toEqual(["openAiApiKey", "allowedModels", "chat", "compaction", "promptCaching", "rateLimits", "retries"]);
+    ).toEqual(["openAiApiKey", "allowedModels", "chat", "compaction", "promptCaching", "retries", "queueRetries", "rateLimits"]);
 
     expect(
       getOrderedConfigEntries(
@@ -227,6 +277,17 @@ describe("editable config fields", () => {
           baseDelayMs: 1000
         },
         "ai.retries"
+      ).map(([key]) => key)
+    ).toEqual(["maxRetries", "baseDelayMs", "maxDelayMs"]);
+
+    expect(
+      getOrderedConfigEntries(
+        {
+          maxDelayMs: 30000,
+          maxRetries: 3,
+          baseDelayMs: 1000
+        },
+        "ai.queueRetries"
       ).map(([key]) => key)
     ).toEqual(["maxRetries", "baseDelayMs", "maxDelayMs"]);
 
@@ -288,6 +349,7 @@ describe("editable config fields", () => {
     expect(getEditableConfigPaths({ prefix: "ai.", includeSensitive: false })).toContain("ai.chat.streamingEnabled");
     expect(getEditableConfigPaths({ prefix: "ai.", includeSensitive: false })).toContain("ai.compaction.enabled");
     expect(getEditableConfigPaths({ prefix: "ai.", includeSensitive: false })).toContain("ai.retries.maxRetries");
+    expect(getEditableConfigPaths({ prefix: "ai.", includeSensitive: false })).toContain("ai.queueRetries.maxRetries");
     expect(getEditableConfigPaths({ prefix: "ai.", includeSensitive: false })).not.toContain("ai.openAiApiKey");
   });
 

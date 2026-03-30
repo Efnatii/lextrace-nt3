@@ -80,6 +80,7 @@ internal static class PromptCaching
                 epoch: session.CompactionPassCount,
                 instructions: config.Chat.Instructions,
                 schemaName: config.Chat.StructuredOutput.Name,
+                schemaDescription: config.Chat.StructuredOutput.Description,
                 schema: config.Chat.StructuredOutput.Schema,
                 strict: config.Chat.StructuredOutput.Strict
             )
@@ -109,6 +110,7 @@ internal static class PromptCaching
                 epoch: session.CompactionPassCount,
                 instructions: resolvedInstructions,
                 schemaName: null,
+                schemaDescription: null,
                 schema: null,
                 strict: false
             )
@@ -267,6 +269,7 @@ internal static class PromptCaching
         int epoch,
         string? instructions,
         string? schemaName,
+        string? schemaDescription,
         string? schema,
         bool strict
     )
@@ -281,6 +284,7 @@ internal static class PromptCaching
             epoch.ToString(),
             ComputeFingerprint(instructions),
             ComputeFingerprint(schemaName),
+            ComputeFingerprint(schemaDescription),
             ComputeFingerprint(schema),
             strict ? "1" : "0"
         ]);
