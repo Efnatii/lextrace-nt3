@@ -24,6 +24,9 @@ export const TextElementCategorySchema = z.enum([
 ]);
 export type TextElementCategory = z.infer<typeof TextElementCategorySchema>;
 
+export const TextBindingPresenceSchema = z.enum(["live", "stale"]);
+export type TextBindingPresence = z.infer<typeof TextBindingPresenceSchema>;
+
 export const TextBindingLocatorSchema = z.object({
   preferredSelector: z.string().nullable(),
   ancestorSelector: z.string().nullable(),
@@ -46,6 +49,8 @@ export type TextBindingContext = z.infer<typeof TextBindingContextSchema>;
 export const TextBindingRecordSchema = z.object({
   bindingId: z.string().min(1),
   category: TextElementCategorySchema,
+  presence: TextBindingPresenceSchema,
+  staleSince: z.string().nullable(),
   originalText: z.string(),
   originalNormalized: z.string(),
   replacementText: z.string().nullable(),
@@ -94,6 +99,8 @@ export type TextStorageEnvelope = z.infer<typeof TextStorageEnvelopeSchema>;
 
 export type TextMapSummary = {
   total: number;
+  live: number;
+  stale: number;
   changed: number;
   unchanged: number;
   categories: Record<TextElementCategory, number>;
@@ -295,8 +302,12 @@ export function buildTextMapSummary(pageMap: TextPageMap | null | undefined): Te
   }
 
   const changed = bindings.filter((binding) => binding.changed).length;
+  const live = bindings.filter((binding) => binding.presence === "live").length;
+  const stale = bindings.length - live;
   return {
     total: bindings.length,
+    live,
+    stale,
     changed,
     unchanged: bindings.length - changed,
     categories
@@ -308,6 +319,8 @@ export function areTextBindingsEquivalentForPersistence(
     TextBindingRecord,
     | "bindingId"
     | "category"
+    | "presence"
+    | "staleSince"
     | "originalText"
     | "originalNormalized"
     | "replacementText"
@@ -323,6 +336,8 @@ export function areTextBindingsEquivalentForPersistence(
     TextBindingRecord,
     | "bindingId"
     | "category"
+    | "presence"
+    | "staleSince"
     | "originalText"
     | "originalNormalized"
     | "replacementText"
@@ -338,6 +353,8 @@ export function areTextBindingsEquivalentForPersistence(
   return (
     left.bindingId === right.bindingId &&
     left.category === right.category &&
+    left.presence === right.presence &&
+    left.staleSince === right.staleSince &&
     left.originalText === right.originalText &&
     left.originalNormalized === right.originalNormalized &&
     left.replacementText === right.replacementText &&
@@ -442,6 +459,29 @@ export function matchBindingToCandidate(
   };
 }
 
+export function isReliableTextBindingMatch(
+  binding: Pick<TextBindingRecord, "originalNormalized" | "attributeName" | "locator">,
+  candidate: TextScanCandidate,
+  result: MatchResult
+): boolean {
+  if (result.score < 40) {
+    return false;
+  }
+
+  const hasPreferredSelectorMatch =
+    Boolean(binding.locator.preferredSelector) &&
+    binding.locator.preferredSelector === candidate.locator.preferredSelector &&
+    (binding.attributeName ?? null) === (candidate.attributeName ?? null);
+  const hasElementSelectorMatch =
+    Boolean(binding.locator.elementSelector) &&
+    binding.locator.elementSelector === candidate.locator.elementSelector &&
+    binding.locator.nodeIndex === candidate.locator.nodeIndex &&
+    (binding.attributeName ?? null) === (candidate.attributeName ?? null);
+  const hasExactTextMatch = binding.originalNormalized === candidate.normalizedText;
+
+  return hasPreferredSelectorMatch || hasElementSelectorMatch || hasExactTextMatch || result.score >= 90;
+}
+
 export function mergeTextPageMapWithCandidates(
   pageMap: TextPageMap,
   candidates: readonly TextScanCandidate[],
@@ -462,6 +502,8 @@ export function mergeTextPageMapWithCandidates(
       const nextBinding: TextBindingRecord = {
         ...matchedBinding,
         category: candidate.category,
+        presence: "live",
+        staleSince: null,
         originalText: candidate.text,
         originalNormalized: candidate.normalizedText,
         effectiveText: resolveDisplayedBindingText(
@@ -501,6 +543,8 @@ export function mergeTextPageMapWithCandidates(
       TextBindingRecordSchema.parse({
         bindingId,
         category: candidate.category,
+        presence: "live",
+        staleSince: null,
         originalText: candidate.text,
         originalNormalized: candidate.normalizedText,
         replacementText: null,
@@ -519,12 +563,20 @@ export function mergeTextPageMapWithCandidates(
     );
   }
 
+  const staleBindings = remainingBindings.map((binding) =>
+    TextBindingRecordSchema.parse({
+      ...binding,
+      presence: "stale",
+      staleSince: binding.staleSince ?? now
+    })
+  );
+
   return {
     ...pageMap,
     pageTitle: options?.pageTitle ?? pageMap.pageTitle,
     lastScanAt: now,
     updatedAt: now,
-    bindings: mergedBindings
+    bindings: [...mergedBindings, ...staleBindings]
   };
 }
 
@@ -754,7 +806,7 @@ export function mapBindingsToCandidateIndices(
 
     remainingCandidates.forEach((entry, remainingIndex) => {
       const result = matchBindingToCandidate(binding, entry.candidate);
-      if (result.score < 40) {
+      if (!isReliableTextBindingMatch(binding, entry.candidate, result)) {
         return;
       }
 
@@ -791,7 +843,7 @@ function findBestBindingMatch(
 
   bindings.forEach((binding, index) => {
     const result = matchBindingToCandidate(binding, candidate);
-    if (result.score < 40) {
+    if (!isReliableTextBindingMatch(binding, candidate, result)) {
       return;
     }
 

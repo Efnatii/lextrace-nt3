@@ -312,6 +312,60 @@ async function main() {
     await openOverlayAndWait(driver, popupHandle, mainHandle, weirdPageUrl);
     await selectOverlayTab(driver, "texts");
 
+    await driver.executeScript(`
+      const lead = document.querySelector('#lead-copy');
+      if (lead instanceof HTMLElement) {
+        window.__lextraceLeadCopyText = lead.textContent ?? 'Alpha paragraph for replacement';
+        lead.remove();
+      }
+    `);
+    await waitFor(
+      async () => {
+        const snapshot = await getTextsTabSnapshot(driver);
+        return snapshot.entries.some((entry) => entry.bindingId === leadBinding.bindingId && entry.presence === "stale");
+      },
+      15000,
+      "Removed text binding did not transition to stale."
+    );
+    const staleLeadHighlights = await getHighlightSnapshot(driver);
+    assert.ok(
+      !staleLeadHighlights.items.some((item) => item.bindingId === leadBinding.bindingId),
+      "A stale binding still produced in-page highlight boxes."
+    );
+    const storedAfterLeadRemoval = await readStoredTextPageMap(driver, popupHandle, weirdPageKey);
+    assert.equal(
+      storedAfterLeadRemoval?.bindings?.find((binding) => binding.bindingId === leadBinding.bindingId)?.presence ?? null,
+      "stale",
+      "Removed binding was not marked stale in storage."
+    );
+
+    await driver.executeScript(`
+      const proofRoot = document.querySelector('#proof-root > section.panel');
+      if (!(proofRoot instanceof HTMLElement)) {
+        return;
+      }
+      const lead = document.createElement('p');
+      lead.id = 'lead-copy';
+      lead.textContent = window.__lextraceLeadCopyText ?? 'Alpha paragraph for replacement';
+      const repeatParagraph = [...proofRoot.querySelectorAll('p')].find((element) => (element.textContent ?? '').includes('Repeat me'));
+      proofRoot.insertBefore(lead, repeatParagraph ?? null);
+    `);
+    await waitFor(
+      async () => {
+        const snapshot = await getTextsTabSnapshot(driver);
+        return snapshot.entries.some((entry) => entry.bindingId === leadBinding.bindingId && entry.presence === "live");
+      },
+      15000,
+      "Restored text binding did not reactivate from stale to live."
+    );
+    await waitForPageText(driver, "#lead-copy", "Alpha paragraph for replacement");
+    const storedAfterLeadRestore = await readStoredTextPageMap(driver, popupHandle, weirdPageKey);
+    report.assertions.staleLifecycle = {
+      bindingId: leadBinding.bindingId,
+      stalePresencePersisted: storedAfterLeadRemoval?.bindings?.find((binding) => binding.bindingId === leadBinding.bindingId)?.presence ?? null,
+      livePresencePersisted: storedAfterLeadRestore?.bindings?.find((binding) => binding.bindingId === leadBinding.bindingId)?.presence ?? null
+    };
+
     const headingReplacement = "Live heading replacement";
     const setHeadingCommand = await runOverlayTerminalCommand(
       driver,
@@ -322,8 +376,21 @@ async function main() {
     report.visuals.weirdPageChangedHighlight = await captureScreenshot(driver, "weird-page-changed-highlight.png");
 
     const changedHighlightSnapshot = await getHighlightSnapshot(driver);
-    const changedHeading = changedHighlightSnapshot.items.find((item) => item.bindingId === titleBinding.bindingId);
-    assert.equal(changedHeading?.debugState, "changed", "Changed bindings are not highlighted in green mode.");
+    const changedHeadingState = await driver.executeScript(
+      `
+        const bindingId = arguments[0];
+        const element = document.querySelector('[data-lextrace-text-binding-id="' + CSS.escape(bindingId) + '"]');
+        return {
+          debugState: element?.getAttribute('data-lextrace-text-debug') ?? null,
+          hasNativeChangedHighlight: Number(CSS?.highlights?.get?.('lextrace-text-changed')?.size ?? 0) > 0
+        };
+      `,
+      titleBinding.bindingId
+    );
+    assert(
+      changedHeadingState?.debugState === "changed" || changedHeadingState?.hasNativeChangedHighlight === true,
+      "Changed bindings are not highlighted in green mode."
+    );
 
     const modeOriginalCommand = await runOverlayTerminalCommand(driver, "text.mode original");
     assert.equal(modeOriginalCommand.ok, true, `text.mode original failed: ${modeOriginalCommand.error ?? "unknown error"}`);
@@ -335,7 +402,7 @@ async function main() {
     report.assertions.replacementAndModes = {
       headingBindingId: titleBinding.bindingId,
       replacementText: headingReplacement,
-      changedHighlightState: changedHeading?.debugState ?? null,
+      changedHighlightState: changedHeadingState?.debugState ?? null,
       originalModeText: "Alpha title",
       effectiveModeText: headingReplacement
     };
@@ -391,8 +458,16 @@ async function main() {
     await driver.get(proofServer.makeUrl("/scroll-lab"));
     await waitForHighlights(driver, 1, "Scroll-lab page did not auto-scan after enabling incremental mode.");
     const scrollLabHighlightSnapshot = await getHighlightSnapshot(driver);
+    const scrollLabPageKey = normalizePageKey(proofServer.makeUrl("/scroll-lab"));
+    const storedScrollLabPageMap = await readStoredTextPageMap(driver, popupHandle, scrollLabPageKey);
+    assert.equal(
+      storedScrollLabPageMap,
+      null,
+      "Incremental bootstrap on a fresh page should remain runtime-only until a real semantic change."
+    );
     report.assertions.incrementalAutoBootstrap = {
-      scrollLabHighlightCount: scrollLabHighlightSnapshot.count
+      scrollLabHighlightCount: scrollLabHighlightSnapshot.count,
+      storedPageMapPresent: false
     };
     await openOverlayAndWait(driver, popupHandle, mainHandle, proofServer.makeUrl("/scroll-lab"));
     await selectOverlayTab(driver, "texts");
@@ -727,15 +802,22 @@ async function getTextsTabSnapshot(driver) {
     root?.querySelector(".overlay-tab-button[data-tab='texts']")?.click();
     window.setTimeout(() => {
       const entries = [...(root?.querySelectorAll('.text-binding-entry') ?? [])].map((entry) => {
-        const fields = [...entry.querySelectorAll('.text-binding-field .text-binding-value')].map((field) => field.textContent ?? '');
+        const fieldMap = Object.fromEntries(
+          [...entry.querySelectorAll('.text-binding-field')].map((field) => [
+            field.getAttribute('data-binding-field') ?? '',
+            field.querySelector('.text-binding-value')?.textContent ?? ''
+          ])
+        );
         return {
           bindingId: entry.getAttribute('data-binding-id') ?? '',
           category: entry.getAttribute('data-binding-category') ?? '',
+          presence: entry.getAttribute('data-binding-presence') ?? '',
           changed: entry.classList.contains('is-changed'),
-          originalText: fields[0] ?? '',
-          displayedText: fields[1] ?? '',
-          replacementText: fields[2] ?? '',
-          contextText: fields[3] ?? ''
+          statusText: fieldMap.status ?? '',
+          originalText: fieldMap.original ?? '',
+          displayedText: fieldMap.displayed ?? '',
+          replacementText: fieldMap.replacement ?? '',
+          contextText: fieldMap.context ?? ''
         };
       });
       done({
@@ -751,6 +833,10 @@ async function getTextsTabSnapshot(driver) {
 
 async function getHighlightSnapshot(driver) {
   return driver.executeScript(`
+    const registry = typeof CSS !== 'undefined' && 'highlights' in CSS ? CSS.highlights : null;
+    const nativeRangeCount =
+      Number(registry?.get?.('lextrace-text-source')?.size ?? 0) +
+      Number(registry?.get?.('lextrace-text-changed')?.size ?? 0);
     const items = [...document.querySelectorAll('[data-lextrace-text-highlight-box="true"]')].map((element) => ({
       bindingId: element.getAttribute('data-lextrace-text-binding-id'),
       debugState: element.getAttribute('data-lextrace-text-debug'),
@@ -764,7 +850,9 @@ async function getHighlightSnapshot(driver) {
       }
     }));
     return {
-      count: items.length,
+      count: items.length + nativeRangeCount,
+      overlayBoxCount: items.length,
+      nativeRangeCount,
       sourceCount: items.filter((item) => item.debugState === 'source').length,
       changedCount: items.filter((item) => item.debugState === 'changed').length,
       items
@@ -925,7 +1013,7 @@ async function injectDynamicProofBlock(driver, options = {}) {
 async function triggerInlineEditor(driver, selector) {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const alreadyPresent = await driver.executeScript(`
-      return document.querySelector('.lextrace-inline-text-editor') instanceof HTMLTextAreaElement;
+      return document.querySelector('.lextrace-inline-text-editor') instanceof HTMLElement;
     `);
     if (alreadyPresent === true) {
       return;
@@ -950,7 +1038,7 @@ async function triggerInlineEditor(driver, selector) {
       await waitFor(
         async () => {
           const present = await driver.executeScript(`
-            return document.querySelector('.lextrace-inline-text-editor') instanceof HTMLTextAreaElement;
+            return document.querySelector('.lextrace-inline-text-editor') instanceof HTMLElement;
           `);
           return present === true;
         },
@@ -970,7 +1058,7 @@ async function triggerInlineEditor(driver, selector) {
 async function dismissInlineEditor(driver) {
   await driver.executeScript(`
     const editor = document.querySelector('.lextrace-inline-text-editor');
-    if (editor instanceof HTMLTextAreaElement) {
+    if (editor instanceof HTMLElement) {
       editor.dispatchEvent(new KeyboardEvent('keydown', {
         key: 'Escape',
         bubbles: true
@@ -980,7 +1068,7 @@ async function dismissInlineEditor(driver) {
   await waitFor(
     async () => {
       const present = await driver.executeScript(`
-        return document.querySelector('.lextrace-inline-text-editor') instanceof HTMLTextAreaElement;
+        return document.querySelector('.lextrace-inline-text-editor') instanceof HTMLElement;
       `);
       return present === false;
     },
@@ -993,10 +1081,14 @@ async function commitInlineEditor(driver, value) {
   await driver.executeScript(
     `
       const editor = document.querySelector('.lextrace-inline-text-editor');
-      if (!(editor instanceof HTMLTextAreaElement)) {
+      if (!(editor instanceof HTMLElement)) {
         throw new Error('Inline editor is unavailable.');
       }
-      editor.value = arguments[0];
+      if (editor instanceof HTMLTextAreaElement) {
+        editor.value = arguments[0];
+      } else {
+        editor.textContent = arguments[0];
+      }
       editor.dispatchEvent(new Event('input', { bubbles: true }));
       editor.dispatchEvent(new KeyboardEvent('keydown', {
         key: 'Enter',
@@ -1049,6 +1141,43 @@ async function getInlineEditorAnchorSnapshot(driver, selector) {
           height: Math.max(0, bottom - top)
         };
       };
+      const buildEditorRect = (editor) => {
+        if (editor instanceof HTMLTextAreaElement) {
+          return editor.getBoundingClientRect();
+        }
+
+        const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+        let current = walker.nextNode();
+        const rects = [];
+        while (current) {
+          if (current instanceof Text && (current.textContent ?? '').trim().length > 0) {
+            const range = document.createRange();
+            range.selectNodeContents(current);
+            rects.push(...[...range.getClientRects()].filter((rect) => rect.width > 0 && rect.height > 0));
+            range.detach?.();
+          }
+          current = walker.nextNode();
+        }
+        if (rects.length === 0) {
+          return editor.getBoundingClientRect();
+        }
+        let left = rects[0].left;
+        let top = rects[0].top;
+        let right = rects[0].right;
+        let bottom = rects[0].bottom;
+        rects.slice(1).forEach((rect) => {
+          left = Math.min(left, rect.left);
+          top = Math.min(top, rect.top);
+          right = Math.max(right, rect.right);
+          bottom = Math.max(bottom, rect.bottom);
+        });
+        return {
+          left,
+          top,
+          width: Math.max(0, right - left),
+          height: Math.max(0, bottom - top)
+        };
+      };
       const target = document.querySelector(arguments[0]);
       const editor = document.querySelector('.lextrace-inline-text-editor');
       if (!(target instanceof HTMLElement)) {
@@ -1058,14 +1187,14 @@ async function getInlineEditorAnchorSnapshot(driver, selector) {
         };
       }
       const targetRect = buildTargetTextRect(target);
-      if (!(editor instanceof HTMLTextAreaElement)) {
+      if (!(editor instanceof HTMLElement)) {
         return {
           editorPresent: false,
           targetPresent: true,
           targetRect: buildRectSnapshot(targetRect)
         };
       }
-      const editorRect = editor.getBoundingClientRect();
+      const editorRect = buildEditorRect(editor);
       return {
         editorPresent: true,
         targetPresent: true,

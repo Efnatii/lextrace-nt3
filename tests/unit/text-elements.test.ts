@@ -377,9 +377,86 @@ describe("text element helpers", () => {
       }
     );
 
-    expect(secondScan.bindings).toHaveLength(1);
+    expect(secondScan.bindings).toHaveLength(2);
     expect(secondScan.bindings[0]?.category).toBe("button");
     expect(secondScan.bindings[0]?.originalText).toBe("Launch");
+    expect(secondScan.bindings[0]?.presence).toBe("live");
+    expect(secondScan.bindings[1]?.originalText).toBe("Alpha");
+    expect(secondScan.bindings[1]?.presence).toBe("stale");
+    expect(secondScan.bindings[1]?.staleSince).toBe("2026-03-29T00:00:02.000Z");
+  });
+
+  it("keeps missing bindings as stale and reactivates them on a later full scan", () => {
+    const pageMap = createEmptyTextPageMap({
+      pageKey: "https://example.com/path",
+      pageUrl: "https://example.com/path",
+      now: "2026-03-30T00:00:00.000Z"
+    });
+
+    const firstScan = mergeTextPageMapWithCandidates(
+      pageMap,
+      [
+        createCandidate({
+          category: "paragraph",
+          text: "Alpha",
+          normalizedText: "Alpha",
+          locator: {
+            preferredSelector: "#alpha",
+            ancestorSelector: "main",
+            elementSelector: "main > p:nth-of-type(1)",
+            nodeIndex: 0,
+            tagName: "p",
+            attributeName: null,
+            classNames: [],
+            stableAttributes: {}
+          }
+        })
+      ],
+      {
+        now: "2026-03-30T00:00:01.000Z"
+      }
+    );
+
+    const staleScan = mergeTextPageMapWithCandidates(
+      firstScan,
+      [],
+      {
+        now: "2026-03-30T00:00:02.000Z"
+      }
+    );
+
+    expect(staleScan.bindings).toHaveLength(1);
+    expect(staleScan.bindings[0]?.presence).toBe("stale");
+    expect(staleScan.bindings[0]?.staleSince).toBe("2026-03-30T00:00:02.000Z");
+
+    const reactivatedScan = mergeTextPageMapWithCandidates(
+      staleScan,
+      [
+        createCandidate({
+          category: "paragraph",
+          text: "Alpha",
+          normalizedText: "Alpha",
+          locator: {
+            preferredSelector: "#alpha",
+            ancestorSelector: "main",
+            elementSelector: "main > p:nth-of-type(1)",
+            nodeIndex: 0,
+            tagName: "p",
+            attributeName: null,
+            classNames: [],
+            stableAttributes: {}
+          }
+        })
+      ],
+      {
+        now: "2026-03-30T00:00:03.000Z"
+      }
+    );
+
+    expect(reactivatedScan.bindings).toHaveLength(1);
+    expect(reactivatedScan.bindings[0]?.bindingId).toBe(firstScan.bindings[0]?.bindingId);
+    expect(reactivatedScan.bindings[0]?.presence).toBe("live");
+    expect(reactivatedScan.bindings[0]?.staleSince).toBeNull();
   });
 
   it("resolves display mode correctly", () => {
@@ -452,6 +529,8 @@ describe("text element helpers", () => {
     const summaryAfter = buildTextMapSummary(reset);
 
     expect(summaryBefore.total).toBe(2);
+    expect(summaryBefore.live).toBe(2);
+    expect(summaryBefore.stale).toBe(0);
     expect(summaryBefore.changed).toBe(1);
     expect(summaryBefore.categories.heading).toBe(1);
     expect(summaryAfter.changed).toBe(0);

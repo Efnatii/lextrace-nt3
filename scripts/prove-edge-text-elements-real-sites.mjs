@@ -98,6 +98,18 @@ async function main() {
         siteResult.suspiciousBoxes = suspiciousBoxes;
         siteResult.screenshotPath = await captureScreenshot(driver, `${site.key}.png`);
 
+        if (site.key === "youtube") {
+          const deepScroll = await runDeepScrollProof(driver, popupHandle, pageKey, textsSnapshot.entryCount);
+          siteResult.deepScroll = deepScroll;
+          siteResult.deepScrollScreenshotPath = await captureScreenshot(driver, `${site.key}-deep-scroll.png`);
+          if (!deepScroll.retainedHighlights) {
+            throw new Error("YouTube deep-scroll proof lost all highlight boxes on at least one step.");
+          }
+          if (!deepScroll.expandedOrRetainedEntries) {
+            throw new Error("YouTube deep-scroll proof did not retain or expand text bindings.");
+          }
+        }
+
         const inlineProbe = await probeInlineEditorAgainstLargestBox(driver, suspiciousBoxes);
         siteResult.inlineProbe = inlineProbe;
       } catch (error) {
@@ -123,7 +135,7 @@ async function enableTextDebugConfig(driver) {
   await setSelectValueWithRetry(driver, "debug.textElements.highlightEnabled", "true");
   await setSelectValueWithRetry(driver, "debug.textElements.inlineEditingEnabled", "true");
   await setSelectValueWithRetry(driver, "debug.textElements.displayMode", "effective");
-  await setSelectValueWithRetry(driver, "debug.textElements.autoScanMode", "off");
+  await setSelectValueWithRetry(driver, "debug.textElements.autoScanMode", "incremental");
 }
 
 async function setSelectValueWithRetry(driver, configPath, value) {
@@ -176,6 +188,39 @@ async function navigateToSite(driver, url) {
   }
 
   await waitForPageReady(driver, url, 45000);
+}
+
+async function runDeepScrollProof(driver, popupHandle, pageKey, initialEntryCount) {
+  const samples = [];
+  for (let step = 0; step < 6; step += 1) {
+    await driver.executeScript(`
+      window.scrollBy({
+        top: Math.max(480, Math.floor(window.innerHeight * 0.9)),
+        behavior: 'auto'
+      });
+    `);
+    await new Promise((resolve) => setTimeout(resolve, 1800));
+    const textsSnapshot = await getTextsTabSnapshot(driver);
+    const highlightSnapshot = await getHighlightSnapshot(driver);
+    const storedPageMap = await readStoredTextPageMap(driver, popupHandle, pageKey);
+    samples.push({
+      step: step + 1,
+      entryCount: textsSnapshot.entryCount,
+      highlightCount: highlightSnapshot.count,
+      storedBindingCount: storedPageMap?.bindings?.length ?? null
+    });
+  }
+
+  const highlightCounts = samples.map((sample) => sample.highlightCount);
+  const entryCounts = samples.map((sample) => sample.entryCount);
+  return {
+    initialEntryCount,
+    samples,
+    minHighlightCount: Math.min(...highlightCounts),
+    maxEntryCount: Math.max(initialEntryCount, ...entryCounts),
+    retainedHighlights: highlightCounts.every((count) => count > 0),
+    expandedOrRetainedEntries: Math.max(initialEntryCount, ...entryCounts) >= initialEntryCount
+  };
 }
 
 async function waitForOverlay(driver) {
@@ -290,6 +335,10 @@ async function getHighlightSnapshot(driver) {
   return driver.executeScript(`
     const viewportWidth = window.innerWidth;
     const viewportHeight = window.innerHeight;
+    const registry = typeof CSS !== 'undefined' && 'highlights' in CSS ? CSS.highlights : null;
+    const nativeRangeCount =
+      Number(registry?.get?.('lextrace-text-source')?.size ?? 0) +
+      Number(registry?.get?.('lextrace-text-changed')?.size ?? 0);
     const items = [...document.querySelectorAll('[data-lextrace-text-highlight-box="true"]')].map((element) => {
       const rect = element.getBoundingClientRect();
       return {
@@ -306,7 +355,9 @@ async function getHighlightSnapshot(driver) {
       };
     });
     return {
-      count: items.length,
+      count: items.length + nativeRangeCount,
+      overlayBoxCount: items.length,
+      nativeRangeCount,
       items
     };
   `);
