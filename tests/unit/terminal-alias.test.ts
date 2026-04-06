@@ -33,6 +33,7 @@ describe("terminal alias helpers", () => {
       "text.scan",
       "text.list [all|changed]",
       "text.set <bindingId> -- <text>",
+      "text.blank page",
       "text.revert <bindingId>",
       "text.mode <effective|original>",
       "text.download",
@@ -165,6 +166,21 @@ describe("terminal alias helpers", () => {
       bindingId: "txt_123",
       text: "hello",
       raw: "text.set txt_123 -- hello"
+    });
+    expect(parseTerminalAliasCommand("text.set txt_123 --")).toEqual({
+      kind: "alias",
+      namespace: "text",
+      action: "set",
+      bindingId: "txt_123",
+      text: "",
+      raw: "text.set txt_123 --"
+    });
+    expect(parseTerminalAliasCommand("text.blank page")).toEqual({
+      kind: "alias",
+      namespace: "text",
+      action: "blank",
+      scope: "page",
+      raw: "text.blank page"
     });
     expect(parseTerminalAliasCommand("text.delete txt_123")).toEqual({
       kind: "alias",

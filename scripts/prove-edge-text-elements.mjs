@@ -1025,9 +1025,11 @@ async function triggerInlineEditor(driver, selector) {
         if (!(element instanceof HTMLElement)) {
           throw new Error('Inline edit target is unavailable for ' + arguments[0]);
         }
-        element.dispatchEvent(new MouseEvent('dblclick', {
+        element.dispatchEvent(new MouseEvent('contextmenu', {
           bubbles: true,
           cancelable: true,
+          button: 2,
+          buttons: 2,
           view: window
         }));
       `,

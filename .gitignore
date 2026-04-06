@@ -2,7 +2,9 @@ node_modules/
 coverage/
 test-results/
 playwright-report/
+.claude/
 artifacts/dist/
+artifacts/screenshots/
 artifacts/tmp/
 artifacts/native-host/
 artifacts/extension/

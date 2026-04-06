@@ -16,6 +16,7 @@ import {
   mapBindingsToCandidateIndices,
   mergeTextPageMapWithCandidates,
   normalizeTextForBinding,
+  reconcileAutoBlankBindings,
   removeBindingFromPageMap,
   removePageMapFromEnvelope,
   resetPageBindings,
@@ -377,16 +378,13 @@ describe("text element helpers", () => {
       }
     );
 
-    expect(secondScan.bindings).toHaveLength(2);
+    expect(secondScan.bindings).toHaveLength(1);
     expect(secondScan.bindings[0]?.category).toBe("button");
     expect(secondScan.bindings[0]?.originalText).toBe("Launch");
     expect(secondScan.bindings[0]?.presence).toBe("live");
-    expect(secondScan.bindings[1]?.originalText).toBe("Alpha");
-    expect(secondScan.bindings[1]?.presence).toBe("stale");
-    expect(secondScan.bindings[1]?.staleSince).toBe("2026-03-29T00:00:02.000Z");
   });
 
-  it("keeps missing bindings as stale and reactivates them on a later full scan", () => {
+  it("drops unchanged missing bindings and recreates them on a later full scan", () => {
     const pageMap = createEmptyTextPageMap({
       pageKey: "https://example.com/path",
       pageUrl: "https://example.com/path",
@@ -425,9 +423,7 @@ describe("text element helpers", () => {
       }
     );
 
-    expect(staleScan.bindings).toHaveLength(1);
-    expect(staleScan.bindings[0]?.presence).toBe("stale");
-    expect(staleScan.bindings[0]?.staleSince).toBe("2026-03-30T00:00:02.000Z");
+    expect(staleScan.bindings).toHaveLength(0);
 
     const reactivatedScan = mergeTextPageMapWithCandidates(
       staleScan,
@@ -454,7 +450,6 @@ describe("text element helpers", () => {
     );
 
     expect(reactivatedScan.bindings).toHaveLength(1);
-    expect(reactivatedScan.bindings[0]?.bindingId).toBe(firstScan.bindings[0]?.bindingId);
     expect(reactivatedScan.bindings[0]?.presence).toBe("live");
     expect(reactivatedScan.bindings[0]?.staleSince).toBeNull();
   });
@@ -513,8 +508,11 @@ describe("text element helpers", () => {
         preferredSelector: "#target",
         elementSelector: "main > span:nth-of-type(1)",
         ancestorSelector: "main",
+        tagName: "h1",
         attributeName: null,
-        nodeIndex: 0
+        nodeIndex: 0,
+        contextText: "ancestor",
+        stableAttributes: {}
       }),
       "Changed heading",
       {
@@ -535,6 +533,124 @@ describe("text element helpers", () => {
     expect(summaryBefore.categories.heading).toBe(1);
     expect(summaryAfter.changed).toBe(0);
     expect(reset.bindings.every((binding) => binding.replacementText === null)).toBe(true);
+    expect(reset.bindings.every((binding) => binding.autoBlanked === false)).toBe(true);
+  });
+
+  it("marks config-generated blank replacements and clears them when auto-blank is disabled", () => {
+    const scanned = mergeTextPageMapWithCandidates(
+      createEmptyTextPageMap({
+        pageKey: "https://example.com/path",
+        pageUrl: "https://example.com/path",
+        pageTitle: "Example page",
+        now: "2026-04-05T18:00:00.000Z"
+      }),
+      [
+        createCandidate({
+          category: "paragraph",
+          text: "Alpha",
+          normalizedText: "Alpha"
+        })
+      ],
+      {
+        pageTitle: "Example page",
+        now: "2026-04-05T18:00:01.000Z"
+      }
+    );
+
+    const autoBlanked = reconcileAutoBlankBindings(scanned, true, {
+      now: "2026-04-05T18:00:02.000Z"
+    });
+    expect(autoBlanked.didChange).toBe(true);
+    expect(autoBlanked.pageMap.bindings[0]?.replacementText).toBe("");
+    expect(autoBlanked.pageMap.bindings[0]?.autoBlanked).toBe(true);
+    expect(autoBlanked.pageMap.bindings[0]?.effectiveText).toBe("");
+
+    const reverted = reconcileAutoBlankBindings(autoBlanked.pageMap, false, {
+      now: "2026-04-05T18:00:03.000Z"
+    });
+    expect(reverted.didChange).toBe(true);
+    expect(reverted.revertedBindings).toBe(1);
+    expect(reverted.pageMap.bindings[0]?.replacementText).toBeNull();
+    expect(reverted.pageMap.bindings[0]?.autoBlanked).toBe(false);
+    expect(reverted.pageMap.bindings[0]?.effectiveText).toBe("Alpha");
+    expect(reverted.pageMap.bindings[0]?.changed).toBe(false);
+  });
+
+  it("does not clear manual empty replacements when auto-blank is disabled", () => {
+    const scanned = mergeTextPageMapWithCandidates(
+      createEmptyTextPageMap({
+        pageKey: "https://example.com/path",
+        pageUrl: "https://example.com/path",
+        pageTitle: "Example page",
+        now: "2026-04-05T18:10:00.000Z"
+      }),
+      [
+        createCandidate({
+          category: "paragraph",
+          text: "Manual blank",
+          normalizedText: "Manual blank"
+        })
+      ],
+      {
+        pageTitle: "Example page",
+        now: "2026-04-05T18:10:01.000Z"
+      }
+    );
+
+    const manuallyBlanked = updateBindingReplacement(scanned, scanned.bindings[0]!.bindingId, "", {
+      now: "2026-04-05T18:10:02.000Z"
+    });
+    const reconciled = reconcileAutoBlankBindings(manuallyBlanked, false, {
+      now: "2026-04-05T18:10:03.000Z"
+    });
+
+    expect(reconciled.didChange).toBe(false);
+    expect(reconciled.revertedBindings).toBe(0);
+    expect(reconciled.pageMap.bindings[0]?.replacementText).toBe("");
+    expect(reconciled.pageMap.bindings[0]?.autoBlanked).toBe(false);
+    expect(reconciled.pageMap.bindings[0]?.effectiveText).toBe("");
+  });
+
+  it("clears legacy empty auto-blank-like replacements when auto-blank is disabled", () => {
+    const scanned = mergeTextPageMapWithCandidates(
+      createEmptyTextPageMap({
+        pageKey: "https://example.com/path",
+        pageUrl: "https://example.com/path",
+        pageTitle: "Example page",
+        now: "2026-04-05T18:20:00.000Z"
+      }),
+      [
+        createCandidate({
+          category: "paragraph",
+          text: "Legacy blank",
+          normalizedText: "Legacy blank"
+        })
+      ],
+      {
+        pageTitle: "Example page",
+        now: "2026-04-05T18:20:01.000Z"
+      }
+    );
+
+    const legacyBlanked = {
+      ...scanned,
+      bindings: scanned.bindings.map((binding) => ({
+        ...binding,
+        autoBlanked: undefined,
+        replacementText: "",
+        effectiveText: "",
+        changed: true
+      }))
+    };
+    const reconciled = reconcileAutoBlankBindings(legacyBlanked, false, {
+      now: "2026-04-05T18:20:02.000Z"
+    });
+
+    expect(reconciled.didChange).toBe(true);
+    expect(reconciled.revertedBindings).toBe(1);
+    expect(reconciled.pageMap.bindings[0]?.replacementText).toBeNull();
+    expect(reconciled.pageMap.bindings[0]?.autoBlanked).toBe(false);
+    expect(reconciled.pageMap.bindings[0]?.effectiveText).toBe("Legacy blank");
   });
 
   it("upserts, removes and exports page maps cleanly", () => {

@@ -54,6 +54,7 @@ export const TextBindingRecordSchema = z.object({
   originalText: z.string(),
   originalNormalized: z.string(),
   replacementText: z.string().nullable(),
+  autoBlanked: z.boolean().optional(),
   effectiveText: z.string(),
   currentText: z.string(),
   tagName: z.string(),
@@ -249,18 +250,29 @@ export function buildTextBindingId(input: {
   preferredSelector?: string | null;
   elementSelector?: string | null;
   ancestorSelector?: string | null;
+  tagName?: string | null;
   attributeName?: string | null;
   nodeIndex?: number | null;
+  contextText?: string | null;
+  stableAttributes?: Record<string, string> | null;
 }): string {
+  const stableAttributeSeed = Object.entries(input.stableAttributes ?? {})
+    .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+    .map(([key, value]) => `${key}=${value}`)
+    .join("|");
+  const contextSeed = normalizeTextForBinding(input.contextText ?? "").slice(0, 180);
   const seed = [
     input.pageKey,
     input.category,
+    input.tagName?.trim().toLowerCase() ?? "",
     input.normalizedText,
     input.preferredSelector ?? "",
     input.elementSelector ?? "",
     input.ancestorSelector ?? "",
     input.attributeName ?? "",
-    input.nodeIndex ?? ""
+    input.nodeIndex ?? "",
+    contextSeed,
+    stableAttributeSeed
   ].join("\u001f");
   return `txt_${fnv1a(seed)}`;
 }
@@ -297,17 +309,22 @@ export function buildTextMapSummary(pageMap: TextPageMap | null | undefined): Te
     TextElementCategorySchema.options.map((category) => [category, 0])
   ) as Record<TextElementCategory, number>;
   const bindings = pageMap?.bindings ?? [];
+  let live = 0;
+  let changed = 0;
   for (const binding of bindings) {
     categories[binding.category] += 1;
+    if (binding.presence === "live") {
+      live += 1;
+    }
+    if (binding.changed) {
+      changed += 1;
+    }
   }
 
-  const changed = bindings.filter((binding) => binding.changed).length;
-  const live = bindings.filter((binding) => binding.presence === "live").length;
-  const stale = bindings.length - live;
   return {
     total: bindings.length,
     live,
-    stale,
+    stale: bindings.length - live,
     changed,
     unchanged: bindings.length - changed,
     categories
@@ -324,6 +341,7 @@ export function areTextBindingsEquivalentForPersistence(
     | "originalText"
     | "originalNormalized"
     | "replacementText"
+    | "autoBlanked"
     | "effectiveText"
     | "currentText"
     | "tagName"
@@ -341,6 +359,7 @@ export function areTextBindingsEquivalentForPersistence(
     | "originalText"
     | "originalNormalized"
     | "replacementText"
+    | "autoBlanked"
     | "effectiveText"
     | "currentText"
     | "tagName"
@@ -358,13 +377,61 @@ export function areTextBindingsEquivalentForPersistence(
     left.originalText === right.originalText &&
     left.originalNormalized === right.originalNormalized &&
     left.replacementText === right.replacementText &&
+    left.autoBlanked === right.autoBlanked &&
     left.effectiveText === right.effectiveText &&
     left.currentText === right.currentText &&
     left.tagName === right.tagName &&
     left.attributeName === right.attributeName &&
     left.changed === right.changed &&
-    JSON.stringify(left.locator) === JSON.stringify(right.locator) &&
-    JSON.stringify(left.context) === JSON.stringify(right.context)
+    areLocatorsEquivalent(left.locator, right.locator) &&
+    areContextsEquivalent(left.context, right.context)
+  );
+}
+
+function areLocatorsEquivalent(left: TextBindingLocator, right: TextBindingLocator): boolean {
+  if (
+    left.preferredSelector !== right.preferredSelector ||
+    left.ancestorSelector !== right.ancestorSelector ||
+    left.elementSelector !== right.elementSelector ||
+    left.nodeIndex !== right.nodeIndex ||
+    left.tagName !== right.tagName ||
+    left.attributeName !== right.attributeName
+  ) {
+    return false;
+  }
+
+  const leftClasses = left.classNames;
+  const rightClasses = right.classNames;
+  if (leftClasses.length !== rightClasses.length) {
+    return false;
+  }
+  for (let i = 0; i < leftClasses.length; i += 1) {
+    if (leftClasses[i] !== rightClasses[i]) {
+      return false;
+    }
+  }
+
+  const leftAttrs = left.stableAttributes;
+  const rightAttrs = right.stableAttributes;
+  const leftKeys = Object.keys(leftAttrs);
+  const rightKeys = Object.keys(rightAttrs);
+  if (leftKeys.length !== rightKeys.length) {
+    return false;
+  }
+  for (const key of leftKeys) {
+    if (leftAttrs[key] !== rightAttrs[key]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function areContextsEquivalent(left: TextBindingContext, right: TextBindingContext): boolean {
+  return (
+    left.pageTitle === right.pageTitle &&
+    left.selectorPreview === right.selectorPreview &&
+    left.ancestorText === right.ancestorText
   );
 }
 
@@ -513,6 +580,7 @@ export function mergeTextPageMapWithCandidates(
           },
           "effective"
         ),
+        autoBlanked: matchedBinding.autoBlanked,
         currentText: candidate.text,
         tagName: candidate.tagName,
         attributeName: candidate.attributeName,
@@ -535,41 +603,43 @@ export function mergeTextPageMapWithCandidates(
       preferredSelector: candidate.locator.preferredSelector,
       elementSelector: candidate.locator.elementSelector,
       ancestorSelector: candidate.locator.ancestorSelector,
+      tagName: candidate.tagName,
       attributeName: candidate.attributeName,
-      nodeIndex: candidate.locator.nodeIndex
+      nodeIndex: candidate.locator.nodeIndex,
+      contextText: candidate.context.ancestorText,
+      stableAttributes: candidate.locator.stableAttributes
     });
 
-    mergedBindings.push(
-      TextBindingRecordSchema.parse({
-        bindingId,
-        category: candidate.category,
-        presence: "live",
-        staleSince: null,
-        originalText: candidate.text,
-        originalNormalized: candidate.normalizedText,
-        replacementText: null,
-        effectiveText: candidate.text,
-        currentText: candidate.text,
-        tagName: candidate.tagName,
-        attributeName: candidate.attributeName,
-        locator: candidate.locator,
-        context: candidate.context,
-        firstSeenAt: now,
-        lastSeenAt: now,
-        lastMatchedAt: now,
-        matchStrategy: "created",
-        changed: false
-      })
-    );
+    mergedBindings.push({
+      bindingId,
+      category: candidate.category,
+      presence: "live",
+      staleSince: null,
+      originalText: candidate.text,
+      originalNormalized: candidate.normalizedText,
+      replacementText: null,
+      autoBlanked: false,
+      effectiveText: candidate.text,
+      currentText: candidate.text,
+      tagName: candidate.tagName,
+      attributeName: candidate.attributeName,
+      locator: candidate.locator,
+      context: candidate.context,
+      firstSeenAt: now,
+      lastSeenAt: now,
+      lastMatchedAt: now,
+      matchStrategy: "created",
+      changed: false
+    });
   }
 
-  const staleBindings = remainingBindings.map((binding) =>
-    TextBindingRecordSchema.parse({
+  const staleBindings = remainingBindings
+    .filter((binding) => binding.changed)
+    .map((binding) => ({
       ...binding,
-      presence: "stale",
+      presence: "stale" as const,
       staleSince: binding.staleSince ?? now
-    })
-  );
+    }));
 
   return {
     ...pageMap,
@@ -601,6 +671,7 @@ export function updateBindingReplacement(
       return {
         ...binding,
         replacementText: nextReplacement,
+        autoBlanked: false,
         effectiveText: resolveDisplayedBindingText(
           {
             originalText: binding.originalText,
@@ -623,10 +694,120 @@ export function resetPageBindings(pageMap: TextPageMap, options?: { now?: string
     bindings: pageMap.bindings.map((binding) => ({
       ...binding,
       replacementText: null,
+      autoBlanked: false,
       effectiveText: binding.originalText,
       changed: false,
       lastMatchedAt: now
     }))
+  };
+}
+
+function isLegacyAutoBlankLike(binding: Pick<TextBindingRecord, "replacementText" | "effectiveText" | "changed" | "originalText" | "autoBlanked">): boolean {
+  return (
+    binding.autoBlanked !== false &&
+    binding.replacementText === "" &&
+    binding.effectiveText === "" &&
+    binding.changed &&
+    binding.originalText.length > 0
+  );
+}
+
+export function reconcileAutoBlankBindings(
+  pageMap: TextPageMap,
+  autoBlankEnabled: boolean,
+  options?: {
+    now?: string;
+    includeStale?: boolean;
+    touchMatchedAt?: boolean;
+  }
+): {
+  pageMap: TextPageMap;
+  didChange: boolean;
+  blankedBindings: number;
+  revertedBindings: number;
+} {
+  const now = options?.now ?? new Date().toISOString();
+  const includeStale = options?.includeStale ?? false;
+  const touchMatchedAt = options?.touchMatchedAt ?? false;
+  let didChange = false;
+  let blankedBindings = 0;
+  let revertedBindings = 0;
+
+  const nextBindings = pageMap.bindings.map((binding) => {
+    const shouldProcess = includeStale || binding.presence === "live";
+    if (!shouldProcess) {
+      return binding;
+    }
+
+    if (autoBlankEnabled) {
+      const nextChanged = binding.originalText !== "";
+      const nextLastMatchedAt = touchMatchedAt ? now : binding.lastMatchedAt;
+      const isAlreadyBlanked =
+        binding.replacementText === "" &&
+        binding.effectiveText === "" &&
+        binding.changed === nextChanged;
+      if (isAlreadyBlanked && binding.autoBlanked === false && binding.lastMatchedAt === nextLastMatchedAt) {
+        blankedBindings += 1;
+        return binding;
+      }
+      const nextBinding = {
+        ...binding,
+        replacementText: "",
+        autoBlanked: true,
+        effectiveText: "",
+        changed: nextChanged,
+        lastMatchedAt: nextLastMatchedAt
+      };
+      if (!areTextBindingsEquivalentForPersistence(binding, nextBinding) || binding.lastMatchedAt !== nextLastMatchedAt) {
+        didChange = true;
+      }
+      if (nextBinding.replacementText === "") {
+        blankedBindings += 1;
+      }
+      return nextBinding;
+    }
+
+    const isAutoBlanked = binding.autoBlanked === true || isLegacyAutoBlankLike(binding);
+    if (!isAutoBlanked) {
+      if (binding.replacementText === "") {
+        blankedBindings += 1;
+      }
+      return binding;
+    }
+
+    const nextLastMatchedAt = touchMatchedAt ? now : binding.lastMatchedAt;
+    const nextBinding = {
+      ...binding,
+      replacementText: null,
+      autoBlanked: false,
+      effectiveText: binding.originalText,
+      changed: false,
+      lastMatchedAt: nextLastMatchedAt
+    };
+    didChange = true;
+    revertedBindings += 1;
+    return nextBinding;
+  });
+
+  const nextPageMap = didChange
+    ? {
+        ...pageMap,
+        updatedAt: now,
+        bindings: nextBindings
+      }
+    : pageMap;
+
+  if (!autoBlankEnabled) {
+    blankedBindings = nextBindings.filter(
+      (binding) => (includeStale || binding.presence === "live") && binding.replacementText === ""
+    ).length;
+  }
+
+  return {
+    pageMap: nextPageMap,
+    didChange,
+    blankedBindings,
+    revertedBindings
   };
 }
 
@@ -792,43 +973,78 @@ export function mapBindingsToCandidateIndices(
   bindings: readonly TextBindingRecord[],
   candidates: readonly TextScanCandidate[]
 ): TextBindingCandidateMatch[] {
-  const remainingCandidates = candidates.map((candidate, index) => ({
-    candidate,
-    candidateIndex: index
-  }));
+  const usedCandidateIndices = new Set<number>();
   const matches: TextBindingCandidateMatch[] = [];
 
-  bindings.forEach((binding) => {
-    let bestRemainingIndex = -1;
+  const selectorIndex = new Map<string, number[]>();
+  for (let i = 0; i < candidates.length; i += 1) {
+    const sel = candidates[i]!.locator.preferredSelector;
+    if (sel) {
+      const key = `${sel}\u001f${candidates[i]!.attributeName ?? ""}`;
+      const list = selectorIndex.get(key);
+      if (list) {
+        list.push(i);
+      } else {
+        selectorIndex.set(key, [i]);
+      }
+    }
+  }
+
+  for (const binding of bindings) {
     let bestCandidateIndex = -1;
     let bestResult: MatchResult | null = null;
     let bestStrategy: string | null = null;
 
-    remainingCandidates.forEach((entry, remainingIndex) => {
-      const result = matchBindingToCandidate(binding, entry.candidate);
-      if (!isReliableTextBindingMatch(binding, entry.candidate, result)) {
-        return;
+    if (binding.locator.preferredSelector) {
+      const key = `${binding.locator.preferredSelector}\u001f${binding.attributeName ?? ""}`;
+      const indexed = selectorIndex.get(key);
+      if (indexed) {
+        for (const ci of indexed) {
+          if (usedCandidateIndices.has(ci)) {
+            continue;
+          }
+          const result = matchBindingToCandidate(binding, candidates[ci]!);
+          if (!isReliableTextBindingMatch(binding, candidates[ci]!, result)) {
+            continue;
+          }
+          if (!bestResult || result.score > bestResult.score) {
+            bestResult = result;
+            bestStrategy = result.strategy;
+            bestCandidateIndex = ci;
+          }
+        }
       }
-
-      if (!bestResult || result.score > bestResult.score) {
-        bestResult = result;
-        bestStrategy = result.strategy;
-        bestRemainingIndex = remainingIndex;
-        bestCandidateIndex = entry.candidateIndex;
-      }
-    });
-
-    if (bestRemainingIndex === -1 || bestCandidateIndex === -1 || !bestResult) {
-      return;
     }
 
-    remainingCandidates.splice(bestRemainingIndex, 1);
+    if (!bestResult) {
+      for (let ci = 0; ci < candidates.length; ci += 1) {
+        if (usedCandidateIndices.has(ci)) {
+          continue;
+        }
+        const candidate = candidates[ci]!;
+        const result = matchBindingToCandidate(binding, candidate);
+        if (!isReliableTextBindingMatch(binding, candidate, result)) {
+          continue;
+        }
+        if (!bestResult || result.score > bestResult.score) {
+          bestResult = result;
+          bestStrategy = result.strategy;
+          bestCandidateIndex = ci;
+        }
+      }
+    }
+
+    if (bestCandidateIndex === -1 || !bestResult) {
+      continue;
+    }
+
+    usedCandidateIndices.add(bestCandidateIndex);
     matches.push({
       bindingId: binding.bindingId,
       candidateIndex: bestCandidateIndex,
       strategy: bestStrategy
     });
-  });
+  }
 
   return matches;
 }

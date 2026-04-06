@@ -427,9 +427,11 @@ async function probeInlineEditorAgainstLargestBox(driver, suspiciousBoxes) {
       if (!(target instanceof Element)) {
         return;
       }
-      target.dispatchEvent(new MouseEvent('dblclick', {
+      target.dispatchEvent(new MouseEvent('contextmenu', {
         bubbles: true,
         cancelable: true,
+        button: 2,
+        buttons: 2,
         clientX: x,
         clientY: y,
         view: window

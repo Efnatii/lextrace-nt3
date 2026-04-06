@@ -14,9 +14,12 @@
     "test:native-host": "dotnet test native-host/LexTrace.NativeHost.Tests/LexTrace.NativeHost.Tests.csproj",
     "test:unit": "vitest run",
     "test:edge": "node scripts/test-edge.mjs",
+    "test:edge:text": "node scripts/test-edge-text-elements.mjs",
     "test:edge:ai": "node scripts/test-edge-ai.mjs",
     "test:edge:ai:prompt-cache": "node scripts/test-edge-ai-prompt-cache.mjs",
     "test:edge:ai:matrix": "node scripts/test-edge-ai-matrix.mjs",
+    "test:edge:real-sites": "node scripts/test-edge-real-sites.mjs",
+    "test:edge:real-sites:rp": "node scripts/test-edge-real-sites.mjs --real-profile",
     "typecheck": "tsc --noEmit"
   },
   "repository": {

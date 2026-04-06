@@ -70,7 +70,6 @@ import { parseRuntimeWorkerStatus, type WorkerStatus } from "../shared/runtime-s
 import {
   areTextBindingListsEquivalentForPersistence,
   areTextBindingsEquivalentForPersistence,
-  buildInlineTextEditorGeometry,
   buildControlTextLayoutRects,
   buildTextBindingId,
   buildTextMapSummary,
@@ -87,10 +86,10 @@ import {
   isTextBindingAttributeVisuallyRenderable,
   removeBindingFromPageMap,
   removePageMapFromEnvelope,
+  reconcileAutoBlankBindings,
   resetPageBindings,
   resolveDisplayedBindingText,
   sanitizeReplacementText,
-  TextBindingRecordSchema,
   TextStorageEnvelopeSchema,
   updateBindingReplacement,
   upsertPageMapInEnvelope,
@@ -266,25 +265,16 @@ type TextRuntimeTarget = {
   styleElement: HTMLElement;
   attributeName: string | null;
   textNode: Text | null;
+  lastKnownClientRects: TextRectSnapshot[];
   readCurrentText: () => string;
   applyRenderedText: (value: string) => void;
   getOriginalText: () => string;
+  getLiveClientRects: () => TextRectSnapshot[];
   getClientRects: () => TextRectSnapshot[];
   getBoundingClientRect: () => TextRectSnapshot | null;
 };
 
-type TextScrollTarget = HTMLElement | Window;
-
 type TextHighlightHandle = Highlight;
-
-type TextPresentationSubscription = {
-  cleanup: () => void;
-};
-
-type TextScrollTargetSubscription = {
-  bindingIds: Set<string>;
-  listener: (event: Event) => void;
-};
 
 type LiveTextCandidate = {
   candidate: TextScanCandidate;
@@ -329,6 +319,10 @@ const TEXT_DELETE_ICON: StatusChipIcon = {
 const TEXT_DOWNLOAD_ICON = STATUS_DOWNLOAD_ICON;
 const TEXT_SOURCE_HIGHLIGHT_NAME = "lextrace-text-source";
 const TEXT_CHANGED_HIGHLIGHT_NAME = "lextrace-text-changed";
+const TEXT_BINDING_SELECTOR_MAX_DEPTH = 12;
+const TEXT_OBSERVER_SUPPRESSION_WINDOW_MS = 320;
+const TEXT_INCREMENTAL_SCAN_DELAY_MS = 90;
+const TEXT_DEFERRED_MUTATION_RETRY_MAX_ATTEMPTS = 2;
 const TEXT_HOST_TAG_NAMES = new Set([
   "a",
   "button",
@@ -367,6 +361,10 @@ const TEXT_INLINE_WRAPPER_TAG_NAMES = new Set([
   "time",
   "u"
 ]);
+const TEXT_HOST_PROMOTION_CONTAINER_TAG_NAMES = new Set([
+  "div",
+  "span"
+]);
 
 function createToolIconButton(options: {
   tooltip: string;
@@ -397,6 +395,13 @@ function truncateTextPreview(value: string, maxLength = 180): string {
 }
 
 function isTextDebugSkippableElement(element: Element): boolean {
+  if (
+    element instanceof HTMLElement &&
+    element.closest("[data-lextrace-text-debug-skip='true']")
+  ) {
+    return true;
+  }
+
   const tagName = element.tagName.toLowerCase();
   return (
     tagName === "script" ||
@@ -408,7 +413,7 @@ function isTextDebugSkippableElement(element: Element): boolean {
   );
 }
 
-function isTextDebugVisibleElement(element: HTMLElement): boolean {
+function isTextDebugPotentiallyVisibleElement(element: HTMLElement): boolean {
   if (!element.isConnected) {
     return false;
   }
@@ -421,22 +426,6 @@ function isTextDebugVisibleElement(element: HTMLElement): boolean {
     return false;
   }
 
-  if (typeof element.checkVisibility === "function") {
-    try {
-      if (
-        !element.checkVisibility({
-          checkOpacity: true,
-          checkVisibilityCSS: true,
-          contentVisibilityAuto: true
-        })
-      ) {
-        return false;
-      }
-    } catch {
-      // Ignore unsupported option sets and fall back to manual checks below.
-    }
-  }
-
   const style = window.getComputedStyle(element);
   if (
     style.display === "none" ||
@@ -446,6 +435,26 @@ function isTextDebugVisibleElement(element: HTMLElement): boolean {
     Number.parseFloat(style.opacity || "1") <= 0.01
   ) {
     return false;
+  }
+
+  return true;
+}
+
+function isTextDebugVisibleElement(element: HTMLElement): boolean {
+  if (!isTextDebugPotentiallyVisibleElement(element)) {
+    return false;
+  }
+
+  if (typeof element.checkVisibility === "function") {
+    try {
+      return element.checkVisibility({
+        checkOpacity: true,
+        checkVisibilityCSS: true,
+        contentVisibilityAuto: true
+      });
+    } catch {
+      // Unsupported option set — fall through to the conservative visibility checks above.
+    }
   }
 
   return true;
@@ -497,7 +506,7 @@ function buildPreferredTextSelector(element: Element): string | null {
   return null;
 }
 
-function buildElementSelectorPath(element: Element, maxDepth = 6): string | null {
+function buildElementSelectorPath(element: Element, maxDepth = TEXT_BINDING_SELECTOR_MAX_DEPTH): string | null {
   const segments: string[] = [];
   let current: Element | null = element;
 
@@ -537,7 +546,7 @@ function buildAncestorSelector(element: HTMLElement): string | null {
     current = current.parentElement;
   }
 
-  return buildElementSelectorPath(element.parentElement ?? element);
+  return buildElementSelectorPath(element.parentElement ?? element, TEXT_BINDING_SELECTOR_MAX_DEPTH);
 }
 
 function isSemanticTextHostElement(element: HTMLElement): boolean {
@@ -546,19 +555,55 @@ function isSemanticTextHostElement(element: HTMLElement): boolean {
   return TEXT_HOST_TAG_NAMES.has(tagName) || role === "button" || role === "heading" || role === "link";
 }
 
+function isCustomElementTagName(tagName: string): boolean {
+  return tagName.includes("-");
+}
+
+function shouldPromoteTextHostToParent(current: HTMLElement, parent: HTMLElement): boolean {
+  if (isSemanticTextHostElement(parent)) {
+    return true;
+  }
+
+  if (isSemanticTextHostElement(current)) {
+    return false;
+  }
+
+  const currentText = normalizeTextForBinding(current.textContent ?? "");
+  const parentText = normalizeTextForBinding(parent.textContent ?? "");
+  if (!currentText || currentText !== parentText) {
+    return false;
+  }
+
+  const parentRole = parent.getAttribute("role")?.trim().toLowerCase() ?? "";
+  if (parentRole === "text") {
+    return true;
+  }
+
+  const parentTagName = parent.tagName.toLowerCase();
+  if (isCustomElementTagName(parentTagName)) {
+    return true;
+  }
+
+  if (window.getComputedStyle(parent).display === "contents") {
+    return true;
+  }
+
+  const currentTagName = current.tagName.toLowerCase();
+  if (!TEXT_INLINE_WRAPPER_TAG_NAMES.has(currentTagName)) {
+    return false;
+  }
+
+  return (
+    TEXT_INLINE_WRAPPER_TAG_NAMES.has(parentTagName) ||
+    (TEXT_HOST_PROMOTION_CONTAINER_TAG_NAMES.has(parentTagName) && parent.children.length <= 2)
+  );
+}
+
 function resolveTextBindingHostElement(element: HTMLElement): HTMLElement {
   let current = element;
   let parent = current.parentElement;
   while (parent) {
-    if (isSemanticTextHostElement(parent)) {
-      return parent;
-    }
-
-    if (!TEXT_INLINE_WRAPPER_TAG_NAMES.has(current.tagName.toLowerCase())) {
-      break;
-    }
-
-    if (!TEXT_INLINE_WRAPPER_TAG_NAMES.has(parent.tagName.toLowerCase())) {
+    if (!shouldPromoteTextHostToParent(current, parent)) {
       break;
     }
 
@@ -566,7 +611,7 @@ function resolveTextBindingHostElement(element: HTMLElement): HTMLElement {
     parent = current.parentElement;
   }
 
-  return element;
+  return current;
 }
 
 function resolveTextHighlightElement(element: HTMLElement): HTMLElement {
@@ -629,32 +674,6 @@ function getRenderableTextNodeClientRects(textNode: Text): TextRectSnapshot[] {
 
   const boundingRect = snapshotClientRect(range.getBoundingClientRect());
   return isRenderableTextRect(boundingRect) ? [boundingRect] : [];
-}
-
-function isTextScrollHostElement(element: HTMLElement): boolean {
-  const style = window.getComputedStyle(element);
-  const overflowValues = [style.overflowX, style.overflowY, style.overflow]
-    .join(" ")
-    .toLowerCase();
-  if (!/(auto|scroll|overlay)/.test(overflowValues)) {
-    return false;
-  }
-
-  return element.scrollHeight > element.clientHeight + 1 || element.scrollWidth > element.clientWidth + 1;
-}
-
-function collectTextScrollTargets(element: HTMLElement): TextScrollTarget[] {
-  const targets: TextScrollTarget[] = [];
-  let current: HTMLElement | null = element;
-  while (current) {
-    if (isTextScrollHostElement(current)) {
-      targets.push(current);
-    }
-    current = current.parentElement;
-  }
-
-  targets.push(window);
-  return targets;
 }
 
 function isRuntimeTargetVisuallyRenderable(target: TextRuntimeTarget): boolean {
@@ -762,18 +781,28 @@ function measureFormControlTextRects(
   }).filter((rect) => isRenderableTextRect(rect));
 }
 
-function getElementTextNodeIndexWithinHost(hostElement: HTMLElement, node: Text): number {
+function getElementTextNodeIndexWithinHost(
+  hostElement: HTMLElement,
+  node: Text,
+  options?: {
+    originalTextLookup?: (candidate: Text) => string | null | undefined;
+  }
+): number {
   const walker = document.createTreeWalker(hostElement, NodeFilter.SHOW_TEXT);
   let index = 0;
   let currentNode = walker.nextNode();
   while (currentNode) {
     if (currentNode instanceof Text) {
       const parentElement = currentNode.parentElement;
+      const candidateText =
+        options?.originalTextLookup?.(currentNode) ??
+        currentNode.textContent ??
+        "";
       if (
         parentElement &&
         !isTextDebugSkippableElement(parentElement) &&
-        isTextDebugVisibleElement(parentElement) &&
-        normalizeTextForBinding(currentNode.textContent ?? "").length > 0
+        isTextDebugPotentiallyVisibleElement(parentElement) &&
+        normalizeTextForBinding(candidateText).length > 0
       ) {
         if (currentNode === node) {
           return index;
@@ -828,19 +857,13 @@ class OverlayTerminalController {
   private readonly textNodeOriginalMap = new WeakMap<Text, string>();
   private readonly textAttributeOriginalMap = new WeakMap<Element, Map<string, string>>();
   private readonly highlightedTextElements = new Set<HTMLElement>();
-  private readonly textHighlightBoxes = new Map<string, HTMLDivElement>();
   private readonly textHighlightRanges = new Map<string, Range>();
   private readonly textHighlightRangeKinds = new Map<string, "source" | "changed">();
-  private readonly textPresentationSubscriptions = new Map<string, TextPresentationSubscription>();
-  private readonly textScrollTargetSubscriptions = new Map<EventTarget, TextScrollTargetSubscription>();
-  private readonly dirtyTextPresentationBindings = new Set<string>();
   private readonly suppressedTextAutoScanPageKeys = new Set<string>();
   private readonly textTrackedPageKeys = new Set<string>();
   private textDebugStyleElement: HTMLStyleElement | null = null;
-  private textHighlightLayer: HTMLDivElement | null = null;
   private textSourceHighlightHandle: TextHighlightHandle | null = null;
   private textChangedHighlightHandle: TextHighlightHandle | null = null;
-  private textPresentationRefreshFrame: number | null = null;
   private textStatusSignature = "";
   private textToolSignature = "";
   private textFeedSignature = "";
@@ -848,13 +871,18 @@ class OverlayTerminalController {
   private textScanTimer: number | null = null;
   private textViewportScanTimer: number | null = null;
   private readonly pendingTextMutationRoots = new Set<HTMLElement>();
+  private readonly pendingSuppressedTextMutationRoots = new Set<HTMLElement>();
+  private readonly pendingDeferredTextMutationRetryRoots = new Set<HTMLElement>();
+  private readonly deferredTextMutationRetryAttempts = new Map<HTMLElement, number>();
   private textMutationObserver: MutationObserver | null = null;
   private textObserverSuppressionDepth = 0;
+  private textObserverSuppressedUntil = 0;
+  private textObserverSuppressionFlushTimer: number | null = null;
+  private textDeferredMutationRetryTimer: number | null = null;
   private textStateHydrated = false;
   private inlineTextEditor:
     | {
         bindingId: string;
-        mode: "overlay" | "inline";
         editor: HTMLElement;
         target: TextRuntimeTarget;
         readValue: () => string;
@@ -918,9 +946,7 @@ class OverlayTerminalController {
     window.addEventListener("keydown", this.handleCapturedKeyboardEvent, true);
     window.addEventListener("keyup", this.handleCapturedKeyboardEvent, true);
     window.addEventListener("keypress", this.handleCapturedKeyboardEvent, true);
-    window.addEventListener("resize", this.handleTextDebugWindowResize, true);
-    document.addEventListener("scroll", this.handleTextViewportAutoScanScroll, true);
-    document.addEventListener("dblclick", this.handleDocumentTextDoubleClick, true);
+    document.addEventListener("contextmenu", this.handleDocumentTextContextMenu, true);
     chrome.storage.onChanged.addListener(this.handleStorageChanged);
     void this.bootstrapContentState();
   }
@@ -1987,7 +2013,7 @@ class OverlayTerminalController {
         }),
         createToolIconButton({
           tooltip: inlineEditingEnabled
-            ? "Inline-редактирование текстов включено"
+            ? "Inline-редактирование включено: правый клик по тексту"
             : "Inline-редактирование выключено, включи debug.textElements.inlineEditingEnabled",
           icon: TEXT_EDIT_ICON,
           dataRole: "texts-inline-editing",
@@ -2184,6 +2210,26 @@ class OverlayTerminalController {
 
   private getTextAutoScanMode(): TextAutoScanMode {
     return this.currentConfig?.debug.textElements.autoScanMode ?? "off";
+  }
+
+  private getIncrementalRefreshDebounceMs(): number {
+    return this.currentConfig?.debug.textElements.incrementalRefreshDebounceMs ?? TEXT_INCREMENTAL_SCAN_DELAY_MS;
+  }
+
+  private isTextAutoBlankOnScanEnabled(): boolean {
+    return this.currentConfig?.debug.textElements.autoBlankOnScan ?? false;
+  }
+
+  private isDeferredMutationRetryEnabled(): boolean {
+    return this.currentConfig?.debug.textElements.deferredMutationRetryEnabled ?? false;
+  }
+
+  private getDeferredMutationRetryDelayMs(): number {
+    return this.currentConfig?.debug.textElements.deferredMutationRetryDelayMs ?? 180;
+  }
+
+  private canInlineEditRuntimeTarget(target: TextRuntimeTarget | null | undefined): boolean {
+    return Boolean(target && target.attributeName === null);
   }
 
   private isIncrementalTextAutoScanEnabled(): boolean {
@@ -2551,6 +2597,9 @@ class OverlayTerminalController {
       return null;
     }
 
+    this.textPageMap =
+      (await this.reconcileCurrentPageTextBindingsWithAutoBlankConfig(options?.reason ?? "hydrate")) ?? this.textPageMap;
+
     if (this.isIncrementalTextAutoScanEnabled()) {
       this.textTrackedPageKeys.add(pageContext.pageKey);
     } else {
@@ -2558,6 +2607,7 @@ class OverlayTerminalController {
     }
 
     this.materializeCurrentPageTextTargets(this.textPageMap);
+    this.updateTextDebugPresentation();
     this.renderTexts();
     this.updateTextObservationState();
     return this.textPageMap;
@@ -2574,6 +2624,7 @@ class OverlayTerminalController {
       (this.visible && this.activeTab === "texts") ||
       (textDebugConfig?.highlightEnabled ?? false) ||
       (textDebugConfig?.inlineEditingEnabled ?? false) ||
+      (textDebugConfig?.autoBlankOnScan ?? false) ||
       this.isIncrementalTextAutoScanEnabled()
     );
   }
@@ -2608,6 +2659,156 @@ class OverlayTerminalController {
     });
   }
 
+  private buildBlankedTextPageMap(
+    pageMap: TextPageMap,
+    options?: {
+      includeStale?: boolean;
+      now?: string;
+      touchMatchedAt?: boolean;
+      autoBlanked?: boolean;
+    }
+  ): {
+    pageMap: TextPageMap;
+    didChange: boolean;
+    blankedBindings: number;
+  } {
+    const now = options?.now ?? new Date().toISOString();
+    const includeStale = options?.includeStale ?? false;
+    const touchMatchedAt = options?.touchMatchedAt ?? false;
+    const autoBlanked = options?.autoBlanked ?? false;
+    let didChange = false;
+
+    const nextBindings = pageMap.bindings.map((binding) => {
+      const shouldBlank = includeStale || binding.presence === "live";
+      if (!shouldBlank) {
+        return binding;
+      }
+
+      const nextChanged = binding.originalText !== "";
+      const nextLastMatchedAt = touchMatchedAt ? now : binding.lastMatchedAt;
+      const isAlreadyBlanked =
+        binding.replacementText === "" &&
+        binding.effectiveText === "" &&
+        binding.changed === nextChanged;
+      if (isAlreadyBlanked && binding.autoBlanked === false && binding.lastMatchedAt === nextLastMatchedAt) {
+        return binding;
+      }
+      if (
+        binding.replacementText === "" &&
+        binding.autoBlanked === autoBlanked &&
+        binding.effectiveText === "" &&
+        binding.changed === nextChanged &&
+        binding.lastMatchedAt === nextLastMatchedAt
+      ) {
+        return binding;
+      }
+
+      didChange = true;
+      return {
+        ...binding,
+        replacementText: "",
+        autoBlanked,
+        effectiveText: "",
+        changed: nextChanged,
+        lastMatchedAt: nextLastMatchedAt
+      };
+    });
+
+    const nextPageMap: TextPageMap = didChange
+      ? {
+          ...pageMap,
+          displayMode: this.getTextDisplayMode(),
+          updatedAt: now,
+          bindings: nextBindings
+        }
+      : pageMap.displayMode === this.getTextDisplayMode()
+        ? pageMap
+        : {
+            ...pageMap,
+            displayMode: this.getTextDisplayMode()
+          };
+
+    return {
+      pageMap: nextPageMap,
+      didChange,
+      blankedBindings: nextBindings.filter(
+        (binding) => (includeStale || binding.presence === "live") && binding.replacementText === ""
+      ).length
+    };
+  }
+
+  private async ensureCurrentPageTextBindingsAutoBlanked(reason: string): Promise<TextPageMap | null> {
+    const currentPageMap = this.textPageMap;
+    if (!currentPageMap || !this.isTextAutoBlankOnScanEnabled()) {
+      return currentPageMap;
+    }
+
+    const nextBlankState = this.buildBlankedTextPageMap(currentPageMap, {
+      now: new Date().toISOString(),
+      autoBlanked: true
+    });
+    if (!nextBlankState.didChange) {
+      return nextBlankState.pageMap;
+    }
+
+    this.textPageMap = nextBlankState.pageMap;
+    this.textStorageEnvelope = upsertPageMapInEnvelope(this.textStorageEnvelope, nextBlankState.pageMap);
+    await this.persistTextStorageEnvelope(this.textStorageEnvelope);
+    this.textPageMapPersisted = true;
+
+    await recordLog(
+      "content",
+      "text.page.auto_blank",
+      "Тексты текущей страницы автоматически очищены пустой заменой по конфигу.",
+      {
+        pageKey: nextBlankState.pageMap.pageKey,
+        reason,
+        blankedBindings: nextBlankState.blankedBindings
+      }
+    );
+
+    return nextBlankState.pageMap;
+  }
+
+  private async reconcileCurrentPageTextBindingsWithAutoBlankConfig(reason: string): Promise<TextPageMap | null> {
+    const currentPageMap = this.textPageMap;
+    if (!currentPageMap) {
+      return currentPageMap;
+    }
+
+    const nextAutoBlankState = reconcileAutoBlankBindings(
+      currentPageMap,
+      this.isTextAutoBlankOnScanEnabled(),
+      {
+        now: new Date().toISOString()
+      }
+    );
+    if (!nextAutoBlankState.didChange) {
+      return nextAutoBlankState.pageMap;
+    }
+
+    this.textPageMap = nextAutoBlankState.pageMap;
+    this.textStorageEnvelope = upsertPageMapInEnvelope(this.textStorageEnvelope, nextAutoBlankState.pageMap);
+    await this.persistTextStorageEnvelope(this.textStorageEnvelope);
+    this.textPageMapPersisted = true;
+
+    await recordLog(
+      "content",
+      this.isTextAutoBlankOnScanEnabled() ? "text.page.auto_blank" : "text.page.auto_blank.reverted",
+      this.isTextAutoBlankOnScanEnabled()
+        ? "Тексты текущей страницы автоматически очищены пустой заменой по конфигу."
+        : "Автоматические blank-замены текущей страницы сняты после выключения конфига.",
+      {
+        pageKey: nextAutoBlankState.pageMap.pageKey,
+        reason,
+        blankedBindings: nextAutoBlankState.blankedBindings,
+        revertedBindings: nextAutoBlankState.revertedBindings
+      }
+    );
+
+    return nextAutoBlankState.pageMap;
+  }
+
   private async scanCurrentPageTextElements(options?: {
     reason?: string;
     persist?: boolean;
@@ -2632,7 +2833,7 @@ class OverlayTerminalController {
         this.textStorageEnvelope.pages[pageContext.pageKey] ??
         this.createCurrentTextPageMap(now);
       const liveCandidates = this.collectLiveTextCandidates();
-      const nextPageMap: TextPageMap = {
+      let nextPageMap: TextPageMap = {
         ...mergeTextPageMapWithCandidates(
           {
             ...existingPageMap,
@@ -2650,6 +2851,13 @@ class OverlayTerminalController {
         pageTitle: document.title || null,
         displayMode: this.getTextDisplayMode()
       };
+      nextPageMap = reconcileAutoBlankBindings(
+        nextPageMap,
+        this.isTextAutoBlankOnScanEnabled(),
+        {
+          now
+        }
+      ).pageMap;
 
       const liveBindings = nextPageMap.bindings.filter((binding) => binding.presence === "live");
       const matches = mapBindingsToCandidateIndices(
@@ -2663,6 +2871,7 @@ class OverlayTerminalController {
           return;
         }
 
+        this.adoptPreviousTextRuntimeTargetState(previousTargets.get(match.bindingId), liveTarget);
         liveTarget.bindingId = match.bindingId;
         this.textTargetMap.set(match.bindingId, liveTarget);
       });
@@ -2693,7 +2902,8 @@ class OverlayTerminalController {
             reason: options.reason ?? "manual",
             totalBindings: summary.total,
             changedBindings: summary.changed,
-            lastScanAt: nextPageMap.lastScanAt
+            lastScanAt: nextPageMap.lastScanAt,
+            autoBlankOnScan: this.isTextAutoBlankOnScanEnabled()
           }
         );
       }
@@ -2718,14 +2928,29 @@ class OverlayTerminalController {
     );
 
     this.textTargetMap.clear();
+    const matchedBindingIds = new Set<string>();
     matches.forEach((match) => {
       const target = liveCandidates[match.candidateIndex]?.target;
       if (!target) {
         return;
       }
 
+      matchedBindingIds.add(match.bindingId);
+      this.adoptPreviousTextRuntimeTargetState(previousTargets.get(match.bindingId), target);
       target.bindingId = match.bindingId;
       this.textTargetMap.set(match.bindingId, target);
+    });
+    liveBindings.forEach((binding) => {
+      if (matchedBindingIds.has(binding.bindingId)) {
+        return;
+      }
+
+      const previousTarget = previousTargets.get(binding.bindingId);
+      if (!previousTarget || !this.canRetainChangedTextBindingWithoutCandidate(binding, previousTarget)) {
+        return;
+      }
+
+      this.textTargetMap.set(binding.bindingId, previousTarget);
     });
 
     if (this.inlineTextEditor && !this.textTargetMap.has(this.inlineTextEditor.bindingId)) {
@@ -2734,6 +2959,17 @@ class OverlayTerminalController {
 
     this.restoreRemovedTextTargets(previousTargets, new Set(this.textTargetMap.keys()));
     this.applyTextBindingsToDom();
+  }
+
+  private adoptPreviousTextRuntimeTargetState(
+    previousTarget: TextRuntimeTarget | undefined,
+    nextTarget: TextRuntimeTarget
+  ): void {
+    if (!previousTarget || nextTarget.lastKnownClientRects.length > 0 || previousTarget.lastKnownClientRects.length === 0) {
+      return;
+    }
+
+    nextTarget.lastKnownClientRects = previousTarget.lastKnownClientRects.map((rect) => ({ ...rect }));
   }
 
   private isTextBindingAffectedByMutationRoots(
@@ -2754,12 +2990,41 @@ class OverlayTerminalController {
     );
   }
 
+  private canRetainChangedTextBindingWithoutCandidate(
+    binding: TextBindingRecord,
+    target: TextRuntimeTarget | undefined
+  ): boolean {
+    if (!target) {
+      return false;
+    }
+
+    const inlineEditorOwnsBinding =
+      this.inlineTextEditor?.bindingId === binding.bindingId &&
+      this.inlineTextEditor.editor.isConnected;
+    if (!inlineEditorOwnsBinding && (binding.replacementText === null || !binding.changed)) {
+      return false;
+    }
+
+    if (!target.styleElement.isConnected || !target.highlightElement.isConnected) {
+      return false;
+    }
+
+    if (target.textNode && !target.textNode.isConnected && !inlineEditorOwnsBinding) {
+      return false;
+    }
+
+    return (
+      isTextDebugPotentiallyVisibleElement(target.styleElement) ||
+      isTextDebugPotentiallyVisibleElement(target.highlightElement)
+    );
+  }
+
   private buildStaleTextBinding(binding: TextBindingRecord, now: string): TextBindingRecord {
-    return TextBindingRecordSchema.parse({
+    return {
       ...binding,
       presence: "stale",
       staleSince: binding.staleSince ?? now
-    });
+    };
   }
 
   private async refreshTextBindingsIncrementally(reason: string): Promise<void> {
@@ -2800,6 +3065,7 @@ class OverlayTerminalController {
     );
 
     if (incrementalCandidates.length === 0 && affectedBindingIds.size === 0) {
+      this.updateDeferredMutationRetryStateForRoots(mutationRoots, retainedTargets);
       return;
     }
 
@@ -2824,7 +3090,7 @@ class OverlayTerminalController {
         }
 
         const result = matchBindingToCandidate(binding, candidate);
-        if (result.score < 40 || result.score <= bestScore) {
+        if (!isReliableTextBindingMatch(binding, candidate, result) || result.score <= bestScore) {
           return;
         }
 
@@ -2836,13 +3102,14 @@ class OverlayTerminalController {
       if (bestBinding) {
         const matchedBinding = bestBinding as TextBindingRecord;
         matchedBindingIds.add(matchedBinding.bindingId);
-        const nextBinding = TextBindingRecordSchema.parse({
+        const nextBinding: TextBindingRecord = {
           ...matchedBinding,
           category: candidate.category,
           presence: "live",
           staleSince: null,
           originalText: candidate.text,
           originalNormalized: candidate.normalizedText,
+          autoBlanked: matchedBinding.autoBlanked,
           effectiveText: resolveDisplayedBindingText(
             {
               originalText: candidate.text,
@@ -2859,10 +3126,11 @@ class OverlayTerminalController {
           lastMatchedAt: now,
           matchStrategy: bestStrategy,
           changed: matchedBinding.replacementText !== null && matchedBinding.replacementText !== candidate.text
-        });
+        };
         if (!areTextBindingsEquivalentForPersistence(matchedBinding, nextBinding)) {
           updatedBindings.set(matchedBinding.bindingId, nextBinding);
         }
+        this.adoptPreviousTextRuntimeTargetState(previousTargets.get(matchedBinding.bindingId), target);
         target.bindingId = matchedBinding.bindingId;
         if (previousTargets.get(matchedBinding.bindingId) !== target) {
           runtimeChangedBindingIds.add(matchedBinding.bindingId);
@@ -2878,8 +3146,11 @@ class OverlayTerminalController {
         preferredSelector: candidate.locator.preferredSelector,
         elementSelector: candidate.locator.elementSelector,
         ancestorSelector: candidate.locator.ancestorSelector,
+        tagName: candidate.tagName,
         attributeName: candidate.attributeName,
-        nodeIndex: candidate.locator.nodeIndex
+        nodeIndex: candidate.locator.nodeIndex,
+        contextText: candidate.context.ancestorText,
+        stableAttributes: candidate.locator.stableAttributes
       });
 
       if (currentPageMap.bindings.some((binding) => binding.bindingId === bindingId) ||
@@ -2887,7 +3158,7 @@ class OverlayTerminalController {
         return;
       }
 
-      const nextBinding = TextBindingRecordSchema.parse({
+      const nextBinding: TextBindingRecord = {
         bindingId,
         category: candidate.category,
         presence: "live",
@@ -2895,6 +3166,7 @@ class OverlayTerminalController {
         originalText: candidate.text,
         originalNormalized: candidate.normalizedText,
         replacementText: null,
+        autoBlanked: false,
         effectiveText: candidate.text,
         currentText: candidate.text,
         tagName: candidate.tagName,
@@ -2906,7 +3178,7 @@ class OverlayTerminalController {
         lastMatchedAt: now,
         matchStrategy: "incremental-created",
         changed: false
-      });
+      };
 
       newBindings.push(nextBinding);
       target.bindingId = bindingId;
@@ -2914,20 +3186,31 @@ class OverlayTerminalController {
       nextTargets.set(bindingId, target);
     });
 
+    const deletedBindingIds = new Set<string>();
     currentPageMap.bindings.forEach((binding) => {
       if (binding.presence !== "live" || !affectedBindingIds.has(binding.bindingId) || matchedBindingIds.has(binding.bindingId)) {
         return;
       }
 
-      updatedBindings.set(binding.bindingId, this.buildStaleTextBinding(binding, now));
+      const previousTarget = previousTargets.get(binding.bindingId);
+      if (previousTarget && this.canRetainChangedTextBindingWithoutCandidate(binding, previousTarget)) {
+        nextTargets.set(binding.bindingId, previousTarget);
+        return;
+      }
+
+      if (binding.changed) {
+        updatedBindings.set(binding.bindingId, this.buildStaleTextBinding(binding, now));
+      } else {
+        deletedBindingIds.add(binding.bindingId);
+      }
       nextTargets.delete(binding.bindingId);
     });
 
-    const mergedBindings = currentPageMap.bindings.map((binding) => updatedBindings.get(binding.bindingId) ?? binding);
+    const mergedBindings = currentPageMap.bindings
+      .filter((binding) => !deletedBindingIds.has(binding.bindingId))
+      .map((binding) => updatedBindings.get(binding.bindingId) ?? binding);
     const nextBindings = this.sortTextBindingsByRuntimeOrder([...mergedBindings, ...newBindings], nextTargets);
-    const didBindingsChange = !areTextBindingListsEquivalentForPersistence(currentPageMap.bindings, nextBindings);
-    const didRuntimeTargetsChange = runtimeChangedBindingIds.size > 0;
-    const nextPageMap: TextPageMap = {
+    let nextPageMap: TextPageMap = {
       ...currentPageMap,
       pageUrl: pageContext.pageUrl,
       pageTitle: document.title || null,
@@ -2935,6 +3218,16 @@ class OverlayTerminalController {
       updatedAt: now,
       bindings: nextBindings
     };
+    nextPageMap = reconcileAutoBlankBindings(
+      nextPageMap,
+      this.isTextAutoBlankOnScanEnabled(),
+      {
+        now
+      }
+    ).pageMap;
+    this.updateDeferredMutationRetryStateForRoots(mutationRoots, nextTargets);
+    const didBindingsChange = !areTextBindingListsEquivalentForPersistence(currentPageMap.bindings, nextPageMap.bindings);
+    const didRuntimeTargetsChange = runtimeChangedBindingIds.size > 0;
 
     if (!didBindingsChange && !didRuntimeTargetsChange) {
       return;
@@ -2948,6 +3241,7 @@ class OverlayTerminalController {
       this.resetInlineTextEditor();
     }
     this.restoreRemovedTextTargets(previousTargets, new Set(this.textTargetMap.keys()));
+    this.textPageMap = nextPageMap;
     this.applyTextBindingsToDom();
     this.updateTextDebugPresentation();
     this.updateTextObservationState();
@@ -2956,7 +3250,6 @@ class OverlayTerminalController {
       return;
     }
 
-    this.textPageMap = nextPageMap;
     this.textStorageEnvelope = upsertPageMapInEnvelope(this.textStorageEnvelope, nextPageMap);
     await this.persistTextStorageEnvelope(this.textStorageEnvelope);
     this.textPageMapPersisted = true;
@@ -2969,7 +3262,8 @@ class OverlayTerminalController {
       updatedBindings: updatedBindings.size,
       affectedRoots: mutationRoots.length,
       lastScanAt: currentPageMap.lastScanAt,
-      updatedAt: now
+      updatedAt: now,
+      autoBlankOnScan: this.isTextAutoBlankOnScanEnabled()
     });
   }
 
@@ -3004,11 +3298,16 @@ class OverlayTerminalController {
 
     const now = new Date().toISOString();
     const matchedBindingIds = new Set<string>();
+    // Pre-mark connected live bindings as matched — they don't need re-matching
+    // and excluding them from the pool reduces O(candidates × all_bindings) to O(candidates × stale)
+    retainedTargets.forEach((_, bindingId) => matchedBindingIds.add(bindingId));
     const updatedBindings = new Map<string, TextBindingRecord>();
     const nextTargets = new Map(retainedTargets);
     const newBindings: TextBindingRecord[] = [];
     const runtimeChangedBindingIds = new Set<string>();
-    const candidateBindingPool = currentPageMap.bindings;
+    const candidateBindingPool = currentPageMap.bindings.filter(
+      (b) => b.presence === "stale" || !retainedTargets.has(b.bindingId)
+    );
 
     incrementalCandidates.forEach(({ candidate, target }) => {
       let bestBinding: TextBindingRecord | null = null;
@@ -3033,13 +3332,14 @@ class OverlayTerminalController {
       if (bestBinding && bestStrategy) {
         const matchedBinding = bestBinding as TextBindingRecord;
         matchedBindingIds.add(matchedBinding.bindingId);
-        const nextBinding = TextBindingRecordSchema.parse({
+        const nextBinding: TextBindingRecord = {
           ...matchedBinding,
           category: candidate.category,
           presence: "live",
           staleSince: null,
           originalText: candidate.text,
           originalNormalized: candidate.normalizedText,
+          autoBlanked: matchedBinding.autoBlanked,
           effectiveText: resolveDisplayedBindingText(
             {
               originalText: candidate.text,
@@ -3056,10 +3356,11 @@ class OverlayTerminalController {
           lastMatchedAt: now,
           matchStrategy: bestStrategy,
           changed: matchedBinding.replacementText !== null && matchedBinding.replacementText !== candidate.text
-        });
+        };
         if (!areTextBindingsEquivalentForPersistence(matchedBinding, nextBinding)) {
           updatedBindings.set(matchedBinding.bindingId, nextBinding);
         }
+        this.adoptPreviousTextRuntimeTargetState(previousTargets.get(matchedBinding.bindingId), target);
         target.bindingId = matchedBinding.bindingId;
         if (previousTargets.get(matchedBinding.bindingId) !== target) {
           runtimeChangedBindingIds.add(matchedBinding.bindingId);
@@ -3075,8 +3376,11 @@ class OverlayTerminalController {
         preferredSelector: candidate.locator.preferredSelector,
         elementSelector: candidate.locator.elementSelector,
         ancestorSelector: candidate.locator.ancestorSelector,
+        tagName: candidate.tagName,
         attributeName: candidate.attributeName,
-        nodeIndex: candidate.locator.nodeIndex
+        nodeIndex: candidate.locator.nodeIndex,
+        contextText: candidate.context.ancestorText,
+        stableAttributes: candidate.locator.stableAttributes
       });
 
       if (
@@ -3086,7 +3390,7 @@ class OverlayTerminalController {
         return;
       }
 
-      const nextBinding = TextBindingRecordSchema.parse({
+      const nextBinding: TextBindingRecord = {
         bindingId,
         category: candidate.category,
         presence: "live",
@@ -3094,6 +3398,7 @@ class OverlayTerminalController {
         originalText: candidate.text,
         originalNormalized: candidate.normalizedText,
         replacementText: null,
+        autoBlanked: false,
         effectiveText: candidate.text,
         currentText: candidate.text,
         tagName: candidate.tagName,
@@ -3105,7 +3410,7 @@ class OverlayTerminalController {
         lastMatchedAt: now,
         matchStrategy: "viewport-created",
         changed: false
-      });
+      };
 
       newBindings.push(nextBinding);
       target.bindingId = bindingId;
@@ -3113,9 +3418,29 @@ class OverlayTerminalController {
       nextTargets.set(bindingId, target);
     });
 
-    const mergedBindings = currentPageMap.bindings.map((binding) => updatedBindings.get(binding.bindingId) ?? binding);
+    const mergedBindings = currentPageMap.bindings
+      .filter((binding) => {
+        const next = updatedBindings.get(binding.bindingId) ?? binding;
+        return next.presence === "live" || next.changed;
+      })
+      .map((binding) => updatedBindings.get(binding.bindingId) ?? binding);
     const nextBindings = this.sortTextBindingsByRuntimeOrder([...mergedBindings, ...newBindings], nextTargets);
-    const didBindingsChange = !areTextBindingListsEquivalentForPersistence(currentPageMap.bindings, nextBindings);
+    let nextPageMap: TextPageMap = {
+      ...currentPageMap,
+      pageUrl: pageContext.pageUrl,
+      pageTitle: document.title || null,
+      displayMode: this.getTextDisplayMode(),
+      updatedAt: now,
+      bindings: nextBindings
+    };
+    nextPageMap = reconcileAutoBlankBindings(
+      nextPageMap,
+      this.isTextAutoBlankOnScanEnabled(),
+      {
+        now
+      }
+    ).pageMap;
+    const didBindingsChange = !areTextBindingListsEquivalentForPersistence(currentPageMap.bindings, nextPageMap.bindings);
     const didRuntimeTargetsChange = runtimeChangedBindingIds.size > 0;
 
     if (!didBindingsChange && !didRuntimeTargetsChange) {
@@ -3129,6 +3454,7 @@ class OverlayTerminalController {
     if (this.inlineTextEditor && !this.textTargetMap.has(this.inlineTextEditor.bindingId)) {
       this.resetInlineTextEditor();
     }
+    this.textPageMap = nextPageMap;
     this.applyTextBindingsToDom();
     this.updateTextDebugPresentation();
     this.updateTextObservationState();
@@ -3137,16 +3463,6 @@ class OverlayTerminalController {
       return;
     }
 
-    const nextPageMap: TextPageMap = {
-      ...currentPageMap,
-      pageUrl: pageContext.pageUrl,
-      pageTitle: document.title || null,
-      displayMode: this.getTextDisplayMode(),
-      updatedAt: now,
-      bindings: nextBindings
-    };
-
-    this.textPageMap = nextPageMap;
     this.textStorageEnvelope = upsertPageMapInEnvelope(this.textStorageEnvelope, nextPageMap);
     await this.persistTextStorageEnvelope(this.textStorageEnvelope);
     this.textPageMapPersisted = true;
@@ -3160,7 +3476,8 @@ class OverlayTerminalController {
       newBindings: newBindings.length,
       updatedBindings: updatedBindings.size,
       lastScanAt: currentPageMap.lastScanAt,
-      updatedAt: now
+      updatedAt: now,
+      autoBlankOnScan: this.isTextAutoBlankOnScanEnabled()
     });
   }
 
@@ -3254,7 +3571,7 @@ class OverlayTerminalController {
     };
 
     this.normalizeMutationRoots(roots).forEach((root) => {
-      if (isTextDebugSkippableElement(root) || !isTextDebugVisibleElement(root)) {
+      if (isTextDebugSkippableElement(root) || !isTextDebugPotentiallyVisibleElement(root)) {
         return;
       }
 
@@ -3333,7 +3650,7 @@ class OverlayTerminalController {
       return null;
     }
 
-    if (!isTextDebugVisibleElement(parentElement)) {
+    if (!isTextDebugPotentiallyVisibleElement(parentElement)) {
       return null;
     }
 
@@ -3344,23 +3661,95 @@ class OverlayTerminalController {
       return null;
     }
 
-    if (getRenderableTextNodeClientRects(textNode).length === 0) {
+    const hostElement = resolveTextBindingHostElement(parentElement);
+    const readRenderableState = (): {
+      highlightElement: HTMLElement;
+      textRects: TextRectSnapshot[];
+      fallbackRects: TextRectSnapshot[];
+    } => {
+      const nextHighlightElement = resolveTextHighlightElement(hostElement.isConnected ? hostElement : parentElement);
+      const textRects = getRenderableTextNodeClientRects(textNode);
+      return {
+        highlightElement: nextHighlightElement,
+        textRects,
+        fallbackRects: getRenderableElementClientRects(nextHighlightElement)
+      };
+    };
+    const initialRenderableState = readRenderableState();
+    if (initialRenderableState.textRects.length === 0 && initialRenderableState.fallbackRects.length === 0) {
       return null;
     }
-
-    const hostElement = resolveTextBindingHostElement(parentElement);
-    const highlightElement = resolveTextHighlightElement(hostElement);
-    const selectorPreview = buildElementSelectorPath(hostElement) ?? buildPreferredTextSelector(hostElement);
+    let runtimeHighlightElement = initialRenderableState.highlightElement;
+    const initialPreciseRects =
+      initialRenderableState.textRects.length > 0 ? initialRenderableState.textRects : initialRenderableState.fallbackRects;
+    let lastKnownClientRects = initialPreciseRects.map((rect) => ({ ...rect }));
+    const getLiveTextRects = (): TextRectSnapshot[] => {
+      const nextRenderableState = readRenderableState();
+      runtimeHighlightElement = nextRenderableState.highlightElement;
+      if (nextRenderableState.textRects.length > 0) {
+        lastKnownClientRects = nextRenderableState.textRects.map((rect) => ({ ...rect }));
+        return lastKnownClientRects;
+      }
+      return [];
+    };
+    const getRenderableCandidateRects = (): TextRectSnapshot[] => {
+      const liveRects = getLiveTextRects();
+      if (liveRects.length > 0) {
+        target.lastKnownClientRects = liveRects;
+        return liveRects;
+      }
+      if (lastKnownClientRects.length > 0) {
+        target.lastKnownClientRects = lastKnownClientRects;
+        return lastKnownClientRects;
+      }
+      const nextRenderableState = readRenderableState();
+      runtimeHighlightElement = nextRenderableState.highlightElement;
+      return nextRenderableState.fallbackRects;
+    };
+    const preferredSelector = buildPreferredTextSelector(hostElement);
+    const elementSelector = buildElementSelectorPath(hostElement);
+    const selectorPreview = elementSelector ?? preferredSelector;
     const ancestorText = normalizeTextForBinding(hostElement.parentElement?.textContent ?? "");
     const locator = {
-      preferredSelector: buildPreferredTextSelector(hostElement),
+      preferredSelector,
       ancestorSelector: buildAncestorSelector(hostElement),
-      elementSelector: buildElementSelectorPath(hostElement),
-      nodeIndex: getElementTextNodeIndexWithinHost(hostElement, textNode),
+      elementSelector,
+      nodeIndex: getElementTextNodeIndexWithinHost(hostElement, textNode, {
+        originalTextLookup: (candidate) => this.textNodeOriginalMap.get(candidate) ?? candidate.textContent ?? ""
+      }),
       tagName: hostElement.tagName.toLowerCase(),
       attributeName: null,
       classNames: Array.from(hostElement.classList).slice(0, 8),
       stableAttributes: getTextDebugStableAttributes(hostElement)
+    };
+
+    const target: TextRuntimeTarget = {
+      bindingId: null,
+      element: hostElement,
+      highlightElement: runtimeHighlightElement,
+      styleElement: parentElement,
+      attributeName: null,
+      textNode,
+      lastKnownClientRects,
+      readCurrentText: () => textNode.textContent ?? "",
+      applyRenderedText: (value: string) => {
+        textNode.textContent = value;
+      },
+      getOriginalText: () => this.textNodeOriginalMap.get(textNode) ?? originalText,
+      getLiveClientRects: () => {
+        const rects = getLiveTextRects();
+        target.highlightElement = runtimeHighlightElement;
+        if (rects.length > 0) {
+          target.lastKnownClientRects = rects;
+        }
+        return rects;
+      },
+      getClientRects: () => {
+        const rects = getRenderableCandidateRects();
+        target.highlightElement = runtimeHighlightElement;
+        return rects;
+      },
+      getBoundingClientRect: () => buildTextRectUnion(target.getClientRects())
     };
 
     return {
@@ -3380,26 +3769,12 @@ class OverlayTerminalController {
           ancestorText: ancestorText.length > 0 ? truncateTextPreview(ancestorText, 180) : null
         }
       },
-      target: {
-        bindingId: null,
-        element: hostElement,
-        highlightElement,
-        styleElement: parentElement,
-        attributeName: null,
-        textNode,
-        readCurrentText: () => textNode.textContent ?? "",
-        applyRenderedText: (value: string) => {
-          textNode.textContent = value;
-        },
-        getOriginalText: () => this.textNodeOriginalMap.get(textNode) ?? originalText,
-        getClientRects: () => getRenderableTextNodeClientRects(textNode),
-        getBoundingClientRect: () => buildTextRectUnion(getRenderableTextNodeClientRects(textNode))
-      }
+      target
     };
   }
 
   private createAttributeCandidates(element: HTMLElement): LiveTextCandidate[] {
-    if (isTextDebugSkippableElement(element) || !isTextDebugVisibleElement(element)) {
+    if (isTextDebugSkippableElement(element) || !isTextDebugPotentiallyVisibleElement(element)) {
       return [];
     }
 
@@ -3464,10 +3839,28 @@ class OverlayTerminalController {
       return null;
     }
 
-    const selectorPreview = buildElementSelectorPath(element) ?? buildPreferredTextSelector(element);
+    const preferredSelector = buildPreferredTextSelector(element);
+    const elementSelector = buildElementSelectorPath(element);
+    const selectorPreview = elementSelector ?? preferredSelector;
     const ancestorText = normalizeTextForBinding(element.parentElement?.textContent ?? "");
     const tagName = element.tagName.toLowerCase();
-    const highlightElement = resolveTextHighlightElement(element);
+    const readRenderableState = (): {
+      highlightElement: HTMLElement;
+      textRects: TextRectSnapshot[];
+      fallbackRects: TextRectSnapshot[];
+    } => {
+      const nextHighlightElement = resolveTextHighlightElement(element);
+      const formControlRects =
+        (attributeName === "value" || attributeName === "placeholder") &&
+        (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement)
+          ? measureFormControlTextRects(element, attributeName, readCurrentAttributeText())
+          : [];
+      return {
+        highlightElement: nextHighlightElement,
+        textRects: formControlRects,
+        fallbackRects: getRenderableElementClientRects(nextHighlightElement)
+      };
+    };
     const readCurrentAttributeText = () => {
       if (attributeName === "value" && element instanceof HTMLSelectElement) {
         return element.selectedOptions[0]?.textContent ?? "";
@@ -3494,27 +3887,73 @@ class OverlayTerminalController {
 
       element.setAttribute(attributeName, value);
     };
-    const getRenderableAttributeRects = () => {
-      if (
-        (attributeName === "value" || attributeName === "placeholder") &&
-        (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement)
-      ) {
-        return measureFormControlTextRects(element, attributeName, readCurrentAttributeText());
+    const initialRenderableState = readRenderableState();
+    if (initialRenderableState.textRects.length === 0 && initialRenderableState.fallbackRects.length === 0) {
+      return null;
+    }
+    let runtimeHighlightElement = initialRenderableState.highlightElement;
+    const initialPreciseRects =
+      initialRenderableState.textRects.length > 0 ? initialRenderableState.textRects : initialRenderableState.fallbackRects;
+    let lastKnownClientRects = initialPreciseRects.map((rect) => ({ ...rect }));
+    const getLiveAttributeRects = (): TextRectSnapshot[] => {
+      const nextRenderableState = readRenderableState();
+      runtimeHighlightElement = nextRenderableState.highlightElement;
+      if (nextRenderableState.textRects.length > 0) {
+        lastKnownClientRects = nextRenderableState.textRects.map((rect) => ({ ...rect }));
+        return lastKnownClientRects;
       }
       return [];
     };
-    if (getRenderableAttributeRects().length === 0) {
-      return null;
-    }
+    const getRenderableAttributeRects = () => {
+      const liveRects = getLiveAttributeRects();
+      if (liveRects.length > 0) {
+        target.lastKnownClientRects = liveRects;
+        return liveRects;
+      }
+      if (lastKnownClientRects.length > 0) {
+        target.lastKnownClientRects = lastKnownClientRects;
+        return lastKnownClientRects;
+      }
+      const nextRenderableState = readRenderableState();
+      runtimeHighlightElement = nextRenderableState.highlightElement;
+      return nextRenderableState.fallbackRects;
+    };
     const locator = {
-      preferredSelector: buildPreferredTextSelector(element),
+      preferredSelector,
       ancestorSelector: buildAncestorSelector(element),
-      elementSelector: buildElementSelectorPath(element),
+      elementSelector,
       nodeIndex: null,
       tagName,
       attributeName,
       classNames: Array.from(element.classList).slice(0, 8),
       stableAttributes: getTextDebugStableAttributes(element)
+    };
+
+    const target: TextRuntimeTarget = {
+      bindingId: null,
+      element,
+      highlightElement: runtimeHighlightElement,
+      styleElement: element,
+      attributeName,
+      textNode: null,
+      lastKnownClientRects,
+      readCurrentText: readCurrentAttributeText,
+      applyRenderedText: applyRenderedAttributeText,
+      getOriginalText: () => this.getAttributeOriginalText(element, attributeName, originalText),
+      getLiveClientRects: () => {
+        const rects = getLiveAttributeRects();
+        target.highlightElement = runtimeHighlightElement;
+        if (rects.length > 0) {
+          target.lastKnownClientRects = rects;
+        }
+        return rects;
+      },
+      getClientRects: () => {
+        const rects = getRenderableAttributeRects();
+        target.highlightElement = runtimeHighlightElement;
+        return rects;
+      },
+      getBoundingClientRect: () => buildTextRectUnion(target.getClientRects())
     };
 
     return {
@@ -3535,20 +3974,197 @@ class OverlayTerminalController {
           ancestorText: ancestorText.length > 0 ? truncateTextPreview(ancestorText, 180) : null
         }
       },
-      target: {
-        bindingId: null,
-        element,
-        highlightElement,
-        styleElement: element,
-        attributeName,
-        textNode: null,
-        readCurrentText: readCurrentAttributeText,
-        applyRenderedText: applyRenderedAttributeText,
-        getOriginalText: () => this.getAttributeOriginalText(element, attributeName, originalText),
-        getClientRects: () => getRenderableAttributeRects(),
-        getBoundingClientRect: () => buildTextRectUnion(getRenderableAttributeRects())
-      }
+      target
     };
+  }
+
+  private trackRuntimeTargetAttribute(
+    trackedAttributesByElement: Map<HTMLElement, Set<string>>,
+    element: HTMLElement,
+    attributeName: string
+  ): void {
+    const current = trackedAttributesByElement.get(element) ?? new Set<string>();
+    current.add(attributeName);
+    trackedAttributesByElement.set(element, current);
+  }
+
+  private getDeferredRetryTrackedTargets(runtimeTargets: ReadonlyMap<string, TextRuntimeTarget>): {
+    trackedTextNodes: Set<Text>;
+    trackedAttributesByElement: Map<HTMLElement, Set<string>>;
+  } {
+    const trackedTextNodes = new Set<Text>();
+    const trackedAttributesByElement = new Map<HTMLElement, Set<string>>();
+
+    runtimeTargets.forEach((target) => {
+      if (!target.styleElement.isConnected && !target.highlightElement.isConnected) {
+        return;
+      }
+
+      if (target.textNode) {
+        trackedTextNodes.add(target.textNode);
+      }
+      if (target.attributeName !== null) {
+        this.trackRuntimeTargetAttribute(trackedAttributesByElement, target.element, target.attributeName);
+      }
+    });
+
+    return {
+      trackedTextNodes,
+      trackedAttributesByElement
+    };
+  }
+
+  private getCurrentTextValueForAttributeCandidate(
+    element: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement,
+    attributeName: "value" | "placeholder"
+  ): string {
+    if (attributeName === "value" && element instanceof HTMLSelectElement) {
+      return element.selectedOptions[0]?.textContent ?? "";
+    }
+    if (attributeName === "value") {
+      return element.value;
+    }
+    return element.getAttribute(attributeName) ?? "";
+  }
+
+  private doesFormControlAttributeNeedDeferredRetry(
+    element: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement,
+    attributeName: "value" | "placeholder"
+  ): boolean {
+    if (!isTextDebugPotentiallyVisibleElement(element)) {
+      return false;
+    }
+
+    if (element instanceof HTMLInputElement && (element.type === "hidden" || element.type === "password")) {
+      return false;
+    }
+
+    const currentValue = this.getCurrentTextValueForAttributeCandidate(element, attributeName);
+    const originalText = this.getAttributeOriginalText(element, attributeName, currentValue);
+    if (!normalizeTextForBinding(originalText)) {
+      return false;
+    }
+
+    if (attributeName === "placeholder" && "value" in element && element.value.length > 0) {
+      return false;
+    }
+
+    if (
+      attributeName === "value" &&
+      (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) &&
+      element.value.length === 0
+    ) {
+      return false;
+    }
+
+    const textRects = measureFormControlTextRects(element, attributeName, currentValue);
+    if (textRects.length > 0) {
+      return false;
+    }
+
+    return getRenderableElementClientRects(resolveTextHighlightElement(element)).length === 0;
+  }
+
+  private rootNeedsDeferredMutationRetry(
+    root: HTMLElement,
+    trackedTextNodes: ReadonlySet<Text>,
+    trackedAttributesByElement: ReadonlyMap<HTMLElement, ReadonlySet<string>>
+  ): boolean {
+    if (!root.isConnected || isTextDebugSkippableElement(root) || !isTextDebugPotentiallyVisibleElement(root)) {
+      return false;
+    }
+
+    const textWalker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let currentTextNode = textWalker.nextNode();
+    while (currentTextNode) {
+      if (currentTextNode instanceof Text) {
+        const parentElement = currentTextNode.parentElement;
+        const originalText = this.textNodeOriginalMap.get(currentTextNode) ?? (currentTextNode.textContent ?? "");
+        if (
+          parentElement &&
+          !trackedTextNodes.has(currentTextNode) &&
+          !isTextDebugSkippableElement(parentElement) &&
+          isTextDebugPotentiallyVisibleElement(parentElement) &&
+          normalizeTextForBinding(originalText).length > 0
+        ) {
+          const hostElement = resolveTextBindingHostElement(parentElement);
+          const highlightElement = resolveTextHighlightElement(hostElement.isConnected ? hostElement : parentElement);
+          if (
+            getRenderableTextNodeClientRects(currentTextNode).length === 0 &&
+            getRenderableElementClientRects(highlightElement).length === 0
+          ) {
+            return true;
+          }
+        }
+      }
+      currentTextNode = textWalker.nextNode();
+    }
+
+    const formControls = new Set<HTMLElement>();
+    if (root.matches("input, textarea, select")) {
+      formControls.add(root);
+    }
+    root.querySelectorAll<HTMLElement>("input, textarea, select").forEach((element) => {
+      formControls.add(element);
+    });
+
+    for (const element of formControls) {
+      const trackedAttributes = trackedAttributesByElement.get(element) ?? new Set<string>();
+      if (
+        (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) &&
+        !trackedAttributes.has("value") &&
+        this.doesFormControlAttributeNeedDeferredRetry(element, "value")
+      ) {
+        return true;
+      }
+
+      if (
+        (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) &&
+        !trackedAttributes.has("placeholder") &&
+        this.doesFormControlAttributeNeedDeferredRetry(element, "placeholder")
+      ) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private collectDeferredMutationRetryRoots(
+    roots: readonly HTMLElement[],
+    runtimeTargets: ReadonlyMap<string, TextRuntimeTarget>
+  ): HTMLElement[] {
+    if (!this.isDeferredMutationRetryEnabled() || roots.length === 0) {
+      return [];
+    }
+
+    const { trackedTextNodes, trackedAttributesByElement } = this.getDeferredRetryTrackedTargets(runtimeTargets);
+    return this.normalizeMutationRoots(
+      roots.filter((root) => this.rootNeedsDeferredMutationRetry(root, trackedTextNodes, trackedAttributesByElement))
+    );
+  }
+
+  private updateDeferredMutationRetryStateForRoots(
+    roots: readonly HTMLElement[],
+    runtimeTargets: ReadonlyMap<string, TextRuntimeTarget>
+  ): void {
+    if (roots.length === 0) {
+      return;
+    }
+
+    if (!this.isDeferredMutationRetryEnabled()) {
+      this.clearDeferredMutationRetryStateForRoots(roots);
+      return;
+    }
+
+    const deferredRoots = this.collectDeferredMutationRetryRoots(roots, runtimeTargets);
+    const deferredRootSet = new Set(deferredRoots);
+    roots.forEach((root) => {
+      if (!deferredRootSet.has(root)) {
+        this.clearDeferredMutationRetryStateForRoots([root]);
+      }
+    });
+    this.scheduleDeferredMutationRetryRoots(deferredRoots);
   }
 
   private getAttributeOriginalText(element: Element, attributeName: string, fallback: string): string {
@@ -3593,15 +4209,187 @@ class OverlayTerminalController {
     this.clearTextHighlights();
   }
 
+  private isRuntimeTextTargetCurrent(target: TextRuntimeTarget | undefined): boolean {
+    if (!target) {
+      return false;
+    }
+
+    if (!target.styleElement.isConnected || !target.highlightElement.isConnected) {
+      return false;
+    }
+
+    if (target.textNode === null || target.textNode.isConnected) {
+      return true;
+    }
+
+    return (
+      this.inlineTextEditor?.bindingId === target.bindingId &&
+      this.inlineTextEditor.editor.isConnected
+    );
+  }
+
+  private ensureCurrentTextTargetsMaterialized(pageMap: TextPageMap): void {
+    const needsRematerialization = pageMap.bindings.some((binding) => {
+      if (binding.presence !== "live") {
+        return false;
+      }
+      return !this.isRuntimeTextTargetCurrent(this.textTargetMap.get(binding.bindingId));
+    });
+
+    if (!needsRematerialization) {
+      return;
+    }
+
+    this.materializeCurrentPageTextTargets(pageMap);
+  }
+
   private withTextObserverSuppressed(action: () => void): void {
     this.textObserverSuppressionDepth += 1;
+    this.textObserverSuppressedUntil = Math.max(
+      this.textObserverSuppressedUntil,
+      Date.now() + TEXT_OBSERVER_SUPPRESSION_WINDOW_MS
+    );
     try {
       action();
     } finally {
       window.setTimeout(() => {
         this.textObserverSuppressionDepth = Math.max(0, this.textObserverSuppressionDepth - 1);
-      }, 0);
+      }, TEXT_OBSERVER_SUPPRESSION_WINDOW_MS);
     }
+  }
+
+  private isTextObserverSuppressed(): boolean {
+    return this.textObserverSuppressionDepth > 0 || Date.now() < this.textObserverSuppressedUntil;
+  }
+
+  private schedulePendingIncrementalTextRefresh(reason: string, delayMs = this.getIncrementalRefreshDebounceMs()): void {
+    if (this.textScanTimer !== null) {
+      window.clearTimeout(this.textScanTimer);
+    }
+
+    this.textScanTimer = window.setTimeout(() => {
+      this.textScanTimer = null;
+      void this.refreshTextBindingsIncrementally(reason);
+    }, Math.max(0, delayMs));
+  }
+
+  private scheduleIncrementalTextRefreshFromRoots(
+    roots: Iterable<HTMLElement>,
+    reason: string,
+    delayMs = this.getIncrementalRefreshDebounceMs()
+  ): void {
+    for (const root of roots) {
+      this.pendingTextMutationRoots.add(root);
+    }
+
+    this.schedulePendingIncrementalTextRefresh(reason, delayMs);
+  }
+
+  private scheduleSuppressedTextMutationFlush(): void {
+    if (this.textObserverSuppressionFlushTimer !== null) {
+      window.clearTimeout(this.textObserverSuppressionFlushTimer);
+    }
+
+    const delayMs = Math.max(0, this.textObserverSuppressedUntil - Date.now()) + 8;
+    this.textObserverSuppressionFlushTimer = window.setTimeout(() => {
+      this.textObserverSuppressionFlushTimer = null;
+      this.flushSuppressedTextMutationRoots();
+    }, delayMs);
+  }
+
+  private flushSuppressedTextMutationRoots(): void {
+    if (this.pendingSuppressedTextMutationRoots.size === 0 || !this.shouldObserveTextElements()) {
+      this.pendingSuppressedTextMutationRoots.clear();
+      return;
+    }
+
+    if (this.isTextObserverSuppressed()) {
+      this.scheduleSuppressedTextMutationFlush();
+      return;
+    }
+
+    this.scheduleIncrementalTextRefreshFromRoots(
+      [...this.pendingSuppressedTextMutationRoots],
+      "mutation:deferred"
+    );
+    this.pendingSuppressedTextMutationRoots.clear();
+  }
+
+  private clearDeferredMutationRetryStateForRoots(roots: Iterable<HTMLElement>): void {
+    let didChange = false;
+    for (const root of roots) {
+      if (this.pendingDeferredTextMutationRetryRoots.delete(root)) {
+        didChange = true;
+      }
+      this.deferredTextMutationRetryAttempts.delete(root);
+    }
+
+    if (
+      didChange &&
+      this.pendingDeferredTextMutationRetryRoots.size === 0 &&
+      this.textDeferredMutationRetryTimer !== null
+    ) {
+      window.clearTimeout(this.textDeferredMutationRetryTimer);
+      this.textDeferredMutationRetryTimer = null;
+    }
+  }
+
+  private scheduleDeferredMutationRetryRoots(roots: readonly HTMLElement[]): void {
+    if (!this.isDeferredMutationRetryEnabled() || roots.length === 0 || !this.shouldObserveTextElements()) {
+      return;
+    }
+
+    let didQueueRoot = false;
+    roots.forEach((root) => {
+      if (!root.isConnected || isTextDebugSkippableElement(root)) {
+        this.deferredTextMutationRetryAttempts.delete(root);
+        this.pendingDeferredTextMutationRetryRoots.delete(root);
+        return;
+      }
+
+      const nextAttempt = (this.deferredTextMutationRetryAttempts.get(root) ?? 0) + 1;
+      if (nextAttempt > TEXT_DEFERRED_MUTATION_RETRY_MAX_ATTEMPTS) {
+        this.deferredTextMutationRetryAttempts.delete(root);
+        this.pendingDeferredTextMutationRetryRoots.delete(root);
+        return;
+      }
+
+      this.deferredTextMutationRetryAttempts.set(root, nextAttempt);
+      this.pendingDeferredTextMutationRetryRoots.add(root);
+      didQueueRoot = true;
+    });
+
+    if (!didQueueRoot) {
+      return;
+    }
+
+    if (this.textDeferredMutationRetryTimer !== null) {
+      window.clearTimeout(this.textDeferredMutationRetryTimer);
+    }
+
+    this.textDeferredMutationRetryTimer = window.setTimeout(() => {
+      this.textDeferredMutationRetryTimer = null;
+      this.flushDeferredMutationRetryRoots();
+    }, this.getDeferredMutationRetryDelayMs());
+  }
+
+  private flushDeferredMutationRetryRoots(): void {
+    if (!this.shouldObserveTextElements() || this.pendingDeferredTextMutationRetryRoots.size === 0) {
+      this.pendingDeferredTextMutationRetryRoots.clear();
+      return;
+    }
+
+    const retryRoots = this.normalizeMutationRoots(
+      [...this.pendingDeferredTextMutationRetryRoots].filter(
+        (root) => root.isConnected && !isTextDebugSkippableElement(root) && isTextDebugPotentiallyVisibleElement(root)
+      )
+    );
+    this.pendingDeferredTextMutationRetryRoots.clear();
+    if (retryRoots.length === 0) {
+      return;
+    }
+
+    this.scheduleIncrementalTextRefreshFromRoots(retryRoots, "mutation:retry", 0);
   }
 
   private applyTextBindingsToDom(): void {
@@ -3644,6 +4432,20 @@ class OverlayTerminalController {
       [data-lextrace-text-editable="true"] {
         cursor: text !important;
       }
+      [data-lextrace-text-binding-id][data-lextrace-text-debug="source"] {
+        outline: 2px solid rgba(198, 84, 84, 0.98);
+        outline-offset: 1px;
+        background: rgba(198, 84, 84, 0.12);
+        text-decoration: underline rgba(198, 84, 84, 1.0) 2px;
+        text-underline-offset: 2px;
+      }
+      [data-lextrace-text-binding-id][data-lextrace-text-debug="changed"] {
+        outline: 2px solid rgba(46, 148, 84, 0.98);
+        outline-offset: 1px;
+        background: rgba(46, 148, 84, 0.12);
+        text-decoration: underline rgba(46, 148, 84, 1.0) 2px;
+        text-underline-offset: 2px;
+      }
       .lextrace-text-highlight-layer {
         position: fixed;
         inset: 0;
@@ -3662,26 +4464,26 @@ class OverlayTerminalController {
         box-shadow:
           inset 0 0 0 2px rgba(198, 84, 84, 0.98),
           0 0 0 1px rgba(198, 84, 84, 0.28),
-          0 0 14px rgba(198, 84, 84, 0.18);
-        background: rgba(198, 84, 84, 0.08);
+          0 0 14px rgba(198, 84, 84, 0.32);
+        background: rgba(198, 84, 84, 0.18);
       }
       .lextrace-text-highlight-box.is-changed {
         box-shadow:
           inset 0 0 0 2px rgba(46, 148, 84, 0.98),
           0 0 0 1px rgba(46, 148, 84, 0.24),
-          0 0 14px rgba(46, 148, 84, 0.18);
-        background: rgba(46, 148, 84, 0.08);
+          0 0 14px rgba(46, 148, 84, 0.32);
+        background: rgba(46, 148, 84, 0.18);
       }
       ::highlight(${TEXT_SOURCE_HIGHLIGHT_NAME}) {
-        background: rgba(198, 84, 84, 0.18);
+        background: rgba(198, 84, 84, 0.35);
         color: inherit;
-        text-decoration: underline rgba(198, 84, 84, 0.9) 2px;
+        text-decoration: underline rgba(198, 84, 84, 1.0) 3px;
         text-underline-offset: 2px;
       }
       ::highlight(${TEXT_CHANGED_HIGHLIGHT_NAME}) {
-        background: rgba(46, 148, 84, 0.18);
+        background: rgba(46, 148, 84, 0.35);
         color: inherit;
-        text-decoration: underline rgba(46, 148, 84, 0.92) 2px;
+        text-decoration: underline rgba(46, 148, 84, 1.0) 3px;
         text-underline-offset: 2px;
       }
       .lextrace-inline-text-editor {
@@ -3706,42 +4508,30 @@ class OverlayTerminalController {
       }
       .lextrace-inline-text-editor-inline {
         display: inline;
-        min-width: 1px;
-        min-height: 1px;
+        position: static;
+        z-index: auto;
+        width: auto;
+        height: auto;
+        min-width: 0;
+        min-height: 0;
         padding: 0;
         margin: 0;
+        border: none;
         border-radius: 0;
         outline: none;
         background: transparent;
         color: inherit;
         caret-color: #111111;
         white-space: pre-wrap;
+        resize: none;
         box-shadow: none;
+        overflow: visible;
         vertical-align: baseline;
         text-decoration: inherit;
       }
     `;
     document.documentElement.appendChild(style);
     this.textDebugStyleElement = style;
-  }
-
-  private ensureTextHighlightLayer(): HTMLDivElement {
-    if (this.textHighlightLayer?.isConnected) {
-      return this.textHighlightLayer;
-    }
-
-    const layer = document.createElement("div");
-    layer.className = "lextrace-text-highlight-layer";
-    document.documentElement.appendChild(layer);
-    this.textHighlightLayer = layer;
-    return layer;
-  }
-
-  private clearTextHighlightBoxes(): void {
-    this.textHighlightBoxes.forEach((element) => {
-      element.remove();
-    });
-    this.textHighlightBoxes.clear();
   }
 
   private getNativeTextHighlightRegistry():
@@ -3814,7 +4604,7 @@ class OverlayTerminalController {
       return false;
     }
 
-    const rects = target.getClientRects().filter((rect) => isRenderableTextRect(rect));
+    const rects = getRenderableTextNodeClientRects(target.textNode).filter((rect) => isRenderableTextRect(rect));
     if (rects.length === 0) {
       this.removeTextHighlightRangeForBinding(bindingId);
       return false;
@@ -3842,15 +4632,6 @@ class OverlayTerminalController {
     return true;
   }
 
-  private removeTextHighlightBoxesForBinding(bindingId: string): void {
-    [...this.textHighlightBoxes.keys()]
-      .filter((key) => key.startsWith(`${bindingId}:`))
-      .forEach((key) => {
-        this.textHighlightBoxes.get(key)?.remove();
-        this.textHighlightBoxes.delete(key);
-      });
-  }
-
   private renderTextHighlightBoxesForBinding(bindingId: string, binding?: TextBindingRecord | null): void {
     const pageMap = this.textPageMap;
     const activeBinding = binding ?? pageMap?.bindings.find((candidate) => candidate.bindingId === bindingId) ?? null;
@@ -3864,276 +4645,41 @@ class OverlayTerminalController {
       !isRuntimeTargetVisuallyRenderable(target)
     ) {
       this.removeTextHighlightRangeForBinding(bindingId);
-      this.removeTextHighlightBoxesForBinding(bindingId);
       return;
     }
 
     if (this.renderNativeTextHighlightForBinding(bindingId, activeBinding, target)) {
-      this.removeTextHighlightBoxesForBinding(bindingId);
       return;
     }
 
     this.removeTextHighlightRangeForBinding(bindingId);
-
-    this.ensureTextDebugStyleElement();
-    const layer = this.ensureTextHighlightLayer();
-    const nextDebugKind = activeBinding.changed ? "changed" : "source";
-    const rects = target
-      .getClientRects()
-      .filter((rect) => isRenderableTextRect(rect) && isViewportRenderableTextRect(rect));
-    const nextKeys = new Set<string>();
-
-    rects.forEach((rect, rectIndex) => {
-      const key = `${bindingId}:${rectIndex}`;
-      nextKeys.add(key);
-
-      const box =
-        this.textHighlightBoxes.get(key) ??
-        (() => {
-          const nextBox = document.createElement("div");
-          nextBox.setAttribute("data-lextrace-text-highlight-box", "true");
-          this.textHighlightBoxes.set(key, nextBox);
-          layer.appendChild(nextBox);
-          return nextBox;
-        })();
-      const nextClassName = `lextrace-text-highlight-box ${activeBinding.changed ? "is-changed" : "is-source"}`;
-      const nextRectSignature = `${rect.left}:${rect.top}:${rect.width}:${rect.height}`;
-      if (box.className !== nextClassName) {
-        box.className = nextClassName;
-      }
-      if (box.style.position !== "fixed") {
-        box.style.position = "fixed";
-      }
-      if (box.getAttribute("data-lextrace-text-binding-id") !== bindingId) {
-        box.setAttribute("data-lextrace-text-binding-id", bindingId);
-      }
-      if (box.getAttribute("data-lextrace-text-debug") !== nextDebugKind) {
-        box.setAttribute("data-lextrace-text-debug", nextDebugKind);
-      }
-      if (box.getAttribute("data-lextrace-text-rect-index") !== String(rectIndex)) {
-        box.setAttribute("data-lextrace-text-rect-index", String(rectIndex));
-      }
-      if (box.getAttribute("data-lextrace-text-rect-signature") !== nextRectSignature) {
-        box.setAttribute("data-lextrace-text-rect-signature", nextRectSignature);
-        box.style.left = `${rect.left}px`;
-        box.style.top = `${rect.top}px`;
-        box.style.width = `${rect.width}px`;
-        box.style.height = `${rect.height}px`;
-      }
-    });
-
-    [...this.textHighlightBoxes.keys()]
-      .filter((key) => key.startsWith(`${bindingId}:`) && !nextKeys.has(key))
-      .forEach((key) => {
-        this.textHighlightBoxes.get(key)?.remove();
-        this.textHighlightBoxes.delete(key);
-      });
   }
 
   private renderTextHighlightBoxes(): void {
     const pageMap = this.textPageMap;
     if (!pageMap || !(this.currentConfig?.debug.textElements.highlightEnabled ?? false)) {
-      this.clearTextHighlightBoxes();
+      this.clearNativeTextHighlights();
       return;
     }
 
-    const liveBindingIds = new Set(
-      pageMap.bindings.filter((binding) => binding.presence === "live").map((binding) => binding.bindingId)
-    );
-    pageMap.bindings.forEach((binding) => {
-      this.renderTextHighlightBoxesForBinding(binding.bindingId, binding);
-    });
+    const liveBindingIds = new Set<string>();
+    for (const binding of pageMap.bindings) {
+      if (binding.presence === "live") {
+        liveBindingIds.add(binding.bindingId);
+        this.renderTextHighlightBoxesForBinding(binding.bindingId, binding);
+      }
+    }
 
-    [...this.textHighlightBoxes.keys()]
-      .filter((key) => !liveBindingIds.has(key.split(":", 1)[0] ?? ""))
-      .forEach((key) => {
-        this.textHighlightBoxes.get(key)?.remove();
-        this.textHighlightBoxes.delete(key);
-      });
-    [...this.textHighlightRanges.keys()]
-      .filter((bindingId) => !liveBindingIds.has(bindingId))
-      .forEach((bindingId) => {
+    this.textHighlightRanges.forEach((_range, bindingId) => {
+      if (!liveBindingIds.has(bindingId)) {
         this.removeTextHighlightRangeForBinding(bindingId);
-      });
-  }
-
-  private readonly handleTextDebugWindowResize = (): void => {
-    this.scheduleAllTextPresentationRefresh();
-    this.scheduleViewportDrivenTextRefresh("viewport-resize");
-  };
-
-  private readonly handleTextViewportAutoScanScroll = (event: Event): void => {
-    if (this.isElementInsideOverlay(event.target)) {
-      return;
-    }
-
-    this.scheduleViewportDrivenTextRefresh("viewport-scroll");
-  };
-
-  private scheduleViewportDrivenTextRefresh(reason: string): void {
-    if (!this.shouldObserveTextElements()) {
-      return;
-    }
-
-    if (this.textViewportScanTimer !== null) {
-      window.clearTimeout(this.textViewportScanTimer);
-    }
-
-    this.textViewportScanTimer = window.setTimeout(() => {
-      this.textViewportScanTimer = null;
-      void this.refreshVisibleTextBindingsIncrementally(reason);
-    }, 180);
-  }
-
-  private requestTextPresentationRefreshFrame(): void {
-    if (this.textPresentationRefreshFrame !== null) {
-      return;
-    }
-
-    this.textPresentationRefreshFrame = window.requestAnimationFrame(() => {
-      this.textPresentationRefreshFrame = null;
-      const dirtyBindingIds = [...this.dirtyTextPresentationBindings];
-      this.dirtyTextPresentationBindings.clear();
-      const highlightEnabled = this.currentConfig?.debug.textElements.highlightEnabled ?? false;
-
-      dirtyBindingIds.forEach((dirtyBindingId) => {
-        if (highlightEnabled) {
-          this.renderTextHighlightBoxesForBinding(dirtyBindingId);
-        } else {
-          this.removeTextHighlightRangeForBinding(dirtyBindingId);
-          this.removeTextHighlightBoxesForBinding(dirtyBindingId);
-        }
-
-        if (this.inlineTextEditor?.bindingId === dirtyBindingId && this.inlineTextEditor.mode === "overlay") {
-          const runtimeTarget = this.textTargetMap.get(dirtyBindingId) ?? this.inlineTextEditor.target;
-          this.positionInlineTextEditor(runtimeTarget, this.inlineTextEditor.editor as HTMLTextAreaElement);
-        }
-      });
-    });
-  }
-
-  private attachBindingToTextScrollTarget(scrollTarget: TextScrollTarget, bindingId: string): void {
-    let subscription = this.textScrollTargetSubscriptions.get(scrollTarget);
-    if (!subscription) {
-      const listener = (event: Event) => {
-        if (scrollTarget !== window && this.isElementInsideOverlay(event.target)) {
-          return;
-        }
-
-        const currentSubscription = this.textScrollTargetSubscriptions.get(scrollTarget);
-        currentSubscription?.bindingIds.forEach((candidateBindingId) => {
-          this.dirtyTextPresentationBindings.add(candidateBindingId);
-        });
-        this.requestTextPresentationRefreshFrame();
-      };
-      scrollTarget.addEventListener("scroll", listener, true);
-      subscription = {
-        bindingIds: new Set<string>(),
-        listener
-      };
-      this.textScrollTargetSubscriptions.set(scrollTarget, subscription);
-    }
-
-    subscription.bindingIds.add(bindingId);
-  }
-
-  private detachBindingFromTextScrollTarget(scrollTarget: TextScrollTarget, bindingId: string): void {
-    const subscription = this.textScrollTargetSubscriptions.get(scrollTarget);
-    if (!subscription) {
-      return;
-    }
-
-    subscription.bindingIds.delete(bindingId);
-    if (subscription.bindingIds.size > 0) {
-      return;
-    }
-
-    scrollTarget.removeEventListener("scroll", subscription.listener, true);
-    this.textScrollTargetSubscriptions.delete(scrollTarget);
-  }
-
-  private clearTextPresentationSubscriptions(): void {
-    this.textPresentationSubscriptions.forEach((subscription) => {
-      subscription.cleanup();
-    });
-    this.textPresentationSubscriptions.clear();
-    this.textScrollTargetSubscriptions.forEach((subscription, scrollTarget) => {
-      scrollTarget.removeEventListener("scroll", subscription.listener, true);
-    });
-    this.textScrollTargetSubscriptions.clear();
-    this.dirtyTextPresentationBindings.clear();
-    if (this.textPresentationRefreshFrame !== null) {
-      window.cancelAnimationFrame(this.textPresentationRefreshFrame);
-      this.textPresentationRefreshFrame = null;
-    }
-  }
-
-  private rebuildTextPresentationSubscriptions(): void {
-    this.clearTextPresentationSubscriptions();
-    if (!(this.currentConfig?.debug.textElements.highlightEnabled ?? false)) {
-      return;
-    }
-
-    this.textTargetMap.forEach((target, bindingId) => {
-      if (canUseNativeTextPresentation(target)) {
-        return;
       }
-
-      const scrollTargets = collectTextScrollTargets(target.styleElement);
-      scrollTargets.forEach((scrollTarget) => {
-        this.attachBindingToTextScrollTarget(scrollTarget, bindingId);
-      });
-      const resizeObserver =
-        typeof ResizeObserver === "function"
-          ? new ResizeObserver(() => {
-              this.scheduleTextPresentationRefresh(bindingId);
-            })
-          : null;
-      resizeObserver?.observe(target.styleElement);
-      if (target.highlightElement !== target.styleElement) {
-        resizeObserver?.observe(target.highlightElement);
-      }
-      this.textPresentationSubscriptions.set(bindingId, {
-        cleanup: () => {
-          resizeObserver?.disconnect();
-          scrollTargets.forEach((scrollTarget) => {
-            this.detachBindingFromTextScrollTarget(scrollTarget, bindingId);
-          });
-        }
-      });
     });
-  }
-
-  private scheduleTextPresentationRefresh(bindingId: string): void {
-    this.dirtyTextPresentationBindings.add(bindingId);
-    this.requestTextPresentationRefreshFrame();
-  }
-
-  private scheduleAllTextPresentationRefresh(): void {
-    if (!(this.currentConfig?.debug.textElements.highlightEnabled ?? false) && !this.inlineTextEditor) {
-      return;
-    }
-
-    this.textTargetMap.forEach((target, bindingId) => {
-      if (canUseNativeTextPresentation(target)) {
-        return;
-      }
-      this.dirtyTextPresentationBindings.add(bindingId);
-    });
-    if (this.inlineTextEditor?.mode === "overlay") {
-      this.dirtyTextPresentationBindings.add(this.inlineTextEditor.bindingId);
-    }
-    if (this.dirtyTextPresentationBindings.size === 0) {
-      return;
-    }
-    this.requestTextPresentationRefreshFrame();
   }
 
   private clearTextHighlights(): void {
     this.clearTextHighlightAttributes();
-    this.clearTextPresentationSubscriptions();
     this.clearNativeTextHighlights();
-    this.clearTextHighlightBoxes();
   }
 
   private clearTextHighlightAttributes(): void {
@@ -4151,9 +4697,7 @@ class OverlayTerminalController {
 
     const pageMap = this.textPageMap;
     if (!pageMap) {
-      this.clearTextPresentationSubscriptions();
       this.clearNativeTextHighlights();
-      this.clearTextHighlightBoxes();
       this.resetInlineTextEditor();
       return;
     }
@@ -4164,9 +4708,7 @@ class OverlayTerminalController {
       this.resetInlineTextEditor();
     }
     if (!highlightEnabled && !inlineEditingEnabled) {
-      this.clearTextPresentationSubscriptions();
       this.clearNativeTextHighlights();
-      this.clearTextHighlightBoxes();
       return;
     }
 
@@ -4180,22 +4722,22 @@ class OverlayTerminalController {
       const interactiveElement = target.styleElement;
       if (isRuntimeTargetVisuallyRenderable(target)) {
         interactiveElement.setAttribute("data-lextrace-text-binding-id", binding.bindingId);
-        if (inlineEditingEnabled) {
+        if (inlineEditingEnabled && this.canInlineEditRuntimeTarget(target)) {
           interactiveElement.setAttribute("data-lextrace-text-editable", "true");
+        }
+        if (highlightEnabled && !canUseNativeTextPresentation(target)) {
+          interactiveElement.setAttribute("data-lextrace-text-debug", binding.changed ? "changed" : "source");
         }
       }
       this.highlightedTextElements.add(interactiveElement);
     });
 
     if (highlightEnabled) {
-      this.rebuildTextPresentationSubscriptions();
       this.renderTextHighlightBoxes();
       return;
     }
 
-    this.clearTextPresentationSubscriptions();
     this.clearNativeTextHighlights();
-    this.clearTextHighlightBoxes();
   }
 
   private shouldObserveTextElements(): boolean {
@@ -4214,7 +4756,18 @@ class OverlayTerminalController {
     const root = document.body ?? document.documentElement;
     if (shouldObserve && root && !this.textMutationObserver) {
       this.textMutationObserver = new MutationObserver((records) => {
-        if (this.textObserverSuppressionDepth > 0) {
+        if (this.isTextObserverSuppressed()) {
+          const suppressedRoots = new Set<HTMLElement>();
+          records.forEach((record) => {
+            this.collectMutationRoots(record).forEach((mutationRoot) => {
+              suppressedRoots.add(mutationRoot);
+            });
+          });
+          this.clearDeferredMutationRetryStateForRoots(suppressedRoots);
+          suppressedRoots.forEach((mutationRoot) => {
+            this.pendingSuppressedTextMutationRoots.add(mutationRoot);
+          });
+          this.scheduleSuppressedTextMutationFlush();
           return;
         }
         this.scheduleIncrementalTextRefresh(records, "mutation");
@@ -4236,9 +4789,20 @@ class OverlayTerminalController {
 
     if (!shouldObserve) {
       this.pendingTextMutationRoots.clear();
+      this.pendingSuppressedTextMutationRoots.clear();
+      this.pendingDeferredTextMutationRetryRoots.clear();
+      this.deferredTextMutationRetryAttempts.clear();
       if (this.textScanTimer !== null) {
         window.clearTimeout(this.textScanTimer);
         this.textScanTimer = null;
+      }
+      if (this.textObserverSuppressionFlushTimer !== null) {
+        window.clearTimeout(this.textObserverSuppressionFlushTimer);
+        this.textObserverSuppressionFlushTimer = null;
+      }
+      if (this.textDeferredMutationRetryTimer !== null) {
+        window.clearTimeout(this.textDeferredMutationRetryTimer);
+        this.textDeferredMutationRetryTimer = null;
       }
       if (this.textViewportScanTimer !== null) {
         window.clearTimeout(this.textViewportScanTimer);
@@ -4248,20 +4812,17 @@ class OverlayTerminalController {
   }
 
   private scheduleIncrementalTextRefresh(records: MutationRecord[], reason: string): void {
+    const nextRoots = new Set<HTMLElement>();
     records.forEach((record) => {
       this.collectMutationRoots(record).forEach((root) => {
-        this.pendingTextMutationRoots.add(root);
+        nextRoots.add(root);
       });
     });
-
-    if (this.textScanTimer !== null) {
-      window.clearTimeout(this.textScanTimer);
-    }
-
-    this.textScanTimer = window.setTimeout(() => {
-      this.textScanTimer = null;
-      void this.refreshTextBindingsIncrementally(reason);
-    }, 90);
+    this.clearDeferredMutationRetryStateForRoots(nextRoots);
+    nextRoots.forEach((root) => {
+      this.pendingTextMutationRoots.add(root);
+    });
+    this.schedulePendingIncrementalTextRefresh(reason);
   }
 
   private collectMutationRoots(record: MutationRecord): HTMLElement[] {
@@ -4272,11 +4833,20 @@ class OverlayTerminalController {
       }
 
       if (value instanceof HTMLElement) {
+        if (this.isElementInsideOverlay(value) || isTextDebugSkippableElement(value)) {
+          return;
+        }
         roots.add(value);
         return;
       }
 
       if (value instanceof Text && value.parentElement) {
+        if (
+          this.isElementInsideOverlay(value.parentElement) ||
+          isTextDebugSkippableElement(value.parentElement)
+        ) {
+          return;
+        }
         roots.add(value.parentElement);
       }
     };
@@ -4292,7 +4862,7 @@ class OverlayTerminalController {
 
   private normalizeMutationRoots(roots: readonly HTMLElement[]): HTMLElement[] {
     const uniqueRoots = roots.filter((root, index, array) => array.indexOf(root) === index);
-    return uniqueRoots.filter((root) => !uniqueRoots.some((candidate) => candidate !== root && root.contains(candidate)));
+    return uniqueRoots.filter((root) => !uniqueRoots.some((candidate) => candidate !== root && candidate.contains(root)));
   }
 
   private async handleTextScanCommand(logSummary = true): Promise<TextPageMap | null> {
@@ -4405,6 +4975,7 @@ class OverlayTerminalController {
     this.textStorageEnvelope = upsertPageMapInEnvelope(this.textStorageEnvelope, nextPageMap);
     await this.persistTextStorageEnvelope(this.textStorageEnvelope);
     this.textPageMapPersisted = true;
+    this.ensureCurrentTextTargetsMaterialized(nextPageMap);
     this.updateTextDebugPresentation();
     this.renderTexts();
 
@@ -4442,12 +5013,55 @@ class OverlayTerminalController {
     this.textStorageEnvelope = upsertPageMapInEnvelope(this.textStorageEnvelope, nextPageMap);
     await this.persistTextStorageEnvelope(this.textStorageEnvelope);
     this.textPageMapPersisted = true;
+    this.ensureCurrentTextTargetsMaterialized(nextPageMap);
     this.updateTextDebugPresentation();
     this.renderTexts();
 
     await recordLog("content", "text.page.reset", "Изменения текстов текущей страницы сброшены.", {
       pageKey: nextPageMap.pageKey,
       bindingCount: nextPageMap.bindings.length
+    });
+
+    return nextPageMap;
+  }
+
+  private async blankCurrentPageTextBindings(): Promise<TextPageMap> {
+    const currentPageMap =
+      (await this.ensureTextElementsHydrated({
+        reason: "page-blank",
+        logSummary: false
+      })) ?? this.textPageMap;
+    if (!currentPageMap) {
+      throw new Error("Карта текстов текущей страницы недоступна.");
+    }
+
+    const nextBlankState = this.buildBlankedTextPageMap(currentPageMap, {
+      includeStale: true,
+      now: new Date().toISOString(),
+      touchMatchedAt: true,
+      autoBlanked: false
+    });
+    const nextPageMap = nextBlankState.pageMap;
+
+    this.textPageMap = nextPageMap;
+    this.textStorageEnvelope = upsertPageMapInEnvelope(this.textStorageEnvelope, nextPageMap);
+    await this.persistTextStorageEnvelope(this.textStorageEnvelope);
+    this.textPageMapPersisted = true;
+    this.ensureCurrentTextTargetsMaterialized(nextPageMap);
+    this.applyTextBindingsToDom();
+    window.setTimeout(() => {
+      if (
+        this.textPageMap?.pageKey === nextPageMap.pageKey &&
+        this.textPageMap.updatedAt === nextPageMap.updatedAt
+      ) {
+        this.updateTextDebugPresentation();
+      }
+    }, 0);
+    this.renderTexts();
+
+    await recordLog("content", "text.page.blank", "Тексты текущей страницы очищены пустой заменой.", {
+      pageKey: nextPageMap.pageKey,
+      bindingCount: nextBlankState.blankedBindings
     });
 
     return nextPageMap;
@@ -4587,7 +5201,7 @@ class OverlayTerminalController {
     };
   }
 
-  private readonly handleDocumentTextDoubleClick = (event: MouseEvent): void => {
+  private readonly handleDocumentTextContextMenu = (event: MouseEvent): void => {
     if (!(this.currentConfig?.debug.textElements.inlineEditingEnabled ?? false)) {
       return;
     }
@@ -4596,23 +5210,26 @@ class OverlayTerminalController {
       return;
     }
 
-    const bindingIdAtPoint = this.resolveEditableTextBindingIdAtPoint(event.clientX, event.clientY);
     const targetElement = event.target instanceof Element
       ? event.target.closest<HTMLElement>("[data-lextrace-text-editable='true']")
       : null;
-    const bindingId = bindingIdAtPoint ?? targetElement?.getAttribute("data-lextrace-text-binding-id");
+    const targetBindingId = targetElement?.getAttribute("data-lextrace-text-binding-id");
+    const bindingIdAtPoint =
+      targetBindingId ? null : this.resolveEditableTextBindingIdAtPoint(event.clientX, event.clientY);
+    const bindingId = targetBindingId ?? bindingIdAtPoint;
     if (!bindingId || !this.textPageMap) {
       return;
     }
 
     const binding = this.textPageMap.bindings.find((candidate) => candidate.bindingId === bindingId);
     const runtimeTarget = this.textTargetMap.get(bindingId);
-    if (!binding || !runtimeTarget) {
+    if (!binding || !runtimeTarget || !this.canInlineEditRuntimeTarget(runtimeTarget)) {
       return;
     }
 
     event.preventDefault();
     event.stopPropagation();
+    event.stopImmediatePropagation?.();
     this.openInlineTextEditor(binding, runtimeTarget);
   };
 
@@ -4625,7 +5242,7 @@ class OverlayTerminalController {
     const matches = pageMap.bindings
       .map((binding) => {
         const target = this.textTargetMap.get(binding.bindingId);
-        if (!target || !isRuntimeTargetVisuallyRenderable(target)) {
+        if (!target || !isRuntimeTargetVisuallyRenderable(target) || !this.canInlineEditRuntimeTarget(target)) {
           return null;
         }
 
@@ -4661,96 +5278,36 @@ class OverlayTerminalController {
     this.resetInlineTextEditor();
     this.ensureTextDebugStyleElement();
 
-    if (target.textNode && target.attributeName === null) {
-      this.openInlineTextNodeEditor(binding, target);
+    if (target.attributeName !== null) {
       return;
     }
-
-    const editor = document.createElement("textarea");
-    editor.className = "lextrace-inline-text-editor";
-    editor.value = target.readCurrentText();
-    editor.spellcheck = false;
-    this.applyInlineTextEditorTextStyle(target, editor);
-
-    const bindingId = binding.bindingId;
-    editor.addEventListener("keydown", (event) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        this.resetInlineTextEditor();
-        return;
-      }
-
-      if (event.key === "Enter" && !event.shiftKey) {
-        event.preventDefault();
-        void this.commitInlineTextEditor(bindingId);
-      }
-    });
-    editor.addEventListener("blur", () => {
-      void this.commitInlineTextEditor(bindingId);
-    });
-
-    const reposition = () => {
-      this.positionInlineTextEditor(target, editor);
-    };
-    const scrollTargets = collectTextScrollTargets(target.styleElement);
-    const handleScroll = (event: Event) => {
-      if (this.isElementInsideOverlay(event.target)) {
-        return;
-      }
-      reposition();
-    };
-    const resizeObserver =
-      typeof ResizeObserver === "function"
-        ? new ResizeObserver(() => {
-            reposition();
-          })
-        : null;
-    scrollTargets.forEach((scrollTarget) => {
-      scrollTarget.addEventListener("scroll", handleScroll, true);
-    });
-    resizeObserver?.observe(target.styleElement);
-    if (target.highlightElement !== target.styleElement) {
-      resizeObserver?.observe(target.highlightElement);
-    }
-    window.addEventListener("resize", reposition, true);
-
-    document.documentElement.appendChild(editor);
-    reposition();
-    editor.focus();
-    editor.select();
-    this.inlineTextEditor = {
-      bindingId,
-      mode: "overlay",
-      editor,
-      target,
-      readValue: () => editor.value,
-      cleanup: () => {
-        window.removeEventListener("resize", reposition, true);
-        scrollTargets.forEach((scrollTarget) => {
-          scrollTarget.removeEventListener("scroll", handleScroll, true);
-        });
-        resizeObserver?.disconnect();
-      }
-    };
+    this.openInlineTextNodeEditor(binding, target);
   }
 
   private openInlineTextNodeEditor(binding: TextBindingRecord, target: TextRuntimeTarget): void {
-    const sourceTextNode = target.textNode;
-    const sourceParent = sourceTextNode?.parentElement;
-    if (!sourceTextNode || !sourceParent) {
+    const sourceParent = target.textNode?.parentElement ?? target.styleElement;
+    if (!sourceParent) {
       return;
+    }
+    let sourceTextNode = target.textNode;
+    if (!sourceTextNode || !sourceTextNode.isConnected || sourceTextNode.parentElement !== sourceParent) {
+      sourceTextNode = document.createTextNode(target.readCurrentText());
+      this.withTextObserverSuppressed(() => {
+        sourceParent.append(sourceTextNode as Text);
+      });
     }
 
     this.removeTextHighlightRangeForBinding(binding.bindingId);
-    this.removeTextHighlightBoxesForBinding(binding.bindingId);
 
     const editor = document.createElement("span");
     editor.className = "lextrace-inline-text-editor lextrace-inline-text-editor-inline";
-    editor.setAttribute("contenteditable", "plaintext-only");
+    editor.setAttribute("contenteditable", "true");
     editor.setAttribute("data-lextrace-inline-mode", "text-node");
+    editor.setAttribute("data-lextrace-text-debug-skip", "true");
     editor.spellcheck = false;
     editor.textContent = target.readCurrentText();
     this.applyInlineTextEditorTextStyle(target, editor);
+    this.applyInlineTextNodeEditorBoxStyle(editor);
 
     const bindingId = binding.bindingId;
     const commit = () => {
@@ -4769,7 +5326,16 @@ class OverlayTerminalController {
       }
     });
     editor.addEventListener("blur", () => {
-      commit();
+      this.scheduleInlineTextEditorBlurCommit(bindingId, editor);
+    });
+    editor.addEventListener("paste", (event) => {
+      const pastedText = event.clipboardData?.getData("text/plain");
+      if (typeof pastedText !== "string") {
+        return;
+      }
+
+      event.preventDefault();
+      this.insertPlainTextIntoInlineEditor(editor, pastedText);
     });
 
     this.withTextObserverSuppressed(() => {
@@ -4785,7 +5351,6 @@ class OverlayTerminalController {
 
     this.inlineTextEditor = {
       bindingId,
-      mode: "inline",
       editor,
       target,
       readValue: () => editor.textContent ?? "",
@@ -4794,6 +5359,8 @@ class OverlayTerminalController {
         this.withTextObserverSuppressed(() => {
           if (editor.isConnected) {
             editor.replaceWith(sourceTextNode);
+          } else if (!sourceTextNode.isConnected) {
+            sourceParent.append(sourceTextNode);
           }
         });
       }
@@ -4812,32 +5379,89 @@ class OverlayTerminalController {
     editor.style.letterSpacing = style.letterSpacing;
     editor.style.textTransform = style.textTransform;
     editor.style.textAlign = style.textAlign;
-    editor.style.whiteSpace = "pre-wrap";
+    editor.style.whiteSpace = style.whiteSpace;
+    editor.style.wordBreak = style.wordBreak;
+    editor.style.overflowWrap = style.overflowWrap;
   }
 
-  private positionInlineTextEditor(target: TextRuntimeTarget, editor: HTMLTextAreaElement): void {
-    if (!target.highlightElement.isConnected || !editor.isConnected) {
+  private applyInlineTextNodeEditorBoxStyle(editor: HTMLElement): void {
+    editor.style.position = "static";
+    editor.style.display = "inline";
+    editor.style.zIndex = "auto";
+    editor.style.left = "auto";
+    editor.style.top = "auto";
+    editor.style.right = "auto";
+    editor.style.bottom = "auto";
+    editor.style.width = "auto";
+    editor.style.height = "auto";
+    editor.style.minWidth = "0";
+    editor.style.minHeight = "0";
+    editor.style.margin = "0";
+    editor.style.padding = "0";
+    editor.style.border = "none";
+    editor.style.borderRadius = "0";
+    editor.style.outline = "none";
+    editor.style.background = "transparent";
+    editor.style.boxShadow = "none";
+    editor.style.overflow = "visible";
+    editor.style.resize = "none";
+    editor.style.verticalAlign = "baseline";
+  }
+
+  private insertPlainTextIntoInlineEditor(editor: HTMLElement, text: string): void {
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0) {
+      editor.textContent = `${editor.textContent ?? ""}${text}`;
       return;
     }
 
-    const targetRect = target.getBoundingClientRect();
-    if (!targetRect) {
+    const range = selection.getRangeAt(0);
+    if (!editor.contains(range.commonAncestorContainer)) {
+      editor.textContent = `${editor.textContent ?? ""}${text}`;
       return;
     }
 
-    const geometry = buildInlineTextEditorGeometry({
-      targetRect,
-      scrollX: 0,
-      scrollY: 0,
-      viewportWidth: window.innerWidth,
-      documentWidth: window.innerWidth
-    });
+    range.deleteContents();
+    const textNode = document.createTextNode(text);
+    range.insertNode(textNode);
+    range.setStartAfter(textNode);
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
 
-    editor.style.position = "fixed";
-    editor.style.left = `${geometry.left}px`;
-    editor.style.top = `${geometry.top}px`;
-    editor.style.width = `${geometry.width}px`;
-    editor.style.height = `${geometry.height}px`;
+  private isInlineTextEditorInteractionActive(editor: HTMLElement): boolean {
+    const activeElement = document.activeElement;
+    if (activeElement === editor) {
+      return true;
+    }
+    if (activeElement instanceof Node && editor.contains(activeElement)) {
+      return true;
+    }
+
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0) {
+      return false;
+    }
+
+    return (
+      (selection.anchorNode instanceof Node && editor.contains(selection.anchorNode)) ||
+      (selection.focusNode instanceof Node && editor.contains(selection.focusNode))
+    );
+  }
+
+  private scheduleInlineTextEditorBlurCommit(bindingId: string, editor: HTMLElement): void {
+    window.setTimeout(() => {
+      if (!this.inlineTextEditor || this.inlineTextEditor.bindingId !== bindingId || this.inlineTextEditor.editor !== editor) {
+        return;
+      }
+
+      if (this.isInlineTextEditorInteractionActive(editor)) {
+        return;
+      }
+
+      void this.commitInlineTextEditor(bindingId);
+    }, 120);
   }
 
   private async commitInlineTextEditor(bindingId: string): Promise<void> {
@@ -4862,7 +5486,12 @@ class OverlayTerminalController {
     this.inlineTextEditor.cleanup();
     this.inlineTextEditor.editor.remove();
     this.inlineTextEditor = null;
-    this.scheduleTextPresentationRefresh(bindingId);
+    if (
+      this.textPageMap?.bindings.some((binding) => binding.bindingId === bindingId) &&
+      (this.currentConfig?.debug.textElements.highlightEnabled ?? false)
+    ) {
+      this.renderTextHighlightBoxesForBinding(bindingId);
+    }
   }
 
   private buildOverlayTargetPayload(target: TerminalOverlayTarget): { tabId?: number; expectedUrl?: string } {
@@ -5873,6 +6502,18 @@ class OverlayTerminalController {
               }
             };
           }
+          case "blank": {
+            const pageMap = await this.blankCurrentPageTextBindings();
+            return {
+              output: {
+                ...this.buildTextStatusResult(),
+                blankedBindings: pageMap.bindings.filter(
+                  (binding) => binding.presence === "live" && binding.replacementText === ""
+                ).length,
+                updatedAt: pageMap.updatedAt
+              }
+            };
+          }
           case "revert": {
             const binding = await this.updateCurrentPageTextBinding(parsed.bindingId, null);
             return {
@@ -6211,7 +6852,10 @@ class OverlayTerminalController {
         "content",
         "overlay.command.failed",
         "Не удалось выполнить команду оверлейного терминала.",
-        { message: error instanceof Error ? error.message : String(error) },
+        {
+          raw: rawInput.trim(),
+          message: error instanceof Error ? error.message : String(error)
+        },
         "error"
       );
     }
@@ -8020,5 +8664,3 @@ const overlayStyles = `
     color: #b91c1c;
   }
 `;
-
-

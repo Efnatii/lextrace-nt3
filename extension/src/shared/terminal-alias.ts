@@ -162,6 +162,13 @@ export type TerminalAliasCommand =
   | {
       kind: "alias";
       namespace: "text";
+      action: "blank";
+      scope: "page";
+      raw: string;
+    }
+  | {
+      kind: "alias";
+      namespace: "text";
       action: "reset";
       scope: "page" | "all";
       raw: string;
@@ -557,6 +564,12 @@ const HELP_ENTRY_REGISTRY: readonly TerminalHelpEntrySpec[] = [
     command: "text.set <bindingId> -- <text>",
     description: "Сохраняет замену для binding и немедленно применяет её на странице.",
     examples: ["text.set txt_ab12cd34 -- New text"]
+  },
+  {
+    topic: "text",
+    command: "text.blank page",
+    description: "Batch-clears all live text bindings on the current page to an empty string and persists the map in one pass.",
+    examples: ["text.blank page"]
   },
   {
     topic: "text",
@@ -998,6 +1011,15 @@ export function parseTerminalAliasCommand(rawInput: string): TerminalAliasComman
       raw
     };
   }
+  if (raw === "text.blank page") {
+    return {
+      kind: "alias",
+      namespace: "text",
+      action: "blank",
+      scope: "page",
+      raw
+    };
+  }
   if (raw === "text.reset page" || raw === "text.reset all") {
     return {
       kind: "alias",
@@ -1055,14 +1077,14 @@ export function parseTerminalAliasCommand(rawInput: string): TerminalAliasComman
     };
   }
   if (raw.startsWith("text.set ")) {
-    const remainder = raw.slice("text.set ".length).trim();
-    const delimiterIndex = remainder.indexOf(" -- ");
-    if (delimiterIndex === -1) {
+    const remainder = raw.slice("text.set ".length);
+    const match = remainder.match(/^(.*?)\s--(?:\s(.*))?$/s);
+    if (!match) {
       throw new Error("text.set requires <bindingId> -- <text>.");
     }
-    const bindingId = remainder.slice(0, delimiterIndex).trim();
-    const text = remainder.slice(delimiterIndex + " -- ".length);
-    if (!bindingId || !text.trim()) {
+    const bindingId = match[1]?.trim() ?? "";
+    const text = match[2] ?? "";
+    if (!bindingId) {
       throw new Error("text.set requires <bindingId> -- <text>.");
     }
     return {

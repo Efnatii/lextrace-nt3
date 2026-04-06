@@ -288,6 +288,32 @@ export const editableConfigFields = [
       incremental: "incremental"
     })
   ),
+  createDescriptor(
+    "debug.textElements.incrementalRefreshDebounceMs",
+    "local",
+    "number",
+    NonNegativeIntegerSchema
+  ),
+  createDescriptor(
+    "debug.textElements.autoBlankOnScan",
+    "local",
+    "boolean",
+    z.boolean(),
+    createBooleanOptions()
+  ),
+  createDescriptor(
+    "debug.textElements.deferredMutationRetryEnabled",
+    "local",
+    "boolean",
+    z.boolean(),
+    createBooleanOptions()
+  ),
+  createDescriptor(
+    "debug.textElements.deferredMutationRetryDelayMs",
+    "local",
+    "number",
+    NonNegativeIntegerSchema
+  ),
   createDescriptor("test.demoHeartbeatMs", "local", "number", RuntimeDelaySchema),
   createDescriptor(
     "test.allowHostCrashCommand",
@@ -347,7 +373,19 @@ const configKeyOrderRegistry = new Map<string, readonly string[]>([
   ["ui", ["popupActiveTab", "overlay"]],
   ["ui.overlay", ["activeTab", "visible", "width", "height", "left", "top"]],
   ["debug", ["textElements"]],
-  ["debug.textElements", ["highlightEnabled", "inlineEditingEnabled", "displayMode", "autoScanMode"]],
+  [
+    "debug.textElements",
+    [
+      "highlightEnabled",
+      "inlineEditingEnabled",
+      "displayMode",
+      "autoScanMode",
+      "incrementalRefreshDebounceMs",
+      "autoBlankOnScan",
+      "deferredMutationRetryEnabled",
+      "deferredMutationRetryDelayMs"
+    ]
+  ],
   ["ai", ["openAiApiKey", "allowedModels", "chat", "compaction", "promptCaching", "retries", "queueRetries", "rateLimits"]],
   ["ai.chat", ["model", "streamingEnabled", "instructions", "structuredOutput"]],
   ["ai.chat.structuredOutput", ["name", "description", "schema", "strict"]],

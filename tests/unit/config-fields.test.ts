@@ -123,6 +123,30 @@ describe("editable config fields", () => {
       valueType: "enum",
       editorType: "select"
     });
+
+    expect(getEditableConfigField("debug.textElements.incrementalRefreshDebounceMs")).toMatchObject({
+      scope: "local",
+      valueType: "number",
+      editorType: "inline"
+    });
+
+    expect(getEditableConfigField("debug.textElements.autoBlankOnScan")).toMatchObject({
+      scope: "local",
+      valueType: "boolean",
+      editorType: "select"
+    });
+
+    expect(getEditableConfigField("debug.textElements.deferredMutationRetryEnabled")).toMatchObject({
+      scope: "local",
+      valueType: "boolean",
+      editorType: "select"
+    });
+
+    expect(getEditableConfigField("debug.textElements.deferredMutationRetryDelayMs")).toMatchObject({
+      scope: "local",
+      valueType: "number",
+      editorType: "inline"
+    });
   });
 
   it("builds nested config patches from field paths", () => {
@@ -145,6 +169,10 @@ describe("editable config fields", () => {
     expect(parseConfigFieldDraft("ai.queueRetries.maxRetries", "5")).toBe(5);
     expect(parseConfigFieldDraft("debug.textElements.displayMode", "original")).toBe("original");
     expect(parseConfigFieldDraft("debug.textElements.autoScanMode", "incremental")).toBe("incremental");
+    expect(parseConfigFieldDraft("debug.textElements.incrementalRefreshDebounceMs", "150")).toBe(150);
+    expect(parseConfigFieldDraft("debug.textElements.autoBlankOnScan", "true")).toBe(true);
+    expect(parseConfigFieldDraft("debug.textElements.deferredMutationRetryEnabled", "true")).toBe(true);
+    expect(parseConfigFieldDraft("debug.textElements.deferredMutationRetryDelayMs", "240")).toBe(240);
     expect(parseConfigFieldDraft("ai.chat.model", '{"model":"gpt-5","tier":"priority"}')).toEqual({
       model: "gpt-5",
       tier: "priority"
@@ -222,11 +250,24 @@ describe("editable config fields", () => {
           inlineEditingEnabled: false,
           displayMode: "effective",
           autoScanMode: "incremental",
-          highlightEnabled: true
+          incrementalRefreshDebounceMs: 90,
+          highlightEnabled: true,
+          autoBlankOnScan: true,
+          deferredMutationRetryEnabled: false,
+          deferredMutationRetryDelayMs: 180
         },
         "debug.textElements"
       ).map(([key]) => key)
-    ).toEqual(["highlightEnabled", "inlineEditingEnabled", "displayMode", "autoScanMode"]);
+    ).toEqual([
+      "highlightEnabled",
+      "inlineEditingEnabled",
+      "displayMode",
+      "autoScanMode",
+      "incrementalRefreshDebounceMs",
+      "autoBlankOnScan",
+      "deferredMutationRetryEnabled",
+      "deferredMutationRetryDelayMs"
+    ]);
 
     expect(
       getOrderedConfigEntries(

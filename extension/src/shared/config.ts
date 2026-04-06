@@ -74,7 +74,11 @@ export const TextElementDebugConfigSchema = z.object({
   highlightEnabled: z.boolean(),
   inlineEditingEnabled: z.boolean(),
   displayMode: TextDisplayModeSchema,
-  autoScanMode: TextAutoScanModeSchema
+  autoScanMode: TextAutoScanModeSchema,
+  incrementalRefreshDebounceMs: z.number().int().min(0),
+  autoBlankOnScan: z.boolean(),
+  deferredMutationRetryEnabled: z.boolean(),
+  deferredMutationRetryDelayMs: z.number().int().min(0),
 });
 
 export const ExtensionConfigSchema = z.object({
@@ -189,7 +193,11 @@ export const ExtensionConfigPatchSchema = z.object({
           highlightEnabled: z.boolean().optional(),
           inlineEditingEnabled: z.boolean().optional(),
           displayMode: TextDisplayModeSchema.optional(),
-          autoScanMode: TextAutoScanModeSchema.optional()
+          autoScanMode: TextAutoScanModeSchema.optional(),
+          incrementalRefreshDebounceMs: z.number().int().min(0).optional(),
+          autoBlankOnScan: z.boolean().optional(),
+          deferredMutationRetryEnabled: z.boolean().optional(),
+          deferredMutationRetryDelayMs: z.number().int().min(0).optional(),
         })
         .optional()
     })
@@ -303,7 +311,11 @@ export const defaultConfig: ExtensionConfig = {
       highlightEnabled: false,
       inlineEditingEnabled: false,
       displayMode: "effective",
-      autoScanMode: "off"
+      autoScanMode: "off",
+      incrementalRefreshDebounceMs: 90,
+      autoBlankOnScan: false,
+      deferredMutationRetryEnabled: false,
+      deferredMutationRetryDelayMs: 180
     }
   },
   ai: {

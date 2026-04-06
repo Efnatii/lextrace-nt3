@@ -82,6 +82,10 @@ describe("config merge", () => {
     expect(defaultConfig.debug.textElements.inlineEditingEnabled).toBe(false);
     expect(defaultConfig.debug.textElements.displayMode).toBe("effective");
     expect(defaultConfig.debug.textElements.autoScanMode).toBe("off");
+    expect(defaultConfig.debug.textElements.incrementalRefreshDebounceMs).toBe(90);
+    expect(defaultConfig.debug.textElements.autoBlankOnScan).toBe(false);
+    expect(defaultConfig.debug.textElements.deferredMutationRetryEnabled).toBe(false);
+    expect(defaultConfig.debug.textElements.deferredMutationRetryDelayMs).toBe(180);
   });
 
   it("merges debug.textElements settings without dropping sibling defaults", () => {
@@ -90,7 +94,11 @@ describe("config merge", () => {
         textElements: {
           highlightEnabled: true,
           displayMode: "original",
-          autoScanMode: "incremental"
+          autoScanMode: "incremental",
+          incrementalRefreshDebounceMs: 150,
+          autoBlankOnScan: true,
+          deferredMutationRetryEnabled: true,
+          deferredMutationRetryDelayMs: 240
         }
       }
     });
@@ -99,6 +107,10 @@ describe("config merge", () => {
     expect(merged.debug.textElements.inlineEditingEnabled).toBe(false);
     expect(merged.debug.textElements.displayMode).toBe("original");
     expect(merged.debug.textElements.autoScanMode).toBe("incremental");
+    expect(merged.debug.textElements.incrementalRefreshDebounceMs).toBe(150);
+    expect(merged.debug.textElements.autoBlankOnScan).toBe(true);
+    expect(merged.debug.textElements.deferredMutationRetryEnabled).toBe(true);
+    expect(merged.debug.textElements.deferredMutationRetryDelayMs).toBe(240);
   });
 
   it("merges nested ai config without dropping sibling defaults", () => {
