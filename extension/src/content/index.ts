@@ -71,6 +71,7 @@ import {
   areTextBindingListsEquivalentForPersistence,
   areTextBindingsEquivalentForPersistence,
   buildControlTextLayoutRects,
+  buildStaleTextBinding,
   buildTextBindingId,
   buildTextMapSummary,
   buildTextRectUnion,
@@ -89,6 +90,7 @@ import {
   reconcileAutoBlankBindings,
   resetPageBindings,
   resolveDisplayedBindingText,
+  resolveIncrementalBindingStates,
   sanitizeReplacementText,
   TextStorageEnvelopeSchema,
   updateBindingReplacement,
@@ -2463,11 +2465,7 @@ class OverlayTerminalController {
     changes: Record<string, chrome.storage.StorageChange>,
     areaName: string
   ): void => {
-    if (areaName !== "local") {
-      return;
-    }
-
-    if (STORAGE_KEYS.localConfig in changes) {
+    if (areaName === "local" && STORAGE_KEYS.localConfig in changes) {
       void (async () => {
         try {
           await this.loadSnapshot();
@@ -2487,7 +2485,13 @@ class OverlayTerminalController {
       })();
     }
 
-    if (STORAGE_KEYS.textMaps in changes) {
+    if (areaName === "session" && STORAGE_KEYS.textMaps in changes) {
+      if (this.textStorageSelfWriteCount > 0) {
+        // Our own write — in-memory state is already up-to-date; skip expensive
+        // re-hydration (prevents the full-page scan feedback loop).
+        this.textStorageSelfWriteCount--;
+        return;
+      }
       void (async () => {
         const nextEnvelope = this.parseStoredTextEnvelope(changes[STORAGE_KEYS.textMaps]?.newValue);
         this.textStorageEnvelope = nextEnvelope;
@@ -2606,7 +2610,13 @@ class OverlayTerminalController {
       this.textTrackedPageKeys.delete(pageContext.pageKey);
     }
 
-    this.materializeCurrentPageTextTargets(this.textPageMap);
+    if (this.areAllLiveBindingTargetsValid(this.textPageMap)) {
+      // All targets are already connected — skip the expensive full-page scan and
+      // just apply any pending DOM writes (e.g. replacementText changes).
+      this.applyTextBindingsToDom();
+    } else {
+      this.materializeCurrentPageTextTargets(this.textPageMap);
+    }
     this.updateTextDebugPresentation();
     this.renderTexts();
     this.updateTextObservationState();
@@ -2638,12 +2648,19 @@ class OverlayTerminalController {
   }
 
   private async loadTextStorageEnvelope(): Promise<TextStorageEnvelope> {
-    const storedValues = await chrome.storage.local.get([STORAGE_KEYS.textMaps]);
-    return this.parseStoredTextEnvelope(storedValues[STORAGE_KEYS.textMaps]);
+    const sessionValues = await chrome.storage.session.get([STORAGE_KEYS.textMaps]);
+    // One-time migration: remove stale key left by the previous local-storage version.
+    void chrome.storage.local.remove(STORAGE_KEYS.textMaps);
+    return this.parseStoredTextEnvelope(sessionValues[STORAGE_KEYS.textMaps]);
   }
 
+  // Counts writes we initiated ourselves so handleStorageChanged can skip
+  // re-hydration for our own writes (prevents full-page scan feedback loop).
+  private textStorageSelfWriteCount = 0;
+
   private async persistTextStorageEnvelope(envelope: TextStorageEnvelope): Promise<void> {
-    await chrome.storage.local.set({
+    this.textStorageSelfWriteCount++;
+    await chrome.storage.session.set({
       [STORAGE_KEYS.textMaps]: envelope
     });
   }
@@ -2780,7 +2797,11 @@ class OverlayTerminalController {
       currentPageMap,
       this.isTextAutoBlankOnScanEnabled(),
       {
-        now: new Date().toISOString()
+        now: new Date().toISOString(),
+        // includeStale keeps stale auto-blanked bindings consistent with the current
+        // blank-mode setting so that when they recover to live they don't bring
+        // replacementText:"" back into the DOM after the user has turned blank mode off.
+        includeStale: true
       }
     );
     if (!nextAutoBlankState.didChange) {
@@ -2855,7 +2876,8 @@ class OverlayTerminalController {
         nextPageMap,
         this.isTextAutoBlankOnScanEnabled(),
         {
-          now
+          now,
+          includeStale: true
         }
       ).pageMap;
 
@@ -2978,8 +3000,14 @@ class OverlayTerminalController {
     mutationRoots: readonly HTMLElement[]
   ): boolean {
     const target = previousTargets.get(bindingId);
+    // RC4 fix: a missing or disconnected target is NOT considered affected by
+    // the current mutation batch.  The old behaviour (return true) caused any
+    // transiently-disconnected element — unrelated to the active mutation roots —
+    // to enter the candidate pool and then get deleted when no candidate matched.
+    // Disconnected bindings are already in the stale pool if they previously failed;
+    // they will be matched again once their element reconnects and a local mutation fires.
     if (!target || !target.highlightElement.isConnected) {
-      return true;
+      return false;
     }
 
     return mutationRoots.some(
@@ -3017,14 +3045,6 @@ class OverlayTerminalController {
       isTextDebugPotentiallyVisibleElement(target.styleElement) ||
       isTextDebugPotentiallyVisibleElement(target.highlightElement)
     );
-  }
-
-  private buildStaleTextBinding(binding: TextBindingRecord, now: string): TextBindingRecord {
-    return {
-      ...binding,
-      presence: "stale",
-      staleSince: binding.staleSince ?? now
-    };
   }
 
   private async refreshTextBindingsIncrementally(reason: string): Promise<void> {
@@ -3186,7 +3206,7 @@ class OverlayTerminalController {
       nextTargets.set(bindingId, target);
     });
 
-    const deletedBindingIds = new Set<string>();
+    const retainedBindingIds = new Set<string>();
     currentPageMap.bindings.forEach((binding) => {
       if (binding.presence !== "live" || !affectedBindingIds.has(binding.bindingId) || matchedBindingIds.has(binding.bindingId)) {
         return;
@@ -3195,21 +3215,28 @@ class OverlayTerminalController {
       const previousTarget = previousTargets.get(binding.bindingId);
       if (previousTarget && this.canRetainChangedTextBindingWithoutCandidate(binding, previousTarget)) {
         nextTargets.set(binding.bindingId, previousTarget);
+        retainedBindingIds.add(binding.bindingId);
         return;
       }
 
-      if (binding.changed) {
-        updatedBindings.set(binding.bindingId, this.buildStaleTextBinding(binding, now));
-      } else {
-        deletedBindingIds.add(binding.bindingId);
-      }
+      // Evict from runtime targets; resolveIncrementalBindingStates will stale
+      // the binding record — both changed and unchanged (RC1 fix: soft-miss, never
+      // delete on first incremental failure).
       nextTargets.delete(binding.bindingId);
     });
 
-    const mergedBindings = currentPageMap.bindings
-      .filter((binding) => !deletedBindingIds.has(binding.bindingId))
-      .map((binding) => updatedBindings.get(binding.bindingId) ?? binding);
-    const nextBindings = this.sortTextBindingsByRuntimeOrder([...mergedBindings, ...newBindings], nextTargets);
+    const nextBindings = this.sortTextBindingsByRuntimeOrder(
+      resolveIncrementalBindingStates(
+        currentPageMap.bindings,
+        affectedBindingIds,
+        matchedBindingIds,
+        updatedBindings,
+        retainedBindingIds,
+        newBindings,
+        now
+      ),
+      nextTargets
+    );
     let nextPageMap: TextPageMap = {
       ...currentPageMap,
       pageUrl: pageContext.pageUrl,
@@ -3222,7 +3249,8 @@ class OverlayTerminalController {
       nextPageMap,
       this.isTextAutoBlankOnScanEnabled(),
       {
-        now
+        now,
+        includeStale: true
       }
     ).pageMap;
     this.updateDeferredMutationRetryStateForRoots(mutationRoots, nextTargets);
@@ -3530,11 +3558,12 @@ class OverlayTerminalController {
       return candidates;
     }
 
+    const visibilityCache = new WeakMap<HTMLElement, boolean>();
     const textWalker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     let currentTextNode = textWalker.nextNode();
     while (currentTextNode) {
       if (currentTextNode instanceof Text) {
-        const candidate = this.createTextNodeCandidate(currentTextNode);
+        const candidate = this.createTextNodeCandidate(currentTextNode, visibilityCache);
         if (candidate) {
           candidates.push(candidate);
         }
@@ -3570,8 +3599,15 @@ class OverlayTerminalController {
       }
     };
 
+    const visibilityCache = new WeakMap<HTMLElement, boolean>();
     this.normalizeMutationRoots(roots).forEach((root) => {
-      if (isTextDebugSkippableElement(root) || !isTextDebugPotentiallyVisibleElement(root)) {
+      // RC2 fix: check only connectivity at the root level.  Per-candidate visibility
+      // is already enforced inside createTextNodeCandidate (isTextDebugPotentiallyVisibleElement
+      // on the text-node's parent) and by the zero-rects guard.  A root with opacity:0
+      // during a CSS fade-in has children whose own computed opacity is 1 — the old
+      // root-level check would skip those children even though they are about to be
+      // visible, leading to binding eviction (RC1) with no recovery path (RC3).
+      if (isTextDebugSkippableElement(root) || !root.isConnected) {
         return;
       }
 
@@ -3579,7 +3615,7 @@ class OverlayTerminalController {
       let currentTextNode = rootTextWalker.nextNode();
       while (currentTextNode) {
         if (currentTextNode instanceof Text) {
-          addCandidate(this.createTextNodeCandidate(currentTextNode));
+          addCandidate(this.createTextNodeCandidate(currentTextNode, visibilityCache));
         }
         currentTextNode = rootTextWalker.nextNode();
       }
@@ -3644,13 +3680,25 @@ class OverlayTerminalController {
     return this.normalizeMutationRoots([...roots]);
   }
 
-  private createTextNodeCandidate(textNode: Text): LiveTextCandidate | null {
+  private createTextNodeCandidate(
+    textNode: Text,
+    visibilityCache?: WeakMap<HTMLElement, boolean>
+  ): LiveTextCandidate | null {
     const parentElement = textNode.parentElement;
     if (!parentElement || isTextDebugSkippableElement(parentElement)) {
       return null;
     }
 
-    if (!isTextDebugPotentiallyVisibleElement(parentElement)) {
+    let parentVisible: boolean;
+    if (visibilityCache) {
+      if (!visibilityCache.has(parentElement)) {
+        visibilityCache.set(parentElement, isTextDebugPotentiallyVisibleElement(parentElement));
+      }
+      parentVisible = visibilityCache.get(parentElement)!;
+    } else {
+      parentVisible = isTextDebugPotentiallyVisibleElement(parentElement);
+    }
+    if (!parentVisible) {
       return null;
     }
 
@@ -3676,12 +3724,21 @@ class OverlayTerminalController {
       };
     };
     const initialRenderableState = readRenderableState();
-    if (initialRenderableState.textRects.length === 0 && initialRenderableState.fallbackRects.length === 0) {
+    // Skip zero-rects guard when this node is blank because we applied replacementText:"".
+    // textNodeOriginalMap holds the pre-blank content so we can detect this case; the
+    // container collapses to zero height while blanked, but the binding is still live.
+    const currentlyBlankedByUs =
+      !normalizeTextForBinding(textNode.textContent ?? "") && normalizedText.length > 0;
+    if (!currentlyBlankedByUs && initialRenderableState.textRects.length === 0 && initialRenderableState.fallbackRects.length === 0) {
       return null;
     }
     let runtimeHighlightElement = initialRenderableState.highlightElement;
     const initialPreciseRects =
-      initialRenderableState.textRects.length > 0 ? initialRenderableState.textRects : initialRenderableState.fallbackRects;
+      initialRenderableState.textRects.length > 0
+        ? initialRenderableState.textRects
+        : initialRenderableState.fallbackRects.length > 0
+          ? initialRenderableState.fallbackRects
+          : [];
     let lastKnownClientRects = initialPreciseRects.map((rect) => ({ ...rect }));
     const getLiveTextRects = (): TextRectSnapshot[] => {
       const nextRenderableState = readRenderableState();
@@ -4226,6 +4283,17 @@ class OverlayTerminalController {
       this.inlineTextEditor?.bindingId === target.bindingId &&
       this.inlineTextEditor.editor.isConnected
     );
+  }
+
+  // Returns true when every live binding already has a connected runtime target,
+  // meaning a full-page scan via materializeCurrentPageTextTargets is unnecessary.
+  private areAllLiveBindingTargetsValid(pageMap: TextPageMap): boolean {
+    return pageMap.bindings.every((binding) => {
+      if (binding.presence !== "live") {
+        return true;
+      }
+      return this.isRuntimeTextTargetCurrent(this.textTargetMap.get(binding.bindingId));
+    });
   }
 
   private ensureCurrentTextTargetsMaterialized(pageMap: TextPageMap): void {
@@ -4976,6 +5044,7 @@ class OverlayTerminalController {
     await this.persistTextStorageEnvelope(this.textStorageEnvelope);
     this.textPageMapPersisted = true;
     this.ensureCurrentTextTargetsMaterialized(nextPageMap);
+    this.applyTextBindingsToDom();
     this.updateTextDebugPresentation();
     this.renderTexts();
 
@@ -5014,6 +5083,7 @@ class OverlayTerminalController {
     await this.persistTextStorageEnvelope(this.textStorageEnvelope);
     this.textPageMapPersisted = true;
     this.ensureCurrentTextTargetsMaterialized(nextPageMap);
+    this.applyTextBindingsToDom();
     this.updateTextDebugPresentation();
     this.renderTexts();
 

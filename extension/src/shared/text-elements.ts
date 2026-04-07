@@ -650,6 +650,62 @@ export function mergeTextPageMapWithCandidates(
   };
 }
 
+/**
+ * Returns a stale copy of a binding. Preserves the earliest staleSince timestamp so
+ * repeated staling calls are idempotent and don't advance the clock on each pass.
+ */
+export function buildStaleTextBinding(binding: TextBindingRecord, now: string): TextBindingRecord {
+  return {
+    ...binding,
+    presence: "stale",
+    staleSince: binding.staleSince ?? now
+  };
+}
+
+/**
+ * Computes the merged binding list after an incremental scan pass.
+ *
+ * Invariants enforced here:
+ *  - Matched bindings receive their updated record from `updatedBindings`.
+ *  - Retained bindings (e.g. inline-editor keeps them alive without a candidate) are left unchanged.
+ *  - Unmatched affected live bindings transition to **stale** — never to deleted.
+ *    This is the RC1 fix: soft-miss on first incremental failure prevents permanent loss of
+ *    unchanged bindings that disappeared only due to transient DOM churn (animations,
+ *    React/Polymer re-renders, temporarily invisible roots).
+ *  - All other bindings (unaffected, already-stale) are kept as-is.
+ *  - New bindings for unmatched candidates are appended at the end.
+ *
+ * The stale unchanged bindings that accumulate here are cleaned up by the next full
+ * `mergeTextPageMapWithCandidates` pass (manual text.scan), which drops unchanged
+ * stale bindings that don't match any candidate.
+ */
+export function resolveIncrementalBindingStates(
+  currentBindings: readonly TextBindingRecord[],
+  affectedBindingIds: ReadonlySet<string>,
+  matchedBindingIds: ReadonlySet<string>,
+  updatedBindings: ReadonlyMap<string, TextBindingRecord>,
+  retainedBindingIds: ReadonlySet<string>,
+  newBindings: readonly TextBindingRecord[],
+  now: string
+): TextBindingRecord[] {
+  const next = currentBindings.map((binding) => {
+    const updated = updatedBindings.get(binding.bindingId);
+    if (updated) {
+      return updated;
+    }
+    if (
+      binding.presence === "live" &&
+      affectedBindingIds.has(binding.bindingId) &&
+      !matchedBindingIds.has(binding.bindingId) &&
+      !retainedBindingIds.has(binding.bindingId)
+    ) {
+      return buildStaleTextBinding(binding, now);
+    }
+    return binding;
+  });
+  return newBindings.length > 0 ? [...next, ...newBindings] : next;
+}
+
 export function updateBindingReplacement(
   pageMap: TextPageMap,
   bindingId: string,
